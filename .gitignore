@@ -1,0 +1,33 @@
+# ملفات Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ملفات البيئة - مهم جداً
+.env
+.env.local
+.env.production
+.env.development
+
+# نظام التشغيل
+.DS_Store
+Thumbs.db
+
+# محررات الكود
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ملفات النظام
+*.pid
+*.seed
+*.pid.lock
+
+# Logs
+logs/
+*.log
+
+# Coverage
+coverage/

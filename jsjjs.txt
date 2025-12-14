@@ -1,0 +1,7 @@
+
+firebase-proxy-server/
+├── .gitignore
+├── package.json
+├── index.js
+├── README.md
+└── .env.example
