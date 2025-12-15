@@ -230,7 +230,7 @@ app.get('/', (req, res) => {
     <html dir="rtl">
     <head>
       <meta charset="UTF-8">
-      <title>Firebase Proxy - Secure Server</title>
+      <title>Firebase Proxy - Secure index</title>
       <style>
         body { font-family: Arial; background: #1a1a2e; color: white; padding: 50px; text-align: center; }
         .box { background: rgba(255,255,255,0.1); padding: 30px; border-radius: 15px; max-width: 800px; margin: auto; }
@@ -242,13 +242,13 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div class="box">
-        <h1>🚀 Firebase Proxy Server - الإصدار الآمن</h1>
+        <h1>🚀 Firebase Proxy index - الإصدار الآمن</h1>
         <div class="status">✅ الخادم يعمل بنجاح</div>
         
         <h3>📡 نقاط النهاية المتاحة:</h3>
         
         <div class="endpoint">
-          <span class="method">GET</span> <code>/api/serverTime</code>
+          <span class="method">GET</span> <code>/api/indexTime</code>
           <p>الحصول على وقت السيرفر (API Key فقط)</p>
         </div>
         
@@ -282,13 +282,13 @@ app.get('/', (req, res) => {
 });
 
 // 2. الحصول على وقت السيرفر
-app.get('/api/serverTime', verifyApiKey, (req, res) => {
+app.get('/api/indexTime', verifyApiKey, (req, res) => {
   const now = Date.now();
   const timestamp = Math.floor(now / 1000);
   
   const responseData = {
     success: true,
-    server_time: now,
+    index_time: now,
     unixtime: timestamp,
     iso_time: new Date(now).toISOString(),
     local_time: new Date(now).toLocaleString('ar-SA'),
@@ -638,7 +638,7 @@ app.listen(PORT, () => {
   console.log('='.repeat(60));
   console.log('📌 نقاط النهاية المتاحة:');
   console.log(`   GET  /                 -> الصفحة الرئيسية`);
-  console.log(`   GET  /api/serverTime   -> وقت السيرفر`);
+  console.log(`   GET  /api/indexTime   -> وقت السيرفر`);
   console.log(`   POST /api/getUser      -> جلب بيانات مستخدم`);
   console.log(`   POST /api/verifyAccount -> التحقق من الحساب`);
   console.log(`   POST /api/updateDevice -> تحديث الجهاز`);
