@@ -26,6 +26,97 @@ const FB_URL = process.env.FIREBASE_URL;
 const FB_KEY = process.env.FIREBASE_KEY;
 
 // ═══════════════════════════════════════════
+// 🔐 نظام التوقيع الرقمي (Request Signing)
+// ═══════════════════════════════════════════
+
+const REQUEST_SIGNING_SECRET = process.env.REQUEST_SIGNING_SECRET || 'YourRequestSigningSecret123';
+const REQUEST_TIMEOUT = 5 * 60 * 1000; // 5 دقائق
+
+// تخزين الـ nonce المستخدمة لمنع إعادة الاستخدام
+const usedNonces = new Map();
+
+// تنظيف الـ nonces القديمة كل دقيقة
+setInterval(() => {
+  const now = Date.now();
+  for (const [nonce, timestamp] of usedNonces.entries()) {
+    if (now - timestamp > REQUEST_TIMEOUT) {
+      usedNonces.delete(nonce);
+    }
+  }
+}, 60 * 1000);
+
+// توليد توقيع HMAC-SHA256
+function generateSignature(data, timestamp) {
+  const hmac = crypto.createHmac('sha256', REQUEST_SIGNING_SECRET);
+  const stringToSign = `${data}|${timestamp}|${REQUEST_SIGNING_SECRET}`;
+  return hmac.update(stringToSign, 'utf8').digest('base64').trim();
+}
+
+// التحقق من التوقيع
+function verifySignature(req) {
+  try {
+    const signature = req.headers['x-signature'];
+    const timestamp = req.headers['x-timestamp'];
+    const nonce = req.headers['x-nonce'];
+    
+    if (!signature || !timestamp || !nonce) {
+      return { valid: false, error: 'التوقيع أو الطابع الزمني أو الرمز العشوائي مفقود' };
+    }
+    
+    // التحقق من الطابع الزمني (ضمن 5 دقائق)
+    const requestTime = parseInt(timestamp, 10) * 1000;
+    const now = Date.now();
+    
+    if (Math.abs(now - requestTime) > REQUEST_TIMEOUT) {
+      return { valid: false, error: 'الطلب منتهي الصلاحية' };
+    }
+    
+    // التحقق من عدم إعادة استخدام nonce
+    if (usedNonces.has(nonce)) {
+      return { valid: false, error: 'تم استخدام هذا الرمز مسبقاً' };
+    }
+    
+    // توليد التوقيع المتوقع
+    let dataToSign = '';
+    if (req.method === 'GET') {
+      dataToSign = JSON.stringify(req.query || {});
+    } else {
+      dataToSign = JSON.stringify(req.body || {});
+    }
+    
+    const expectedSignature = generateSignature(dataToSign, timestamp);
+    
+    if (signature !== expectedSignature) {
+      console.log(`❌ توقيع غير صالح: ${signature.substring(0, 20)}...`);
+      console.log(`📝 المتوقع: ${expectedSignature.substring(0, 20)}...`);
+      return { valid: false, error: 'توقيع غير صالح' };
+    }
+    
+    // حفظ الـ nonce لمنع إعادة الاستخدام
+    usedNonces.set(nonce, now);
+    
+    return { valid: true };
+  } catch (error) {
+    return { valid: false, error: 'خطأ في التحقق من التوقيع' };
+  }
+}
+
+// Middleware للتحقق من التوقيع
+const verifyRequestSignature = (req, res, next) => {
+  const verification = verifySignature(req);
+  
+  if (!verification.valid) {
+    return res.status(401).json({ 
+      success: false, 
+      error: verification.error,
+      code: 401
+    });
+  }
+  
+  next();
+};
+
+// ═══════════════════════════════════════════
 // 🔐 نظام الجلسات الجديد
 // ═══════════════════════════════════════════
 
@@ -53,15 +144,34 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 // ═══════════════════════════════════════════
-// AUTH MIDDLEWARE
+// AUTH MIDDLEWARE المعدل
 // ═══════════════════════════════════════════
 
 const authApp = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
   const expected = process.env.APP_API_KEY || 'MySecureAppKey@2024#Firebase$';
+  
   if (apiKey !== expected) {
-    return res.status(401).json({ success: false, error: 'غير مصرح', code: 401 });
+    return res.status(401).json({ 
+      success: false, 
+      error: 'غير مصرح - مفتاح API غير صالح', 
+      code: 401 
+    });
   }
+  
+  // التحقق من التوقيع الرقمي (للطلبات المهمة)
+  if (req.method !== 'GET' || req.path.includes('/getUser') || req.path.includes('/updateDevice')) {
+    const verification = verifySignature(req);
+    
+    if (!verification.valid) {
+      return res.status(401).json({ 
+        success: false, 
+        error: `فشل التحقق من التوقيع: ${verification.error}`, 
+        code: 401 
+      });
+    }
+  }
+  
   next();
 };
 
@@ -111,7 +221,6 @@ const authAdmin = (req, res, next) => {
     code: 401 
   });
 };
-
 
 // ═══════════════════════════════════════════
 // 🔑 AUTH للـ SUB ADMIN مع ربط الجهاز
@@ -470,7 +579,6 @@ app.get('/api/sub/stats', authSubAdmin, checkPermission('view'), async (req, res
   }
 });
 
-
 // ═══════════════════════════════════════════
 // 🔑 ADMIN LOGIN ENDPOINTS
 // ═══════════════════════════════════════════
@@ -627,34 +735,58 @@ function generateApiKey() {
 }
 
 // ═══════════════════════════════════════════
-// APP ENDPOINTS (للتطبيق)
+// APP ENDPOINTS (للتطبيق) - مع التوقيع الرقمي
 // ═══════════════════════════════════════════
 
 app.get('/api/serverTime', (req, res) => {
   const now = Date.now();
-  res.json({
+  const timestamp = Math.floor(now / 1000);
+  const nonce = crypto.randomBytes(16).toString('hex');
+  
+  const responseData = {
     success: true,
     server_time: now,
-    unixtime: Math.floor(now / 1000)
-  });
+    unixtime: timestamp,
+    response_timestamp: timestamp,
+    response_nonce: nonce
+  };
+  
+  // توقيع الاستجابة
+  const responseSignature = generateSignature(JSON.stringify(responseData), timestamp.toString());
+  res.set('x-response-signature', responseSignature);
+  
+  res.json(responseData);
 });
 
-app.post('/api/getUser', authApp, async (req, res) => {
+app.post('/api/getUser', authApp, verifyRequestSignature, async (req, res) => {
   try {
-    const { username } = req.body;
-    if (!username) return res.status(400).json({ success: false, error: 'مطلوب', code: 400 });
+    const { username, timestamp, nonce } = req.body;
+    
+    if (!username) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'اسم المستخدم مطلوب', 
+        code: 400 
+      });
+    }
     
     const url = `${FB_URL}/users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
     const response = await firebase.get(url);
     
     if (!response.data || Object.keys(response.data).length === 0) {
-      return res.json({});
+      return res.json({
+        success: false,
+        error: 'المستخدم غير موجود',
+        code: 1,
+        response_timestamp: Math.floor(Date.now() / 1000),
+        response_nonce: crypto.randomBytes(16).toString('hex')
+      });
     }
     
     const key = Object.keys(response.data)[0];
     const user = response.data[key];
     
-    res.json({
+    const responseData = {
       username: user.username,
       password_hash: user.password_hash,
       is_active: user.is_active || false,
@@ -663,42 +795,96 @@ app.post('/api/getUser', authApp, async (req, res) => {
       force_logout: user.force_logout || false,
       session_token: user.session_token || '',
       remaining_days: calculateRemainingDays(user.expiry_date),
-      firebase_key: key
-    });
+      firebase_key: key,
+      response_timestamp: Math.floor(Date.now() / 1000),
+      response_nonce: crypto.randomBytes(16).toString('hex')
+    };
+    
+    // توقيع الاستجابة
+    const responseSignature = generateSignature(
+      JSON.stringify(responseData), 
+      Math.floor(Date.now() / 1000).toString()
+    );
+    
+    res.set('x-response-signature', responseSignature);
+    res.json(responseData);
+    
   } catch (error) {
-    res.status(500).json({ success: false, error: 'خطأ', code: 0 });
+    console.error('خطأ في /api/getUser:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'خطأ في الخادم', 
+      code: 0,
+      response_timestamp: Math.floor(Date.now() / 1000)
+    });
   }
 });
 
-app.post('/api/updateDevice', authApp, async (req, res) => {
+app.post('/api/updateDevice', authApp, verifyRequestSignature, async (req, res) => {
   try {
-    const { username, deviceId } = req.body;
-    if (!username || !deviceId) return res.status(400).json({ success: false, error: 'ناقص', code: 400 });
+    const { username, deviceId, timestamp, nonce } = req.body;
+    
+    if (!username || !deviceId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'بيانات ناقصة', 
+        code: 400 
+      });
+    }
     
     const searchUrl = `${FB_URL}/users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
     const searchRes = await firebase.get(searchUrl);
     
     if (!searchRes.data || Object.keys(searchRes.data).length === 0) {
-      return res.json({ success: false, code: 1 });
+      return res.json({ 
+        success: false, 
+        code: 1,
+        response_timestamp: Math.floor(Date.now() / 1000)
+      });
     }
     
     const key = Object.keys(searchRes.data)[0];
     await firebase.patch(`${FB_URL}/users/${key}.json?auth=${FB_KEY}`, {
       device_id: deviceId,
-      last_login: new Date().toISOString()
+      last_login: new Date().toISOString(),
+      last_updated: Date.now()
     });
     
-    res.json({ success: true });
+    const responseData = {
+      success: true,
+      updated: true,
+      response_timestamp: Math.floor(Date.now() / 1000),
+      response_nonce: crypto.randomBytes(16).toString('hex')
+    };
+    
+    // توقيع الاستجابة
+    const responseSignature = generateSignature(
+      JSON.stringify(responseData), 
+      Math.floor(Date.now() / 1000).toString()
+    );
+    
+    res.set('x-response-signature', responseSignature);
+    res.json(responseData);
+    
   } catch (error) {
-    res.status(500).json({ success: false, code: 11 });
+    res.status(500).json({ 
+      success: false, 
+      code: 11,
+      response_timestamp: Math.floor(Date.now() / 1000)
+    });
   }
 });
 
-app.post('/api/verifyAccount', authApp, async (req, res) => {
+app.post('/api/verifyAccount', authApp, verifyRequestSignature, async (req, res) => {
   try {
-    const { username, password, deviceId } = req.body;
+    const { username, password, deviceId, timestamp, nonce } = req.body;
+    
     if (!username || !password || !deviceId) {
-      return res.status(400).json({ success: false, error: 'ناقص', code: 400 });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'بيانات ناقصة', 
+        code: 400 
+      });
     }
     
     const passHash = hashPassword(password);
@@ -706,40 +892,92 @@ app.post('/api/verifyAccount', authApp, async (req, res) => {
     const response = await firebase.get(url);
     
     if (!response.data || Object.keys(response.data).length === 0) {
-      return res.json({ success: false, code: 1 });
+      return res.json({ 
+        success: false, 
+        code: 1,
+        response_timestamp: Math.floor(Date.now() / 1000)
+      });
     }
     
     const key = Object.keys(response.data)[0];
     const user = response.data[key];
     
-    if (user.password_hash !== passHash) return res.json({ success: false, code: 2 });
-    if (!user.is_active) return res.json({ success: false, code: 3 });
-    if (user.device_id && user.device_id !== '' && user.device_id !== deviceId) {
-      return res.json({ success: false, code: 4 });
+    if (user.password_hash !== passHash) {
+      return res.json({ 
+        success: false, 
+        code: 2,
+        response_timestamp: Math.floor(Date.now() / 1000)
+      });
     }
+    
+    if (!user.is_active) {
+      return res.json({ 
+        success: false, 
+        code: 3,
+        response_timestamp: Math.floor(Date.now() / 1000)
+      });
+    }
+    
+    if (user.device_id && user.device_id !== '' && user.device_id !== deviceId) {
+      return res.json({ 
+        success: false, 
+        code: 4,
+        response_timestamp: Math.floor(Date.now() / 1000)
+      });
+    }
+    
     if (user.force_logout) {
-      return res.json({ success: false, code: 8, error: 'تم إجبارك على الخروج' });
+      return res.json({ 
+        success: false, 
+        code: 8, 
+        error: 'تم إجبارك على الخروج',
+        response_timestamp: Math.floor(Date.now() / 1000)
+      });
     }
     
     const remaining = calculateRemainingDays(user.expiry_date);
-    if (remaining <= 0) return res.json({ success: false, code: 7 });
+    if (remaining <= 0) {
+      return res.json({ 
+        success: false, 
+        code: 7,
+        response_timestamp: Math.floor(Date.now() / 1000)
+      });
+    }
     
     await firebase.patch(`${FB_URL}/users/${key}.json?auth=${FB_KEY}`, {
       device_id: deviceId,
       last_login: new Date().toISOString(),
       force_logout: false,
-      login_count: (user.login_count || 0) + 1
+      login_count: (user.login_count || 0) + 1,
+      last_updated: Date.now()
     });
     
-    res.json({
+    const responseData = {
       success: true,
       username: user.username,
       expiry_date: user.expiry_date,
       remaining_days: remaining,
-      is_active: true
-    });
+      is_active: true,
+      response_timestamp: Math.floor(Date.now() / 1000),
+      response_nonce: crypto.randomBytes(16).toString('hex')
+    };
+    
+    // توقيع الاستجابة
+    const responseSignature = generateSignature(
+      JSON.stringify(responseData), 
+      Math.floor(Date.now() / 1000).toString()
+    );
+    
+    res.set('x-response-signature', responseSignature);
+    res.json(responseData);
+    
   } catch (error) {
-    res.status(500).json({ success: false, code: 0 });
+    console.error('خطأ في /api/verifyAccount:', error);
+    res.status(500).json({ 
+      success: false, 
+      code: 0,
+      response_timestamp: Math.floor(Date.now() / 1000)
+    });
   }
 });
 
@@ -1023,10 +1261,11 @@ app.get('/api/health', async (req, res) => {
   
   res.json({
     status: 'healthy',
-    version: '2.4.0',
+    version: '2.5.0',
     firebase: fbStatus,
     uptime: Math.floor(process.uptime()),
-    activeSessions: adminSessions.size
+    activeSessions: adminSessions.size,
+    usedNonces: usedNonces.size
   });
 });
 
@@ -1037,7 +1276,7 @@ app.get('/', (req, res) => {
 <html dir="rtl">
 <head>
   <meta charset="UTF-8">
-  <title>Firebase Proxy v2.4.0</title>
+  <title>Firebase Proxy v2.5.0</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}
@@ -1048,26 +1287,34 @@ app.get('/', (req, res) => {
     .section h3{color:#4cc9f0;margin-bottom:10px}
     .ep{background:rgba(255,255,255,0.05);padding:8px 12px;margin:5px 0;border-radius:8px;font-family:monospace;font-size:13px}
     .new{background:rgba(16,185,129,0.2);border:1px solid #10b981}
+    .security{background:rgba(220,38,38,0.2);border:1px solid #dc2626}
   </style>
 </head>
 <body>
   <div class="box">
-    <h1>🛡️ Firebase Proxy v2.4.0</h1>
-    <div class="ok">✅ يعمل بنظام الجلسات الآمن</div>
+    <h1>🛡️ Firebase Proxy v2.5.0</h1>
+    <div class="ok">✅ يعمل بنظام التوقيع الرقمي الآمن</div>
     
     <div class="section">
-      <h3>🔐 Auth Endpoints (جديد)</h3>
-      <div class="ep new">POST /api/admin/login</div>
-      <div class="ep new">POST /api/admin/logout</div>
-      <div class="ep new">GET /api/admin/verify-session</div>
+      <h3>🔐 نظام التوقيع الرقمي (جديد)</h3>
+      <div class="ep security">✅ جميع الطلبات موقعة رقمياً</div>
+      <div class="ep security">✅ منع إعادة استخدام الطلبات (Nonce)</div>
+      <div class="ep security">✅ التحقق من الطابع الزمني (5 دقائق)</div>
     </div>
     
     <div class="section">
-      <h3>📱 App Endpoints</h3>
-      <div class="ep">GET /api/serverTime</div>
-      <div class="ep">POST /api/getUser</div>
-      <div class="ep">POST /api/updateDevice</div>
-      <div class="ep">POST /api/verifyAccount</div>
+      <h3>🔐 Auth Endpoints</h3>
+      <div class="ep">POST /api/admin/login</div>
+      <div class="ep">POST /api/admin/logout</div>
+      <div class="ep">GET /api/admin/verify-session</div>
+    </div>
+    
+    <div class="section">
+      <h3>📱 App Endpoints (موقعة)</h3>
+      <div class="ep security">GET /api/serverTime</div>
+      <div class="ep security">POST /api/getUser</div>
+      <div class="ep security">POST /api/updateDevice</div>
+      <div class="ep security">POST /api/verifyAccount</div>
     </div>
     
     <div class="section">
@@ -1077,13 +1324,10 @@ app.get('/', (req, res) => {
       <div class="ep">PATCH /api/admin/users/:id</div>
       <div class="ep">DELETE /api/admin/users/:id</div>
       <div class="ep">POST /api/admin/users/:id/extend</div>
-      <div class="ep">POST /api/admin/users/:id/force-logout</div>
-      <div class="ep">GET /api/admin/api-keys</div>
-      <div class="ep">POST /api/admin/api-keys</div>
     </div>
     
     <p style="margin-top:20px;color:#666;font-size:12px">
-      الجلسات النشطة: يتم تنظيفها تلقائياً كل ساعة
+      🔒 نظام التوقيع: مفعّل | الطلبات المنتهية: ${usedNonces.size}
     </p>
   </div>
 </body>
@@ -1097,8 +1341,9 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log('═'.repeat(50));
-  console.log('🛡️  Firebase Proxy v2.4.0 + Secure Sessions');
+  console.log('🛡️  Firebase Proxy v2.5.0 + Request Signing');
   console.log(`📡 http://localhost:${PORT}`);
-  console.log('🔐 نظام الجلسات: مفعّل');
+  console.log('🔐 نظام التوقيع الرقمي: مفعّل');
+  console.log(`🔑 مفتاح التوقيع: ${REQUEST_SIGNING_SECRET.substring(0, 8)}...`);
   console.log('═'.repeat(50));
 });
