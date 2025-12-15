@@ -26,6 +26,33 @@ const FB_URL = process.env.FIREBASE_URL;
 const FB_KEY = process.env.FIREBASE_KEY;
 
 // ═══════════════════════════════════════════
+// 🔐 نظام الجلسات الجديد
+// ═══════════════════════════════════════════
+
+const adminSessions = new Map();
+
+// بيانات الأدمن من Environment Variables
+const ADMIN_CREDENTIALS = {
+  username: process.env.ADMIN_USERNAME || 'admin',
+  password: process.env.ADMIN_PASSWORD || 'ChangeThisPassword123!'
+};
+
+// إنشاء session token آمن
+function generateSessionToken() {
+  return crypto.randomBytes(64).toString('hex');
+}
+
+// تنظيف الجلسات المنتهية كل ساعة
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of adminSessions.entries()) {
+    if (now - session.createdAt > 24 * 60 * 60 * 1000) {
+      adminSessions.delete(token);
+    }
+  }
+}, 60 * 60 * 1000);
+
+// ═══════════════════════════════════════════
 // AUTH MIDDLEWARE
 // ═══════════════════════════════════════════
 
@@ -38,14 +65,169 @@ const authApp = (req, res, next) => {
   next();
 };
 
+// ✅ Middleware جديد للأدمن - يدعم الجلسات
 const authAdmin = (req, res, next) => {
+  // طريقة 1: التحقق عبر Session Token (للوحة التحكم الجديدة)
+  const sessionToken = req.headers['x-session-token'];
+  if (sessionToken) {
+    const session = adminSessions.get(sessionToken);
+    
+    if (!session) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'جلسة غير صالحة - سجل الدخول مرة أخرى', 
+        code: 401 
+      });
+    }
+    
+    // تحقق من انتهاء الجلسة (24 ساعة)
+    if (Date.now() - session.createdAt > 24 * 60 * 60 * 1000) {
+      adminSessions.delete(sessionToken);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'انتهت صلاحية الجلسة', 
+        code: 401 
+      });
+    }
+    
+    // تحديث آخر نشاط
+    session.lastActivity = Date.now();
+    req.adminUser = session.username;
+    return next();
+  }
+  
+  // طريقة 2: التحقق عبر API Key (للتوافق مع الأنظمة القديمة)
   const adminKey = req.headers['x-admin-key'];
   const expected = process.env.ADMIN_API_KEY;
-  if (!expected || adminKey !== expected) {
-    return res.status(403).json({ success: false, error: 'صلاحيات الأدمن مطلوبة', code: 403 });
+  if (expected && adminKey === expected) {
+    req.adminUser = 'api-key-user';
+    return next();
   }
-  next();
+  
+  // لا يوجد مصادقة صالحة
+  return res.status(401).json({ 
+    success: false, 
+    error: 'غير مصرح - سجل الدخول أولاً', 
+    code: 401 
+  });
 };
+
+// ═══════════════════════════════════════════
+// 🔑 ADMIN LOGIN ENDPOINTS
+// ═══════════════════════════════════════════
+
+// تسجيل الدخول
+app.post('/api/admin/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  // التحقق من البيانات المطلوبة
+  if (!username || !password) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'اسم المستخدم وكلمة المرور مطلوبان' 
+    });
+  }
+  
+  // التحقق من صحة البيانات
+  if (username !== ADMIN_CREDENTIALS.username || 
+      password !== ADMIN_CREDENTIALS.password) {
+    
+    // تأخير للحماية من brute force
+    console.log(`❌ محاولة دخول فاشلة: ${username} من ${req.ip}`);
+    
+    return setTimeout(() => {
+      res.status(401).json({ 
+        success: false, 
+        error: 'اسم المستخدم أو كلمة المرور غير صحيحة' 
+      });
+    }, 1500); // تأخير 1.5 ثانية
+  }
+  
+  // إنشاء جلسة جديدة
+  const sessionToken = generateSessionToken();
+  
+  adminSessions.set(sessionToken, {
+    username,
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    ip: req.ip || req.connection.remoteAddress
+  });
+  
+  console.log(`✅ تسجيل دخول ناجح: ${username} من ${req.ip}`);
+  
+  res.json({ 
+    success: true, 
+    sessionToken,
+    expiresIn: '24 hours',
+    message: 'تم تسجيل الدخول بنجاح'
+  });
+});
+
+// تسجيل الخروج
+app.post('/api/admin/logout', (req, res) => {
+  const sessionToken = req.headers['x-session-token'];
+  
+  if (sessionToken && adminSessions.has(sessionToken)) {
+    const session = adminSessions.get(sessionToken);
+    console.log(`👋 تسجيل خروج: ${session.username}`);
+    adminSessions.delete(sessionToken);
+  }
+  
+  res.json({ success: true, message: 'تم تسجيل الخروج' });
+});
+
+// التحقق من صلاحية الجلسة
+app.get('/api/admin/verify-session', (req, res) => {
+  const sessionToken = req.headers['x-session-token'];
+  
+  if (!sessionToken) {
+    return res.status(401).json({ success: false, error: 'لا يوجد token' });
+  }
+  
+  const session = adminSessions.get(sessionToken);
+  
+  if (!session) {
+    return res.status(401).json({ success: false, error: 'جلسة غير صالحة' });
+  }
+  
+  // تحقق من انتهاء الصلاحية
+  if (Date.now() - session.createdAt > 24 * 60 * 60 * 1000) {
+    adminSessions.delete(sessionToken);
+    return res.status(401).json({ success: false, error: 'انتهت الجلسة' });
+  }
+  
+  res.json({ 
+    success: true, 
+    username: session.username,
+    createdAt: session.createdAt,
+    lastActivity: session.lastActivity
+  });
+});
+
+// معلومات الجلسات النشطة (للأدمن فقط)
+app.get('/api/admin/active-sessions', authAdmin, (req, res) => {
+  const sessions = [];
+  
+  for (const [token, session] of adminSessions.entries()) {
+    sessions.push({
+      username: session.username,
+      createdAt: new Date(session.createdAt).toISOString(),
+      lastActivity: new Date(session.lastActivity).toISOString(),
+      ip: session.ip,
+      tokenPreview: token.substring(0, 8) + '...'
+    });
+  }
+  
+  res.json({ success: true, count: sessions.length, sessions });
+});
+
+// إنهاء جميع الجلسات
+app.post('/api/admin/logout-all', authAdmin, (req, res) => {
+  const count = adminSessions.size;
+  adminSessions.clear();
+  console.log(`🔒 تم إنهاء ${count} جلسة`);
+  res.json({ success: true, message: `تم إنهاء ${count} جلسة` });
+});
 
 // ═══════════════════════════════════════════
 // HELPER FUNCTIONS
@@ -216,6 +398,22 @@ app.get('/api/admin/users', authAdmin, async (req, res) => {
   }
 });
 
+// 📋 جلب مستخدم واحد
+app.get('/api/admin/users/:userId', authAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const response = await firebase.get(`${FB_URL}/users/${userId}.json?auth=${FB_KEY}`);
+    
+    if (!response.data) {
+      return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
+    }
+    
+    res.json({ success: true, data: response.data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ➕ إضافة مستخدم جديد
 app.post('/api/admin/users', authAdmin, async (req, res) => {
   try {
@@ -241,7 +439,7 @@ app.post('/api/admin/users', authAdmin, async (req, res) => {
       max_devices: maxDevices || 1,
       created_at: timestamp,
       last_updated: timestamp,
-      created_by: 'admin',
+      created_by: req.adminUser || 'admin',
       notes: notes || '',
       session_token: crypto.randomBytes(32).toString('hex'),
       force_logout: false,
@@ -249,6 +447,8 @@ app.post('/api/admin/users', authAdmin, async (req, res) => {
     };
     
     await firebase.put(`${FB_URL}/users/${userId}.json?auth=${FB_KEY}`, userData);
+    
+    console.log(`➕ مستخدم جديد: ${username} بواسطة ${req.adminUser}`);
     
     res.json({ success: true, userId, expiryDate });
   } catch (error) {
@@ -274,6 +474,7 @@ app.delete('/api/admin/users/:userId', authAdmin, async (req, res) => {
   try {
     const { userId } = req.params;
     await firebase.delete(`${FB_URL}/users/${userId}.json?auth=${FB_KEY}`);
+    console.log(`🗑️ حذف مستخدم: ${userId} بواسطة ${req.adminUser}`);
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -286,12 +487,17 @@ app.post('/api/admin/users/:userId/extend', authAdmin, async (req, res) => {
     const { userId } = req.params;
     const { minutes } = req.body;
     
+    if (!minutes || minutes < 1) {
+      return res.status(400).json({ success: false, error: 'المدة مطلوبة' });
+    }
+    
     const userRes = await firebase.get(`${FB_URL}/users/${userId}.json?auth=${FB_KEY}`);
     const user = userRes.data;
     
     if (!user) return res.status(404).json({ success: false, error: 'غير موجود' });
     
-    const newTimestamp = user.expiry_timestamp + (minutes * 60 * 1000);
+    const currentExpiry = user.expiry_timestamp || Date.now();
+    const newTimestamp = currentExpiry + (minutes * 60 * 1000);
     const newDate = formatDate(new Date(newTimestamp));
     
     await firebase.patch(`${FB_URL}/users/${userId}.json?auth=${FB_KEY}`, {
@@ -300,7 +506,9 @@ app.post('/api/admin/users/:userId/extend', authAdmin, async (req, res) => {
       last_updated: Date.now()
     });
     
-    res.json({ success: true, newExpiry: newDate });
+    console.log(`⏰ تمديد: ${userId} بـ ${minutes} دقيقة بواسطة ${req.adminUser}`);
+    
+    res.json({ success: true, newExpiry: newDate, newTimestamp });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -317,6 +525,8 @@ app.post('/api/admin/users/:userId/force-logout', authAdmin, async (req, res) =>
       device_id: '',
       logout_timestamp: Date.now()
     });
+    
+    console.log(`🚪 إجبار خروج: ${userId} بواسطة ${req.adminUser}`);
     
     res.json({ success: true });
   } catch (error) {
@@ -377,7 +587,8 @@ app.post('/api/admin/api-keys', authAdmin, async (req, res) => {
       is_active: true,
       created_at: timestamp,
       expiry_timestamp: expiryTimestamp,
-      usage_count: 0
+      usage_count: 0,
+      created_by: req.adminUser || 'admin'
     };
     
     await firebase.put(`${FB_URL}/api_keys/${keyId}.json?auth=${FB_KEY}`, keyData);
@@ -435,7 +646,8 @@ app.get('/api/admin/stats', authAdmin, async (req, res) => {
         totalUsers,
         activeUsers,
         expiredUsers,
-        totalKeys: Object.keys(keys).length
+        totalKeys: Object.keys(keys).length,
+        activeSessions: adminSessions.size
       }
     });
   } catch (error) {
@@ -452,9 +664,10 @@ app.get('/api/health', async (req, res) => {
   
   res.json({
     status: 'healthy',
-    version: '2.3.0',
+    version: '2.4.0',
     firebase: fbStatus,
-    uptime: Math.floor(process.uptime())
+    uptime: Math.floor(process.uptime()),
+    activeSessions: adminSessions.size
   });
 });
 
@@ -465,22 +678,30 @@ app.get('/', (req, res) => {
 <html dir="rtl">
 <head>
   <meta charset="UTF-8">
-  <title>Firebase Proxy v2.3.0</title>
+  <title>Firebase Proxy v2.4.0</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}
-    .box{background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;text-align:center}
+    .box{background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;text-align:center;max-width:600px}
     h1{color:#4cc9f0;margin-bottom:20px}
     .ok{background:#10b981;padding:10px 30px;border-radius:50px;display:inline-block;margin:20px 0}
     .section{margin:20px 0;text-align:right}
     .section h3{color:#4cc9f0;margin-bottom:10px}
     .ep{background:rgba(255,255,255,0.05);padding:8px 12px;margin:5px 0;border-radius:8px;font-family:monospace;font-size:13px}
+    .new{background:rgba(16,185,129,0.2);border:1px solid #10b981}
   </style>
 </head>
 <body>
   <div class="box">
-    <h1>🛡️ Firebase Proxy v2.3.0</h1>
-    <div class="ok">✅ يعمل</div>
+    <h1>🛡️ Firebase Proxy v2.4.0</h1>
+    <div class="ok">✅ يعمل بنظام الجلسات الآمن</div>
+    
+    <div class="section">
+      <h3>🔐 Auth Endpoints (جديد)</h3>
+      <div class="ep new">POST /api/admin/login</div>
+      <div class="ep new">POST /api/admin/logout</div>
+      <div class="ep new">GET /api/admin/verify-session</div>
+    </div>
     
     <div class="section">
       <h3>📱 App Endpoints</h3>
@@ -501,6 +722,10 @@ app.get('/', (req, res) => {
       <div class="ep">GET /api/admin/api-keys</div>
       <div class="ep">POST /api/admin/api-keys</div>
     </div>
+    
+    <p style="margin-top:20px;color:#666;font-size:12px">
+      الجلسات النشطة: يتم تنظيفها تلقائياً كل ساعة
+    </p>
   </div>
 </body>
 </html>
@@ -512,8 +737,9 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('═'.repeat(40));
-  console.log('🛡️  Firebase Proxy v2.3.0 + Admin API');
+  console.log('═'.repeat(50));
+  console.log('🛡️  Firebase Proxy v2.4.0 + Secure Sessions');
   console.log(`📡 http://localhost:${PORT}`);
-  console.log('═'.repeat(40));
+  console.log('🔐 نظام الجلسات: مفعّل');
+  console.log('═'.repeat(50));
 });
