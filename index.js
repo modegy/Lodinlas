@@ -113,13 +113,13 @@ const authAdmin = (req, res, next) => {
 };
 
 
-
 // ═══════════════════════════════════════════
-// 🔑 AUTH للـ SUB ADMIN (عبر API Key)
+// 🔑 AUTH للـ SUB ADMIN مع ربط الجهاز
 // ═══════════════════════════════════════════
 
 const authSubAdmin = async (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
+  const deviceFingerprint = req.headers['x-device-fingerprint'];
   
   if (!apiKey) {
     return res.status(401).json({ 
@@ -129,8 +129,15 @@ const authSubAdmin = async (req, res, next) => {
     });
   }
   
+  if (!deviceFingerprint) {
+    return res.status(401).json({ 
+      success: false, 
+      error: 'معرف الجهاز مطلوب', 
+      code: 401 
+    });
+  }
+  
   try {
-    // البحث عن المفتاح في Firebase
     const response = await firebase.get(`${FB_URL}/api_keys.json?auth=${FB_KEY}`);
     const keys = response.data || {};
     
@@ -153,7 +160,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // تحقق من أن المفتاح نشط
     if (!foundKey.is_active) {
       return res.status(403).json({ 
         success: false, 
@@ -162,7 +168,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // تحقق من انتهاء الصلاحية
     if (foundKey.expiry_timestamp && foundKey.expiry_timestamp < Date.now()) {
       return res.status(403).json({ 
         success: false, 
@@ -171,13 +176,32 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
+    // ═══ التحقق من الجهاز ═══
+    if (foundKey.bound_device) {
+      // المفتاح مربوط بجهاز - تحقق أنه نفس الجهاز
+      if (foundKey.bound_device !== deviceFingerprint) {
+        console.log(`⚠️ محاولة دخول من جهاز مختلف: ${foundKey.admin_name}`);
+        return res.status(403).json({ 
+          success: false, 
+          error: 'هذا المفتاح مربوط بجهاز آخر', 
+          code: 403 
+        });
+      }
+    } else {
+      // أول استخدام - ربط المفتاح بهذا الجهاز
+      await firebase.patch(`${FB_URL}/api_keys/${keyId}.json?auth=${FB_KEY}`, {
+        bound_device: deviceFingerprint,
+        device_bound_at: Date.now()
+      });
+      console.log(`🔗 تم ربط مفتاح "${foundKey.admin_name}" بالجهاز`);
+    }
+    
     // تحديث عداد الاستخدام
     await firebase.patch(`${FB_URL}/api_keys/${keyId}.json?auth=${FB_KEY}`, {
       usage_count: (foundKey.usage_count || 0) + 1,
       last_used: Date.now()
     });
     
-    // إضافة معلومات المفتاح للـ request
     req.subAdmin = {
       name: foundKey.admin_name,
       permission: foundKey.permission_level || 'view_only',
@@ -188,11 +212,7 @@ const authSubAdmin = async (req, res, next) => {
     
   } catch (error) {
     console.error('خطأ في التحقق من API Key:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'خطأ في التحقق', 
-      code: 500 
-    });
+    res.status(500).json({ success: false, error: 'خطأ في التحقق', code: 500 });
   }
 };
 
@@ -226,12 +246,12 @@ const checkPermission = (required) => {
 // 🔐 SUB ADMIN ENDPOINTS
 // ═══════════════════════════════════════════
 
-// التحقق من المفتاح والحصول على الصلاحيات
+// التحقق من المفتاح مع ربط الجهاز
 app.post('/api/sub/verify-key', async (req, res) => {
-  const { apiKey } = req.body;
+  const { apiKey, deviceFingerprint } = req.body;
   
-  if (!apiKey) {
-    return res.status(400).json({ success: false, error: 'المفتاح مطلوب' });
+  if (!apiKey || !deviceFingerprint) {
+    return res.status(400).json({ success: false, error: 'المفتاح ومعرف الجهاز مطلوبان' });
   }
   
   try {
@@ -249,11 +269,28 @@ app.post('/api/sub/verify-key', async (req, res) => {
           return res.json({ success: false, error: 'المفتاح منتهي' });
         }
         
+        // التحقق من الجهاز
+        if (keyData.bound_device && keyData.bound_device !== deviceFingerprint) {
+          return res.json({ 
+            success: false, 
+            error: 'هذا المفتاح مربوط بجهاز آخر ولا يمكن استخدامه هنا' 
+          });
+        }
+        
+        // ربط الجهاز إذا كان أول استخدام
+        if (!keyData.bound_device) {
+          await firebase.patch(`${FB_URL}/api_keys/${id}.json?auth=${FB_KEY}`, {
+            bound_device: deviceFingerprint,
+            device_bound_at: Date.now()
+          });
+        }
+        
         return res.json({ 
           success: true,
           name: keyData.admin_name,
           permission: keyData.permission_level || 'view_only',
-          expiresAt: keyData.expiry_timestamp
+          expiresAt: keyData.expiry_timestamp,
+          isBound: !!keyData.bound_device
         });
       }
     }
@@ -265,7 +302,7 @@ app.post('/api/sub/verify-key', async (req, res) => {
   }
 });
 
-// عرض المستخدمين (للجميع)
+// عرض المستخدمين
 app.get('/api/sub/users', authSubAdmin, checkPermission('view'), async (req, res) => {
   try {
     const response = await firebase.get(`${FB_URL}/users.json?auth=${FB_KEY}`);
@@ -275,18 +312,40 @@ app.get('/api/sub/users', authSubAdmin, checkPermission('view'), async (req, res
   }
 });
 
-// إضافة مستخدم (add_only أو full)
+// إضافة مستخدم - يدعم التاريخ المخصص
 app.post('/api/sub/users', authSubAdmin, checkPermission('add'), async (req, res) => {
   try {
-    const { username, password, expiryMinutes, maxDevices, status } = req.body;
+    const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
     
-    if (!username || !password || !expiryMinutes) {
-      return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
+    if (!username || !password) {
+      return res.status(400).json({ success: false, error: 'اسم المستخدم وكلمة المرور مطلوبان' });
+    }
+    
+    if (!expiryMinutes && !customExpiryDate) {
+      return res.status(400).json({ success: false, error: 'حدد المدة أو التاريخ' });
     }
     
     const timestamp = Date.now();
-    const expiryTimestamp = timestamp + (expiryMinutes * 60 * 1000);
-    const expiryDate = formatDate(new Date(expiryTimestamp));
+    let expiryTimestamp;
+    let expiryDate;
+    
+    // إذا تم تحديد تاريخ مخصص
+    if (customExpiryDate) {
+      const customDate = new Date(customExpiryDate);
+      if (isNaN(customDate.getTime())) {
+        return res.status(400).json({ success: false, error: 'تاريخ غير صالح' });
+      }
+      if (customDate.getTime() <= timestamp) {
+        return res.status(400).json({ success: false, error: 'التاريخ يجب أن يكون في المستقبل' });
+      }
+      expiryTimestamp = customDate.getTime();
+      expiryDate = formatDate(customDate);
+    } else {
+      // استخدام المدة بالدقائق
+      expiryTimestamp = timestamp + (expiryMinutes * 60 * 1000);
+      expiryDate = formatDate(new Date(expiryTimestamp));
+    }
+    
     const userId = `user_${username}_${timestamp}`;
     
     const userData = {
@@ -316,7 +375,7 @@ app.post('/api/sub/users', authSubAdmin, checkPermission('add'), async (req, res
   }
 });
 
-// تمديد مستخدم (extend_only أو full)
+// تمديد مستخدم
 app.post('/api/sub/users/:userId/extend', authSubAdmin, checkPermission('extend'), async (req, res) => {
   try {
     const { userId } = req.params;
@@ -351,7 +410,7 @@ app.post('/api/sub/users/:userId/extend', authSubAdmin, checkPermission('extend'
   }
 });
 
-// حذف مستخدم (full فقط)
+// حذف مستخدم
 app.delete('/api/sub/users/:userId', authSubAdmin, checkPermission('delete'), async (req, res) => {
   try {
     const { userId } = req.params;
@@ -363,7 +422,7 @@ app.delete('/api/sub/users/:userId', authSubAdmin, checkPermission('delete'), as
   }
 });
 
-// تعديل مستخدم (full فقط)
+// تعديل مستخدم
 app.patch('/api/sub/users/:userId', authSubAdmin, checkPermission('edit'), async (req, res) => {
   try {
     const { userId } = req.params;
@@ -375,7 +434,7 @@ app.patch('/api/sub/users/:userId', authSubAdmin, checkPermission('edit'), async
   }
 });
 
-// إعادة تعيين الجهاز (full فقط)
+// إعادة تعيين الجهاز
 app.post('/api/sub/users/:userId/reset-device', authSubAdmin, checkPermission('edit'), async (req, res) => {
   try {
     const { userId } = req.params;
