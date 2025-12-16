@@ -21,19 +21,7 @@ if (!process.env.FIREBASE_URL || !process.env.FIREBASE_KEY) {
 
 // 2. Helmet - حماية Headers
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'"],
-      fontSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      mediaSrc: ["'self'"],
-      frameSrc: ["'none'"]
-    }
-  },
+  contentSecurityPolicy: false, // تم التبسيط
   hsts: {
     maxAge: 31536000,
     includeSubDomains: true,
@@ -51,8 +39,8 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   : ['*'];
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (allowedOrigins.includes('*') || !origin || allowedOrigins.includes(origin)) {
+  origin: function (origin, callback) {
+    if (allowedOrigins[0] === '*' || !origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
       callback(new Error('غير مصرح من CORS'));
@@ -102,8 +90,8 @@ const apiLimiter = createRateLimiter(
   'تجاوزت حد الطلبات - انتظر قليلاً'
 );
 
-// 5. Brute Force Protection - بديل بسيط بدون Redis
-const loginAttempts = new Map(); // IP -> { count, lastAttempt, blockedUntil }
+// 5. Brute Force Protection
+const loginAttempts = new Map();
 
 const bruteForcePrevention = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress;
@@ -143,7 +131,7 @@ const recordFailedLogin = (ip) => {
   
   // بعد 5 محاولات فاشلة
   if (attempt.count >= 5) {
-    attempt.blockedUntil = now + (30 * 60 * 1000); // حظر 30 دقيقة
+    attempt.blockedUntil = now + (30 * 60 * 1000);
     console.error(`🚨 Brute force detected: ${ip} - Blocked for 30 minutes`);
   }
   
@@ -166,15 +154,7 @@ setInterval(() => {
 
 // 6. Request Size Limiting
 app.use(express.json({ 
-  limit: '10mb',
-  verify: (req, res, buf) => {
-    // التحقق من صحة JSON
-    try {
-      JSON.parse(buf);
-    } catch (e) {
-      throw new Error('بيانات JSON غير صالحة');
-    }
-  }
+  limit: '10mb'
 }));
 
 // 7. IP Blacklist/Whitelist System
@@ -218,12 +198,6 @@ const requestLogger = (req, res, next) => {
     if (duration > 5000 || res.statusCode >= 400) {
       console.log(`📊 ${req.method} ${req.path} | IP: ${ip} | Status: ${res.statusCode} | ${duration}ms`);
     }
-    
-    // كشف هجمات DDoS المحتملة
-    if (duration < 10 && res.statusCode === 200) {
-      // طلبات سريعة جداً قد تكون بوت
-      console.warn(`⚡ Suspicious fast request: ${ip} - ${duration}ms`);
-    }
   });
   
   next();
@@ -232,7 +206,7 @@ const requestLogger = (req, res, next) => {
 app.use(requestLogger);
 
 // 9. Anti-DDoS Pattern Detection
-const requestPatterns = new Map(); // IP -> [timestamps]
+const requestPatterns = new Map();
 
 const ddosDetection = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress;
@@ -250,7 +224,7 @@ const ddosDetection = (req, res, next) => {
   // إذا تجاوز 30 طلب في الدقيقة
   if (recentRequests.length > 30) {
     console.error(`🚨 DDoS Pattern Detected: ${ip} - ${recentRequests.length} requests/min`);
-    ipBlacklist.add(ip); // إضافة للقائمة السوداء تلقائياً
+    ipBlacklist.add(ip);
     return res.status(429).json({ 
       success: false, 
       error: 'تم كشف نمط DDoS - تم حظرك'
@@ -283,8 +257,7 @@ setInterval(() => {
 // ═══════════════════════════════════════════
 
 const firebase = axios.create({ 
-  timeout: 15000,
-  maxRedirects: 0 // منع الإعادة التوجيه
+  timeout: 15000
 });
 
 const FB_URL = process.env.FIREBASE_URL;
@@ -297,7 +270,11 @@ const ADMIN_CREDENTIALS = {
 };
 
 function generateSessionToken() {
-  return crypto.randomBytes(64).toString('hex');
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password).digest('hex');
 }
 
 // تنظيف الجلسات كل ساعة
@@ -322,8 +299,8 @@ const authApp = (req, res, next) => {
     return res.status(401).json({ success: false, error: 'API Key مطلوب', code: 401 });
   }
   
-  // Constant-time comparison لمنع timing attacks
-  if (crypto.timingSafeEqual(Buffer.from(apiKey), Buffer.from(expected))) {
+  // مقارنة بسيطة لمنع الأخطاء
+  if (apiKey === expected) {
     return next();
   }
   
@@ -362,7 +339,7 @@ const authAdmin = (req, res, next) => {
   const adminKey = req.headers['x-admin-key'];
   const expected = process.env.ADMIN_API_KEY;
   
-  if (expected && adminKey && crypto.timingSafeEqual(Buffer.from(adminKey), Buffer.from(expected))) {
+  if (expected && adminKey === expected) {
     req.adminUser = 'api-key-user';
     return next();
   }
@@ -467,18 +444,8 @@ app.post('/api/admin/login', loginLimiter, bruteForcePrevention, (req, res) => {
     });
   }
   
-  // Constant-time comparison
-  const usernameMatch = crypto.timingSafeEqual(
-    Buffer.from(username.padEnd(50)), 
-    Buffer.from(ADMIN_CREDENTIALS.username.padEnd(50))
-  );
-  
-  const passwordMatch = crypto.timingSafeEqual(
-    Buffer.from(password.padEnd(50)), 
-    Buffer.from(ADMIN_CREDENTIALS.password.padEnd(50))
-  );
-  
-  if (!usernameMatch || !passwordMatch) {
+  // مقارنة بسيطة
+  if (username !== ADMIN_CREDENTIALS.username || password !== ADMIN_CREDENTIALS.password) {
     console.warn(`❌ فشل الدخول: ${username} من ${ip}`);
     recordFailedLogin(ip);
     
@@ -519,23 +486,6 @@ app.post('/api/admin/logout', (req, res) => {
   
   res.json({ success: true });
 });
-
-// ═══════════════════════════════════════════
-// HELPER FUNCTIONS
-// ═══════════════════════════════════════════
-
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(password, 'utf8').digest('hex');
-}
-
-function formatDate(date) {
-  const d = String(date.getDate()).padStart(2, '0');
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const y = date.getFullYear();
-  const h = String(date.getHours()).padStart(2, '0');
-  const min = String(date.getMinutes()).padStart(2, '0');
-  return `${d}/${m}/${y} ${h}:${min}`;
-}
 
 // ═══════════════════════════════════════════
 // 📱 APP ENDPOINTS
@@ -653,7 +603,7 @@ app.get('/', (req, res) => {
         <h3>🔐 مصادقة آمنة</h3>
         <ul>
           <li>Session-based Authentication</li>
-          <li>Timing-safe Comparisons</li>
+          <li>Secure API Key Validation</li>
           <li>تشفير كلمات المرور SHA-256</li>
           <li>Device Fingerprinting</li>
           <li>تنظيف الجلسات التلقائي</li>
@@ -705,7 +655,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, error: 'خطأ في الخادم' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
   console.log('═'.repeat(60));
   console.log('🛡️  SECURE Firebase Proxy v3.0');
   console.log(`📡 Server: http://localhost:${PORT}`);
