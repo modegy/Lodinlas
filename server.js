@@ -4,8 +4,6 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
-const ExpressBrute = require('express-brute');
-const RedisStore = require('express-brute-redis');
 require('dotenv').config();
 
 const app = express();
@@ -104,27 +102,67 @@ const apiLimiter = createRateLimiter(
   'تجاوزت حد الطلبات - انتظر قليلاً'
 );
 
-// 5. Express Brute - الحماية من Brute Force
-const bruteStore = process.env.REDIS_URL 
-  ? new RedisStore({ 
-      host: process.env.REDIS_HOST || '127.0.0.1',
-      port: process.env.REDIS_PORT || 6379
-    })
-  : new ExpressBrute.MemoryStore();
+// 5. Brute Force Protection - بديل بسيط بدون Redis
+const loginAttempts = new Map(); // IP -> { count, lastAttempt, blockedUntil }
 
-const bruteforce = new ExpressBrute(bruteStore, {
-  freeRetries: 3,
-  minWait: 5 * 60 * 1000, // 5 دقائق
-  maxWait: 60 * 60 * 1000, // 1 ساعة
-  failCallback: (req, res, next, nextValidRequestDate) => {
-    console.error(`🚨 Brute force detected: ${req.ip}`);
-    res.status(429).json({ 
-      success: false, 
-      error: 'تم حظرك مؤقتاً بسبب محاولات متكررة',
-      nextValidRequestDate
+const bruteForcePrevention = (req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  
+  if (!loginAttempts.has(ip)) {
+    loginAttempts.set(ip, { count: 0, lastAttempt: now, blockedUntil: null });
+  }
+  
+  const attempt = loginAttempts.get(ip);
+  
+  // إذا كان محظوراً
+  if (attempt.blockedUntil && now < attempt.blockedUntil) {
+    const waitTime = Math.ceil((attempt.blockedUntil - now) / 1000 / 60);
+    return res.status(429).json({
+      success: false,
+      error: `تم حظرك مؤقتاً. حاول بعد ${waitTime} دقيقة`,
+      blockedUntil: attempt.blockedUntil
     });
   }
-});
+  
+  // إعادة تعيين إذا مر أكثر من 15 دقيقة
+  if (now - attempt.lastAttempt > 15 * 60 * 1000) {
+    attempt.count = 0;
+    attempt.blockedUntil = null;
+  }
+  
+  next();
+};
+
+const recordFailedLogin = (ip) => {
+  const now = Date.now();
+  const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: now, blockedUntil: null };
+  
+  attempt.count++;
+  attempt.lastAttempt = now;
+  
+  // بعد 5 محاولات فاشلة
+  if (attempt.count >= 5) {
+    attempt.blockedUntil = now + (30 * 60 * 1000); // حظر 30 دقيقة
+    console.error(`🚨 Brute force detected: ${ip} - Blocked for 30 minutes`);
+  }
+  
+  loginAttempts.set(ip, attempt);
+};
+
+const resetLoginAttempts = (ip) => {
+  loginAttempts.delete(ip);
+};
+
+// تنظيف محاولات تسجيل الدخول القديمة كل ساعة
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, attempt] of loginAttempts.entries()) {
+    if (now - attempt.lastAttempt > 60 * 60 * 1000) {
+      loginAttempts.delete(ip);
+    }
+  }
+}, 60 * 60 * 1000);
 
 // 6. Request Size Limiting
 app.use(express.json({ 
@@ -158,7 +196,7 @@ const ipFilter = (req, res, next) => {
   }
   
   // إذا كانت القائمة البيضاء مفعلة وال IP ليس فيها
-  if (ipWhitelist.size > 0 && !ipWhitelist.includes('*') && !ipWhitelist.has(clientIp)) {
+  if (ipWhitelist.size > 0 && !ipWhitelist.has('*') && !ipWhitelist.has(clientIp)) {
     console.warn(`⚠️ Unauthorized IP: ${clientIp}`);
     return res.status(403).json({ success: false, error: 'غير مصرح' });
   }
@@ -418,8 +456,9 @@ const authSubAdmin = async (req, res, next) => {
 // 🔑 SECURE AUTH ENDPOINTS
 // ═══════════════════════════════════════════
 
-app.post('/api/admin/login', loginLimiter, bruteforce.prevent, (req, res) => {
+app.post('/api/admin/login', loginLimiter, bruteForcePrevention, (req, res) => {
   const { username, password } = req.body;
+  const ip = req.ip || req.connection.remoteAddress;
   
   if (!username || !password) {
     return res.status(400).json({ 
@@ -440,7 +479,8 @@ app.post('/api/admin/login', loginLimiter, bruteforce.prevent, (req, res) => {
   );
   
   if (!usernameMatch || !passwordMatch) {
-    console.warn(`❌ فشل الدخول: ${username} من ${req.ip}`);
+    console.warn(`❌ فشل الدخول: ${username} من ${ip}`);
+    recordFailedLogin(ip);
     
     return setTimeout(() => {
       res.status(401).json({ 
@@ -450,16 +490,18 @@ app.post('/api/admin/login', loginLimiter, bruteforce.prevent, (req, res) => {
     }, 2000);
   }
   
+  resetLoginAttempts(ip);
+  
   const sessionToken = generateSessionToken();
   
   adminSessions.set(sessionToken, {
     username,
     createdAt: Date.now(),
     lastActivity: Date.now(),
-    ip: req.ip || req.connection.remoteAddress
+    ip: ip
   });
   
-  console.log(`✅ دخول ناجح: ${username} من ${req.ip}`);
+  console.log(`✅ دخول ناجح: ${username} من ${ip}`);
   
   res.json({ 
     success: true, 
@@ -663,7 +705,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, error: 'خطأ في الخادم' });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log('═'.repeat(60));
   console.log('🛡️  SECURE Firebase Proxy v3.0');
   console.log(`📡 Server: http://localhost:${PORT}`);
