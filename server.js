@@ -912,6 +912,250 @@ setInterval(() => {
     }
   }
 }, 60 * 60 * 1000);
+
+// ═══════════════════════════════════════════
+// 🔐 SUB ADMIN ENDPOINTS - أضف هذا فقط
+// ═══════════════════════════════════════════
+
+// 1. التحقق من مفتاح Sub Admin
+app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
+  try {
+    const { apiKey, deviceFingerprint } = req.body;
+    
+    console.log('🔑 التحقق من المفتاح:', apiKey?.substring(0, 10) + '...');
+    
+    if (!apiKey) {
+      return res.status(400).json({ success: false, error: 'API key required' });
+    }
+    
+    // البحث في Firebase
+    const response = await firebase.get(`${FB_URL}/api_keys.json?auth=${FB_KEY}`);
+    const keys = response.data || {};
+    
+    let foundKey = null;
+    let keyId = null;
+    
+    for (const [id, key] of Object.entries(keys)) {
+      if (key.api_key === apiKey) {
+        foundKey = key;
+        keyId = id;
+        break;
+      }
+    }
+    
+    if (!foundKey) {
+      return res.status(401).json({ success: false, error: 'Invalid API key' });
+    }
+    
+    // التحقق من صلاحية المفتاح
+    if (foundKey.is_active === false) {
+      return res.status(403).json({ success: false, error: 'Key is inactive' });
+    }
+    
+    if (foundKey.expiry_timestamp && Date.now() > foundKey.expiry_timestamp) {
+      return res.status(403).json({ success: false, error: 'Key expired' });
+    }
+    
+    // ربط الجهاز
+    if (!foundKey.bound_device) {
+      await firebase.patch(`${FB_URL}/api_keys/${keyId}.json?auth=${FB_KEY}`, {
+        bound_device: deviceFingerprint
+      });
+    } else if (foundKey.bound_device !== deviceFingerprint) {
+      return res.status(403).json({
+        success: false,
+        error: 'Key is bound to another device'
+      });
+    }
+    
+    // تحديث الاستخدام
+    await firebase.patch(`${FB_URL}/api_keys/${keyId}.json?auth=${FB_KEY}`, {
+      usage_count: (foundKey.usage_count || 0) + 1,
+      last_used: Date.now()
+    });
+    
+    res.json({
+      success: true,
+      name: foundKey.admin_name,
+      permission: foundKey.permission_level || 'view_only',
+      key_id: keyId
+    });
+    
+  } catch (error) {
+    console.error('Verify key error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// 2. نقاط النهاية الأخرى للـ Sub Admin
+app.get('/api/sub/users', authSubAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`${FB_URL}/users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    const formattedUsers = {};
+    for (const [id, user] of Object.entries(users)) {
+      const expiry = user.subscription_end || 0;
+      formattedUsers[id] = {
+        username: user.username || '',
+        is_active: user.is_active !== false,
+        expiry_timestamp: expiry,
+        expiry_date: expiry ? formatDate(new Date(expiry)) : '',
+        device_id: user.device_id || ''
+      };
+    }
+    
+    res.json({
+      success: true,
+      data: formattedUsers,
+      count: Object.keys(formattedUsers).length
+    });
+    
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch users' });
+  }
+});
+
+app.get('/api/sub/stats', authSubAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`${FB_URL}/users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    const now = Date.now();
+    let total = 0, active = 0, expired = 0;
+    
+    for (const user of Object.values(users)) {
+      total++;
+      if (user.is_active !== false) active++;
+      if (user.subscription_end && user.subscription_end <= now) expired++;
+    }
+    
+    res.json({
+      success: true,
+      stats: {
+        totalUsers: total,
+        activeUsers: active,
+        expiredUsers: expired
+      }
+    });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to get stats' });
+  }
+});
+
+app.post('/api/sub/users', authSubAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { username, password, expiryMinutes, customExpiryDate } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json({ success: false, error: 'Username and password required' });
+    }
+    
+    // حساب تاريخ الانتهاء
+    let expiryTimestamp;
+    if (customExpiryDate) {
+      expiryTimestamp = new Date(customExpiryDate).getTime();
+    } else if (expiryMinutes) {
+      expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
+    } else {
+      return res.status(400).json({ success: false, error: 'Expiry time required' });
+    }
+    
+    // إنشاء المستخدم
+    const userData = {
+      username,
+      password_hash: hashPassword(password),
+      is_active: true,
+      subscription_end: expiryTimestamp,
+      max_devices: 1,
+      device_id: '',
+      created_at: Date.now(),
+      created_by: req.subAdmin?.name || 'sub_admin'
+    };
+    
+    const result = await firebase.post(`${FB_URL}/users.json?auth=${FB_KEY}`, userData);
+    
+    res.json({
+      success: true,
+      message: 'User created',
+      userId: result.data.name,
+      expiry_date: formatDate(new Date(expiryTimestamp))
+    });
+    
+  } catch (error) {
+    console.error('Create user error:', error);
+    res.status(500).json({ success: false, error: 'Failed to create user' });
+  }
+});
+
+app.post('/api/sub/users/:id/extend', authSubAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { minutes } = req.body;
+    
+    if (!minutes) {
+      return res.status(400).json({ success: false, error: 'Extension time required' });
+    }
+    
+    const userRes = await firebase.get(`${FB_URL}/users/${req.params.id}.json?auth=${FB_KEY}`);
+    if (!userRes.data) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    
+    const user = userRes.data;
+    const now = Date.now();
+    const currentEnd = user.subscription_end || now;
+    const newEndDate = (currentEnd > now ? currentEnd : now) + (minutes * 60 * 1000);
+    
+    await firebase.patch(`${FB_URL}/users/${req.params.id}.json?auth=${FB_KEY}`, {
+      subscription_end: newEndDate,
+      is_active: true
+    });
+    
+    res.json({
+      success: true,
+      message: 'Subscription extended',
+      new_end_date: newEndDate,
+      formatted_date: formatDate(new Date(newEndDate))
+    });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to extend subscription' });
+  }
+});
+
+app.patch('/api/sub/users/:id', authSubAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { is_active } = req.body;
+    
+    await firebase.patch(`${FB_URL}/users/${req.params.id}.json?auth=${FB_KEY}`, { is_active });
+    
+    res.json({ success: true, message: 'User updated' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to update user' });
+  }
+});
+
+app.post('/api/sub/users/:id/reset-device', authSubAdmin, apiLimiter, async (req, res) => {
+  try {
+    await firebase.patch(`${FB_URL}/users/${req.params.id}.json?auth=${FB_KEY}`, { device_id: '' });
+    
+    res.json({ success: true, message: 'Device reset' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to reset device' });
+  }
+});
+
+app.delete('/api/sub/users/:id', authSubAdmin, apiLimiter, async (req, res) => {
+  try {
+    await firebase.delete(`${FB_URL}/users/${req.params.id}.json?auth=${FB_KEY}`);
+    
+    res.json({ success: true, message: 'User deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to delete user' });
+  }
+});
 app.listen(PORT, () => {
   console.log('═'.repeat(50));
   console.log('🛡️  Secure Firebase Proxy v3.1');
