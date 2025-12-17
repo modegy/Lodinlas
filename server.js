@@ -444,6 +444,221 @@ app.post('/api/updateDevice', authApp, apiLimiter, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════
+// 🆕 ADMIN PANEL ENDPOINTS
+// ═══════════════════════════════════════════
+
+// 🔹 1. Get All Users
+app.get('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    // Format users data
+    const formattedUsers = Object.keys(users).map(userId => ({
+      id: userId,
+      username: users[userId].username || '',
+      is_active: users[userId].is_active || false,
+      subscription_end: users[userId].subscription_end || null,
+      created_at: users[userId].created_at || null,
+      last_login: users[userId].last_login || null,
+      device_id: users[userId].device_id || '',
+      notes: users[userId].notes || ''
+    }));
+    
+    res.json({
+      success: true,
+      count: formattedUsers.length,
+      users: formattedUsers
+    });
+    
+  } catch (error) {
+    console.error('Get users error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch users' 
+    });
+  }
+});
+
+// 🔹 2. Get Single User by ID
+app.get('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    
+    if (!userId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'User ID is required' 
+      });
+    }
+    
+    const response = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+    const user = response.data;
+    
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'User not found' 
+      });
+    }
+    
+    res.json({
+      success: true,
+      user: {
+        id: userId,
+        username: user.username || '',
+        password_hash: user.password_hash || '',
+        is_active: user.is_active || false,
+        subscription_end: user.subscription_end || null,
+        created_at: user.created_at || null,
+        last_login: user.last_login || null,
+        device_id: user.device_id || '',
+        notes: user.notes || ''
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get user error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch user' 
+    });
+  }
+});
+
+// 🔹 3. Extend User Subscription
+app.post('/api/admin/users/:id/extend', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { days, hours } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'User ID is required' 
+      });
+    }
+    
+    if ((!days && !hours) || (days < 0 || hours < 0)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Please provide valid extension time (days or hours)' 
+      });
+    }
+    
+    // Get current user data
+    const userResponse = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+    const user = userResponse.data;
+    
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'User not found' 
+      });
+    }
+    
+    const now = Date.now();
+    const currentEnd = user.subscription_end || now;
+    const extensionMs = (parseInt(days || 0) * 24 * 60 * 60 * 1000) + 
+                       (parseInt(hours || 0) * 60 * 60 * 1000);
+    
+    let newEndDate;
+    
+    if (currentEnd > now) {
+      // Extend from current end date
+      newEndDate = currentEnd + extensionMs;
+    } else {
+      // Start from now
+      newEndDate = now + extensionMs;
+    }
+    
+    // Update user
+    await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, {
+      subscription_end: newEndDate,
+      is_active: true,
+      last_updated: now
+    });
+    
+    res.json({
+      success: true,
+      message: `Subscription extended successfully`,
+      new_end_date: newEndDate,
+      formatted_end: new Date(newEndDate).toISOString(),
+      user_id: userId,
+      username: user.username
+    });
+    
+  } catch (error) {
+    console.error('Extend subscription error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to extend subscription' 
+    });
+  }
+});
+
+// 🔹 4. API Keys Management
+app.get('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    // في الإصدار الحالي، نستخدم API Key واحد
+    // يمكنك توسيع هذا ليدير مفاتيح متعددة
+    res.json({
+      success: true,
+      api_keys: [
+        {
+          name: 'Main App API Key',
+          key: APP_API_KEY.substring(0, 8) + '...',
+          created_at: 'System',
+          is_active: true,
+          usage: 'Mobile app authentication'
+        }
+      ],
+      total: 1,
+      message: 'Current API key configuration'
+    });
+    
+  } catch (error) {
+    console.error('Get API keys error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch API keys' 
+    });
+  }
+});
+
+// 🔹 5. Verify Admin Session
+app.get('/api/admin/verify-session', authAdmin, (req, res) => {
+  const sessionToken = req.headers['x-session-token'];
+  const session = adminSessions.get(sessionToken);
+  
+  if (!session) {
+    return res.status(401).json({ 
+      success: false, 
+      error: 'Invalid session' 
+    });
+  }
+  
+  const sessionAge = Date.now() - session.createdAt;
+  const expiresIn = 24 * 60 * 60 * 1000 - sessionAge;
+  
+  res.json({
+    success: true,
+    session: {
+      username: session.username,
+      ip: session.ip,
+      created_at: session.createdAt,
+      expires_in: Math.floor(expiresIn / 1000 / 60) + ' minutes',
+      user_agent: session.userAgent
+    },
+    server_info: {
+      active_sessions: adminSessions.size,
+      uptime: Math.floor(process.uptime()),
+      version: '3.0.0-secure'
+    }
+  });
+});
+
 // 🔹 Home Page
 app.get('/', (req, res) => {
   res.send(`
@@ -500,6 +715,9 @@ app.get('/', (req, res) => {
       margin-right: 10px;
       font-weight: bold;
     }
+    .method.get { background: #10b981; }
+    .method.post { background: #f59e0b; }
+    .method.patch { background: #8b5cf6; }
   </style>
 </head>
 <body>
@@ -507,7 +725,7 @@ app.get('/', (req, res) => {
     <div class="header">
       <h1>🛡️ Secure Firebase Proxy v3.0</h1>
       <div class="security-badge">
-        ✅ جميع أنظمة الحماية مفعلة
+        ✅ جميع أنظمة الحماية مفعلة + لوحة إدارة جديدة
       </div>
     </div>
     
@@ -515,28 +733,53 @@ app.get('/', (req, res) => {
       <h3>📋 Available Endpoints:</h3>
       
       <div class="endpoint">
-        <span class="method">GET</span>
+        <span class="method get">GET</span>
         <strong>/api/health</strong> - حالة الخادم
       </div>
       
       <div class="endpoint">
-        <span class="method">POST</span>
+        <span class="method post">POST</span>
         <strong>/api/admin/login</strong> - دخول الإدارة
       </div>
       
       <div class="endpoint">
-        <span class="method">POST</span>
+        <span class="method get">GET</span>
+        <strong>/api/admin/users</strong> - عرض جميع المستخدمين
+      </div>
+      
+      <div class="endpoint">
+        <span class="method get">GET</span>
+        <strong>/api/admin/users/:id</strong> - عرض مستخدم محدد
+      </div>
+      
+      <div class="endpoint">
+        <span class="method post">POST</span>
+        <strong>/api/admin/users/:id/extend</strong> - تجديد اشتراك مستخدم
+      </div>
+      
+      <div class="endpoint">
+        <span class="method get">GET</span>
+        <strong>/api/admin/api-keys</strong> - إدارة مفاتيح API
+      </div>
+      
+      <div class="endpoint">
+        <span class="method get">GET</span>
+        <strong>/api/admin/verify-session</strong> - التحقق من الجلسة
+      </div>
+      
+      <div class="endpoint">
+        <span class="method post">POST</span>
         <strong>/api/verifyAccount</strong> - التحقق من الحساب (للتطبيق)
       </div>
       
       <div class="endpoint">
-        <span class="method">GET</span>
+        <span class="method get">GET</span>
         <strong>/api/serverTime</strong> - وقت الخادم
       </div>
     </div>
     
     <p style="color: #94a3b8; margin-top: 40px;">
-      🔐 Secure Proxy System | Render Hosted | Advanced Protection
+      🔐 Secure Proxy System | Render Hosted | Advanced Protection | Admin Panel v1.0
     </p>
   </div>
 </body>
@@ -581,5 +824,13 @@ app.listen(PORT, () => {
   console.log('   ✓ Brute Force Protection');
   console.log('   ✓ CORS Protection');
   console.log('   ✓ Helmet Security');
+  console.log('   ✓ Admin Panel Endpoints');
+  console.log('═'.repeat(50));
+  console.log('📊 Admin Endpoints Added:');
+  console.log('   ✓ GET /api/admin/users');
+  console.log('   ✓ GET /api/admin/users/:id');
+  console.log('   ✓ POST /api/admin/users/:id/extend');
+  console.log('   ✓ GET /api/admin/api-keys');
+  console.log('   ✓ GET /api/admin/verify-session');
   console.log('═'.repeat(50));
 });
