@@ -1156,6 +1156,19 @@ app.delete('/api/sub/users/:id', authSubAdmin, apiLimiter, async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to delete user' });
   }
 });
+
+
+
+
+// 1. التحقق من مفتاح Sub Admin - هذه النقطة الأساسية
+app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
+  console.log('🔍 تم استدعاء /api/sub/verify-key');
+  
+  try {
+    const { apiKey, deviceFingerprint } = req.body;
+    
+    console.log('📩 البيانات المستلمة:', { 
+      apiKey: apiKey ? apiKey.substring(
 app.listen(PORT, () => {
   console.log('═'.repeat(50));
   console.log('🛡️  Secure Firebase Proxy v3.1');
