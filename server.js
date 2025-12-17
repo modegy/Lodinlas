@@ -571,6 +571,347 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, error: 'Internal error', code: 500 });
 });
 
+
+
+// ═══════════════════════════════════════════
+// 🔐 SUB ADMIN API
+// ═══════════════════════════════════════════
+
+const subAdminKeys = new Map();
+
+// التحقق من مفتاح Sub Admin
+app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
+  try {
+    const { apiKey, deviceFingerprint } = req.body;
+    
+    if (!apiKey) {
+      return res.status(400).json({ success: false, error: 'API key required' });
+    }
+    
+    // البحث عن المفتاح في Firebase
+    const keysUrl = `api_keys.json?orderBy="api_key"&equalTo="${apiKey}"&auth=${FB_KEY}`;
+    const response = await firebase.get(keysUrl);
+    const keys = response.data || {};
+    
+    if (Object.keys(keys).length === 0) {
+      return res.status(401).json({ success: false, error: 'Invalid API key' });
+    }
+    
+    const keyId = Object.keys(keys)[0];
+    const keyData = keys[keyId];
+    
+    // التحقق من صلاحية المفتاح
+    if (!keyData.is_active) {
+      return res.status(403).json({ success: false, error: 'Key is inactive' });
+    }
+    
+    if (keyData.expiry_timestamp && Date.now() > keyData.expiry_timestamp) {
+      return res.status(403).json({ success: false, error: 'Key expired' });
+    }
+    
+    // ربط الجهاز (إذا لم يكن مربوطاً من قبل)
+    if (!keyData.bound_device) {
+      await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, { 
+        bound_device: deviceFingerprint 
+      });
+    } else if (keyData.bound_device !== deviceFingerprint) {
+      return res.status(403).json({ success: false, error: 'Key bound to another device' });
+    }
+    
+    // زيادة عداد الاستخدام
+    await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, {
+      usage_count: (keyData.usage_count || 0) + 1
+    });
+    
+    // تخزين محلي للتحقق السريع
+    subAdminKeys.set(apiKey, {
+      ...keyData,
+      last_used: Date.now(),
+      device: deviceFingerprint
+    });
+    
+    res.json({
+      success: true,
+      name: keyData.admin_name,
+      permission: keyData.permission_level || 'view_only',
+      key_id: keyId
+    });
+    
+  } catch (error) {
+    console.error('Verify key error:', error.message);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// مصادقة Sub Admin
+const authSubAdmin = async (req, res, next) => {
+  try {
+    const apiKey = req.headers['x-api-key'];
+    const deviceFingerprint = req.headers['x-device-fingerprint'];
+    
+    if (!apiKey) {
+      return res.status(401).json({ success: false, error: 'API key required' });
+    }
+    
+    // التحقق من التخزين المؤقت أولاً
+    const cached = subAdminKeys.get(apiKey);
+    if (cached && cached.device === deviceFingerprint && 
+        cached.expiry_timestamp > Date.now() && cached.is_active) {
+      req.subAdminKey = cached;
+      return next();
+    }
+    
+    // التحقق من Firebase
+    const keysUrl = `api_keys.json?orderBy="api_key"&equalTo="${apiKey}"&auth=${FB_KEY}`;
+    const response = await firebase.get(keysUrl);
+    const keys = response.data || {};
+    
+    if (Object.keys(keys).length === 0) {
+      return res.status(401).json({ success: false, error: 'Invalid API key' });
+    }
+    
+    const keyId = Object.keys(keys)[0];
+    const keyData = keys[keyId];
+    
+    // التحقق من الصلاحيات
+    if (!keyData.is_active || 
+        (keyData.expiry_timestamp && Date.now() > keyData.expiry_timestamp) ||
+        (keyData.bound_device && keyData.bound_device !== deviceFingerprint)) {
+      return res.status(403).json({ success: false, error: 'Unauthorized' });
+    }
+    
+    req.subAdminKey = keyData;
+    next();
+    
+  } catch (error) {
+    console.error('Auth error:', error.message);
+    res.status(500).json({ success: false, error: 'Authentication error' });
+  }
+};
+
+// صلاحيات Sub Admin
+const subAdminPermissions = (permissionLevel) => {
+  return (req, res, next) => {
+    const keyData = req.subAdminKey;
+    const permissions = {
+      'full': ['view', 'add', 'extend', 'edit', 'delete'],
+      'add_only': ['view', 'add'],
+      'extend_only': ['view', 'extend'],
+      'view_only': ['view']
+    };
+    
+    const allowedPermissions = permissions[keyData.permission_level] || permissions.view_only;
+    
+    if (!allowedPermissions.includes(permissionLevel)) {
+      return res.status(403).json({ success: false, error: 'Permission denied' });
+    }
+    
+    next();
+  };
+};
+
+// الحصول على المستخدمين (للـ Sub Admin)
+app.get('/api/sub/users', authSubAdmin, subAdminPermissions('view'), apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    const formattedUsers = {};
+    for (const [id, user] of Object.entries(users)) {
+      const subEnd = user.subscription_end || 0;
+      formattedUsers[id] = {
+        username: user.username || '',
+        is_active: user.is_active !== false,
+        expiry_timestamp: subEnd,
+        expiry_date: formatDate(subEnd),
+        device_id: user.device_id || ''
+      };
+    }
+    
+    res.json({ success: true, data: formattedUsers, count: Object.keys(formattedUsers).length });
+  } catch (error) {
+    console.error('Get users error:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch users' });
+  }
+});
+
+// الإحصائيات
+app.get('/api/sub/stats', authSubAdmin, subAdminPermissions('view'), apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    const now = Date.now();
+    let totalUsers = 0;
+    let activeUsers = 0;
+    let expiredUsers = 0;
+    
+    for (const user of Object.values(users)) {
+      totalUsers++;
+      if (user.is_active !== false) {
+        activeUsers++;
+      }
+      if (user.subscription_end && user.subscription_end <= now) {
+        expiredUsers++;
+      }
+    }
+    
+    res.json({
+      success: true,
+      stats: {
+        totalUsers,
+        activeUsers,
+        expiredUsers
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to get stats' });
+  }
+});
+
+// إضافة مستخدم (للـ Sub Admin)
+app.post('/api/sub/users', authSubAdmin, subAdminPermissions('add'), apiLimiter, async (req, res) => {
+  try {
+    const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json({ success: false, error: 'Username and password required' });
+    }
+    
+    // التحقق من عدم وجود نفس اسم المستخدم
+    const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
+    const checkRes = await firebase.get(checkUrl);
+    if (checkRes.data && Object.keys(checkRes.data).length > 0) {
+      return res.status(400).json({ success: false, error: 'Username already exists' });
+    }
+    
+    // حساب تاريخ الانتهاء
+    let expiryTimestamp;
+    if (customExpiryDate) {
+      expiryTimestamp = new Date(customExpiryDate).getTime();
+    } else if (expiryMinutes) {
+      expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
+    } else {
+      return res.status(400).json({ success: false, error: 'Expiry time required' });
+    }
+    
+    // إنشاء المستخدم
+    const userData = {
+      username,
+      password_hash: hashPassword(password),
+      is_active: status !== 'inactive',
+      subscription_end: expiryTimestamp,
+      max_devices: maxDevices || 1,
+      device_id: '',
+      created_at: Date.now(),
+      last_login: null,
+      created_by: req.subAdminKey.admin_name || 'sub_admin'
+    };
+    
+    const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
+    
+    res.json({ 
+      success: true, 
+      message: 'User created', 
+      userId: createRes.data.name,
+      expiry_date: formatDate(expiryTimestamp)
+    });
+    
+  } catch (error) {
+    console.error('Create user error:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to create user' });
+  }
+});
+
+// تمديد اشتراك مستخدم
+app.post('/api/sub/users/:id/extend', authSubAdmin, subAdminPermissions('extend'), apiLimiter, async (req, res) => {
+  try {
+    const { minutes, days, hours } = req.body;
+    
+    if (!minutes && !days && !hours) {
+      return res.status(400).json({ success: false, error: 'Extension time required' });
+    }
+    
+    const userRes = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
+    if (!userRes.data) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    
+    const user = userRes.data;
+    const now = Date.now();
+    const currentEnd = user.subscription_end || now;
+    
+    let extensionMs = 0;
+    if (minutes) extensionMs = minutes * 60 * 1000;
+    else if (days || hours) {
+      extensionMs = ((days || 0) * 24 * 60 * 60 * 1000) + ((hours || 0) * 60 * 60 * 1000);
+    }
+    
+    const newEndDate = (currentEnd > now ? currentEnd : now) + extensionMs;
+    
+    await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, {
+      subscription_end: newEndDate,
+      is_active: true
+    });
+    
+    res.json({ 
+      success: true, 
+      message: 'Subscription extended', 
+      new_end_date: newEndDate,
+      formatted_date: formatDate(newEndDate)
+    });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to extend subscription' });
+  }
+});
+
+// تحديث حالة المستخدم
+app.patch('/api/sub/users/:id', authSubAdmin, subAdminPermissions('edit'), apiLimiter, async (req, res) => {
+  try {
+    const { is_active } = req.body;
+    
+    await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, { is_active });
+    
+    res.json({ success: true, message: 'User updated' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to update user' });
+  }
+});
+
+// إعادة تعيين الجهاز
+app.post('/api/sub/users/:id/reset-device', authSubAdmin, subAdminPermissions('edit'), apiLimiter, async (req, res) => {
+  try {
+    await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, { device_id: '' });
+    
+    res.json({ success: true, message: 'Device reset' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to reset device' });
+  }
+});
+
+// حذف مستخدم
+app.delete('/api/sub/users/:id', authSubAdmin, subAdminPermissions('delete'), apiLimiter, async (req, res) => {
+  try {
+    await firebase.delete(`users/${req.params.id}.json?auth=${FB_KEY}`);
+    
+    res.json({ success: true, message: 'User deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to delete user' });
+  }
+});
+
+// ═══════════════════════════════════════════
+// تنظيف التخزين المؤقت دورياً
+// ═══════════════════════════════════════════
+setInterval(() => {
+  const now = Date.now();
+  for (const [apiKey, keyData] of subAdminKeys.entries()) {
+    if (now - keyData.last_used > 30 * 60 * 1000) { // 30 دقيقة
+      subAdminKeys.delete(apiKey);
+    }
+  }
+}, 60 * 60 * 1000);
 app.listen(PORT, () => {
   console.log('═'.repeat(50));
   console.log('🛡️  Secure Firebase Proxy v3.1');
