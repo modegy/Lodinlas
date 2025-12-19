@@ -1201,7 +1201,11 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
           expiry_timestamp: subEnd,
           expiry_date: formatDate(subEnd),
           device_id: user.device_id || '',
-          created_by_key: user.created_by_key || null  // إرسال هذه المعلومة أيضاً
+          max_devices: user.max_devices || 1,
+          last_login: user.last_login || 0,
+          created_at: user.created_at || 0,
+          created_by: user.created_by || 'sub_admin',
+          created_by_key: user.created_by_key || null
         };
       }
     }
@@ -1221,6 +1225,57 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
       error: 'Failed to fetch users' 
     });
   }
+});
+
+
+
+// ✅ نقطة API جديدة: الحصول على تفاصيل مستخدم محدد
+app.get('/api/sub/users/:id/details', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const currentKeyId = req.subAdminKeyId;
+        
+        const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+        
+        if (!userRes.data) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'User not found' 
+            });
+        }
+        
+        const user = userRes.data;
+        
+        // ✅ التحقق من الملكية
+        if (user.created_by_key !== currentKeyId) {
+            return res.status(403).json({ 
+                success: false, 
+                error: 'You can only view users you created' 
+            });
+        }
+        
+        res.json({
+            success: true,
+            user: {
+                username: user.username || '',
+                is_active: user.is_active !== false,
+                device_id: user.device_id || '',
+                max_devices: user.max_devices || 1,
+                last_login: user.last_login || 0,
+                created_at: user.created_at || 0,
+                subscription_end: user.subscription_end || 0,
+                created_by: user.created_by || 'sub_admin',
+                notes: user.notes || ''
+            }
+        });
+        
+    } catch (error) {
+        console.error('Get user details error:', error.message);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Failed to get user details' 
+        });
+    }
 });
 
 // الإحصائيات - فقط للمستخدمين الذين أنشأهم هذا Sub Admin
