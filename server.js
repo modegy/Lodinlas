@@ -547,58 +547,64 @@ app.post('/api/updateDevice', authApp, apiLimiter, async (req, res) => {
 // ═══════════════════════════════════════════
 // 👑 MASTER ADMIN - AUTH
 // ═══════════════════════════════════════════
-app.post('/api/admin/login', loginLimiter, bruteForceProtection, (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
-    
-    if (!username || !password) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Username and password required' 
-      });
-    }
-    
-    if (username !== ADMIN_CREDENTIALS.username || password !== ADMIN_CREDENTIALS.password) {
-      const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
-      attempt.count++;
-      attempt.lastAttempt = Date.now();
-      loginAttempts.set(ip, attempt);
-      
-      return setTimeout(() => {
-        res.status(401).json({ 
-          success: false, 
-          error: 'Invalid credentials' 
+
+app.post('/api/admin/login', loginLimiter, bruteForceProtection, async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+        
+        if (!username || !password) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Username and password required' 
+            });
+        }
+        
+        // ✅ **إضافة تأخير بسيط لحماية إضافية**
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        if (username !== ADMIN_CREDENTIALS.username || password !== ADMIN_CREDENTIALS.password) {
+            const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
+            attempt.count++;
+            attempt.lastAttempt = Date.now();
+            loginAttempts.set(ip, attempt);
+            
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Invalid credentials' 
+            });
+        }
+        
+        loginAttempts.delete(ip);
+        const sessionToken = generateToken();
+        
+        adminSessions.set(sessionToken, { 
+            username, 
+            ip, 
+            createdAt: Date.now(), 
+            userAgent: req.headers['user-agent'] 
         });
-      }, 1500);
+        
+        console.log(`✅ Admin login: ${username} from ${ip}`);
+        
+        res.json({ 
+            success: true, 
+            sessionToken, 
+            expiresIn: '24 hours' 
+        });
+        
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Server error' 
+        });
     }
-    
-    loginAttempts.delete(ip);
-    const sessionToken = generateToken();
-    
-    adminSessions.set(sessionToken, { 
-      username, 
-      ip, 
-      createdAt: Date.now(), 
-      userAgent: req.headers['user-agent'] 
-    });
-    
-    console.log(`✅ Admin login: ${username} from ${ip}`);
-    
-    res.json({ 
-      success: true, 
-      sessionToken, 
-      expiresIn: '24 hours' 
-    });
-    
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Server error' 
-    });
-  }
 });
+
+
+
+
 
 app.post('/api/admin/logout', authAdmin, (req, res) => {
   const sessionToken = req.headers['x-session-token'];
