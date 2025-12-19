@@ -35,12 +35,5 @@
     "node": ">=18.0.0",
     "npm": ">=9.0.0"
   },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/yourusername/secure-firebase-proxy.git"
-  },
-  "bugs": {
-    "url": "https://github.com/yourusername/secure-firebase-proxy/issues"
-  },
-  "homepage": "https://github.com/yourusername/secure-firebase-proxy#readme"
+  "private": true
 }
