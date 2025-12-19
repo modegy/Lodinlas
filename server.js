@@ -336,6 +336,44 @@ const checkSubAdminPermission = (requiredPermission) => {
   };
 };
 
+// ✅ التحقق من ملكية المستخدم (Sub Admin يمكنه التعديل فقط على مستخدميه)
+const checkUserOwnership = async (req, res, next) => {
+  try {
+    const userId = req.params.id;
+    const currentKeyId = req.subAdminKeyId;
+    
+    // جلب بيانات المستخدم
+    const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+    
+    if (!userRes.data) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'User not found' 
+      });
+    }
+    
+    const user = userRes.data;
+    
+    // ✅ التحقق: هل هذا المستخدم تم إنشاؤه بواسطة هذا Sub Admin؟
+    if (user.created_by_key !== currentKeyId) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'You can only manage users you created' 
+      });
+    }
+    
+    req.targetUser = user;
+    next();
+    
+  } catch (error) {
+    console.error('Ownership check error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to verify ownership' 
+    });
+  }
+};
+
 // ═══════════════════════════════════════════
 // Logger Middleware
 // ═══════════════════════════════════════════
@@ -1171,24 +1209,29 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
   }
 });
 
-// الإحصائيات
+// الإحصائيات - فقط للمستخدمين الذين أنشأهم هذا Sub Admin
 app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
     const users = response.data || {};
     
+    const currentKeyId = req.subAdminKeyId;
     const now = Date.now();
+    
     let totalUsers = 0;
     let activeUsers = 0;
     let expiredUsers = 0;
     
+    // ✅ إحصائيات فقط للمستخدمين الذين أنشأهم هذا Sub Admin
     for (const user of Object.values(users)) {
-      totalUsers++;
-      if (user.is_active !== false) {
-        activeUsers++;
-      }
-      if (user.subscription_end && user.subscription_end <= now) {
-        expiredUsers++;
+      if (user.created_by_key === currentKeyId) {
+        totalUsers++;
+        if (user.is_active !== false) {
+          activeUsers++;
+        }
+        if (user.subscription_end && user.subscription_end <= now) {
+          expiredUsers++;
+        }
       }
     }
     
