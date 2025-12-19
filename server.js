@@ -83,7 +83,6 @@ const bruteForceProtection = (req, res, next) => {
   
   const attempt = loginAttempts.get(ip);
   
-  // إعادة تعيين بعد 15 دقيقة
   if (Date.now() - attempt.lastAttempt > 15 * 60 * 1000) {
     attempt.count = 0;
   }
@@ -99,7 +98,6 @@ const bruteForceProtection = (req, res, next) => {
   next();
 };
 
-// تنظيف دوري للمحاولات القديمة
 setInterval(() => {
   const now = Date.now();
   for (const [ip, attempt] of loginAttempts.entries()) {
@@ -152,7 +150,6 @@ function formatDate(timestamp) {
   return `${day}/${month}/${year} ${hours}:${mins}`;
 }
 
-// تنظيف الجلسات المنتهية
 setInterval(() => {
   const now = Date.now();
   for (const [token, session] of adminSessions.entries()) {
@@ -166,7 +163,6 @@ setInterval(() => {
 // المصادقة - Middlewares
 // ═══════════════════════════════════════════
 
-// مصادقة التطبيق
 const authApp = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
   
@@ -189,7 +185,7 @@ const authApp = (req, res, next) => {
   });
 };
 
-// مصادقة Master Admin
+// ✅ مصادقة Master Admin مع دعم Direct Token
 const authAdmin = (req, res, next) => {
   const sessionToken = req.headers['x-session-token'];
   const masterToken = process.env.MASTER_ADMIN_TOKEN;
@@ -232,7 +228,6 @@ const authAdmin = (req, res, next) => {
   next();
 };
 
-// مصادقة Sub Admin
 const authSubAdmin = async (req, res, next) => {
   try {
     const apiKey = req.headers['x-api-key'];
@@ -245,7 +240,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // التحقق من Cache أولاً
     const cached = subAdminKeys.get(apiKey);
     if (cached && cached.device === deviceFingerprint) {
       if (cached.expiry_timestamp > Date.now() && cached.is_active) {
@@ -255,7 +249,6 @@ const authSubAdmin = async (req, res, next) => {
       }
     }
     
-    // البحث في Firebase
     const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
     const keys = response.data || {};
     
@@ -277,7 +270,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // التحقق من الصلاحيات
     if (!foundKey.is_active) {
       return res.status(403).json({ 
         success: false, 
@@ -299,7 +291,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // تحديث Cache
     subAdminKeys.set(apiKey, {
       ...foundKey,
       keyId,
@@ -320,7 +311,6 @@ const authSubAdmin = async (req, res, next) => {
   }
 };
 
-// التحقق من صلاحيات Sub Admin
 const checkSubAdminPermission = (requiredPermission) => {
   return (req, res, next) => {
     const keyData = req.subAdminKey;
@@ -329,7 +319,9 @@ const checkSubAdminPermission = (requiredPermission) => {
       'full': ['view', 'add', 'extend', 'edit', 'delete'],
       'add_only': ['view', 'add'],
       'extend_only': ['view', 'extend'],
-      'view_only': ['view']
+      'view_only': ['view'],
+      'delete_only': ['view', 'delete'],
+      'stats_only': ['view']
     };
     
     const allowedPermissions = permissions[keyData.permission_level] || permissions.view_only;
@@ -343,45 +335,6 @@ const checkSubAdminPermission = (requiredPermission) => {
     
     next();
   };
-};
-
-// ✅ التحقق من ملكية المستخدم (Sub Admin يمكنه التعديل فقط على مستخدميه)
-const checkUserOwnership = async (req, res, next) => {
-  try {
-    const userId = req.params.id;
-    const currentKeyId = req.subAdminKeyId;
-    
-    // جلب بيانات المستخدم
-    const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
-    
-    if (!userRes.data) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'User not found' 
-      });
-    }
-    
-    const user = userRes.data;
-    
-    // ✅ التحقق الصارم: يجب أن يكون created_by_key موجود ومطابق تماماً
-    if (!user.created_by_key || user.created_by_key !== currentKeyId) {
-      console.log(`🚫 Ownership denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
-      return res.status(403).json({ 
-        success: false, 
-        error: 'You can only manage users you created' 
-      });
-    }
-    
-    req.targetUser = user;
-    next();
-    
-  } catch (error) {
-    console.error('Ownership check error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to verify ownership' 
-    });
-  }
 };
 
 // ═══════════════════════════════════════════
@@ -407,7 +360,7 @@ app.use((req, res, next) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
-    version: '3.1.0', 
+    version: '3.4.0', 
     uptime: Math.floor(process.uptime()), 
     timestamp: Date.now() 
   });
@@ -533,9 +486,12 @@ app.post('/api/updateDevice', authApp, apiLimiter, async (req, res) => {
     }
     
     const userId = Object.keys(users)[0];
+    const user = users[userId];
+    
     await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
       device_id: deviceId, 
-      last_login: Date.now() 
+      last_login: Date.now(),
+      login_count: (user.login_count || 0) + 1
     });
     
     res.json({ 
@@ -557,62 +513,57 @@ app.post('/api/updateDevice', authApp, apiLimiter, async (req, res) => {
 // ═══════════════════════════════════════════
 
 app.post('/api/admin/login', loginLimiter, bruteForceProtection, async (req, res) => {
-    try {
-        const { username, password } = req.body;
-        const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
-        
-        if (!username || !password) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Username and password required' 
-            });
-        }
-        
-        // ✅ **إضافة تأخير بسيط لحماية إضافية**
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        if (username !== ADMIN_CREDENTIALS.username || password !== ADMIN_CREDENTIALS.password) {
-            const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
-            attempt.count++;
-            attempt.lastAttempt = Date.now();
-            loginAttempts.set(ip, attempt);
-            
-            return res.status(401).json({ 
-                success: false, 
-                error: 'Invalid credentials' 
-            });
-        }
-        
-        loginAttempts.delete(ip);
-        const sessionToken = generateToken();
-        
-        adminSessions.set(sessionToken, { 
-            username, 
-            ip, 
-            createdAt: Date.now(), 
-            userAgent: req.headers['user-agent'] 
-        });
-        
-        console.log(`✅ Admin login: ${username} from ${ip}`);
-        
-        res.json({ 
-            success: true, 
-            sessionToken, 
-            expiresIn: '24 hours' 
-        });
-        
-    } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Server error' 
-        });
+  try {
+    const { username, password } = req.body;
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+    
+    if (!username || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Username and password required' 
+      });
     }
+    
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    if (username !== ADMIN_CREDENTIALS.username || password !== ADMIN_CREDENTIALS.password) {
+      const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
+      attempt.count++;
+      attempt.lastAttempt = Date.now();
+      loginAttempts.set(ip, attempt);
+      
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid credentials' 
+      });
+    }
+    
+    loginAttempts.delete(ip);
+    const sessionToken = generateToken();
+    
+    adminSessions.set(sessionToken, { 
+      username, 
+      ip, 
+      createdAt: Date.now(), 
+      userAgent: req.headers['user-agent'] 
+    });
+    
+    console.log(`✅ Admin login: ${username} from ${ip}`);
+    
+    res.json({ 
+      success: true, 
+      sessionToken, 
+      expiresIn: '24 hours' 
+    });
+    
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Server error' 
+    });
+  }
 });
-
-
-
-
 
 app.post('/api/admin/logout', authAdmin, (req, res) => {
   const sessionToken = req.headers['x-session-token'];
@@ -628,19 +579,33 @@ app.post('/api/admin/logout', authAdmin, (req, res) => {
 app.get('/api/admin/verify-session', authAdmin, (req, res) => {
   const sessionToken = req.headers['x-session-token'];
   const session = adminSessions.get(sessionToken);
-  const expiresIn = 24 * 60 * 60 * 1000 - (Date.now() - session.createdAt);
   
-  res.json({
-    success: true,
-    session: { 
-      username: session.username, 
-      expires_in: Math.floor(expiresIn / 1000 / 60) + ' minutes' 
-    },
-    server_info: { 
-      active_sessions: adminSessions.size, 
-      uptime: Math.floor(process.uptime()) 
-    }
-  });
+  if (session) {
+    const expiresIn = 24 * 60 * 60 * 1000 - (Date.now() - session.createdAt);
+    res.json({
+      success: true,
+      session: { 
+        username: session.username, 
+        expires_in: Math.floor(expiresIn / 1000 / 60) + ' minutes' 
+      },
+      server_info: { 
+        active_sessions: adminSessions.size, 
+        uptime: Math.floor(process.uptime()) 
+      }
+    });
+  } else {
+    res.json({
+      success: true,
+      session: { 
+        username: 'master_owner', 
+        expires_in: 'unlimited' 
+      },
+      server_info: { 
+        active_sessions: adminSessions.size, 
+        uptime: Math.floor(process.uptime()) 
+      }
+    });
+  }
 });
 
 // ═══════════════════════════════════════════
@@ -657,14 +622,19 @@ app.get('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       formattedUsers[id] = {
         username: user.username || '',
         is_active: user.is_active !== false,
+        status: user.status || 'active',
         expiry_timestamp: subEnd,
         expiry_date: formatDate(subEnd),
         created_at: user.created_at || null,
         last_login: user.last_login || null,
+        login_count: user.login_count || 0,
         device_id: user.device_id || '',
         max_devices: user.max_devices || 1,
+        storage_used: user.storage_used || 0,
+        max_storage: user.max_storage || 100,
+        speed_limit: user.speed_limit || 10,
         notes: user.notes || '',
-        created_by_key: user.created_by_key || 'master' // ✅ إضافة هذا الحقل
+        created_by_key: user.created_by_key || 'master'
       };
     }
     
@@ -701,11 +671,12 @@ app.get('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
         id: req.params.id,
         username: user.username,
         is_active: user.is_active !== false,
+        status: user.status || 'active',
         expiry_timestamp: user.subscription_end || 0,
         expiry_date: formatDate(user.subscription_end),
         device_id: user.device_id || '',
         max_devices: user.max_devices || 1,
-        created_by_key: user.created_by_key || 'master' // ✅ إضافة هذا الحقل
+        created_by_key: user.created_by_key || 'master'
       }
     });
     
@@ -718,9 +689,66 @@ app.get('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
   }
 });
 
+// ✅ NEW: Get detailed user information
+app.get('/api/admin/users/:id/details', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
+    
+    if (!response.data) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'User not found' 
+      });
+    }
+    
+    const user = response.data;
+    
+    res.json({
+      success: true,
+      data: {
+        username: user.username || '',
+        email: user.email || '',
+        is_active: user.is_active !== false,
+        status: user.status || 'active',
+        device_id: user.device_id || '',
+        max_devices: user.max_devices || 1,
+        created_at: user.created_at || null,
+        last_login: user.last_login || null,
+        login_count: user.login_count || 0,
+        expiry_timestamp: user.subscription_end || 0,
+        expiry_date: formatDate(user.subscription_end),
+        storage_used: user.storage_used || 0,
+        max_storage: user.max_storage || 100,
+        speed_limit: user.speed_limit || 10,
+        notes: user.notes || '',
+        ip_address: user.ip_address || null,
+        user_agent: user.user_agent || null,
+        created_by_key: user.created_by_key || 'master'
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get user details error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch user details' 
+    });
+  }
+});
+
 app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
   try {
-    const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
+    const { 
+      username, 
+      password, 
+      expiryMinutes, 
+      customExpiryDate, 
+      unlimited,
+      maxDevices, 
+      status,
+      storage_limit,
+      speed_limit
+    } = req.body;
     
     if (!username || !password) {
       return res.status(400).json({ 
@@ -729,7 +757,6 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       });
     }
     
-    // التحقق من عدم وجود نفس الاسم
     const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
     const checkRes = await firebase.get(checkUrl);
     
@@ -740,9 +767,10 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       });
     }
     
-    // حساب تاريخ الانتهاء
     let expiryTimestamp;
-    if (customExpiryDate) {
+    if (unlimited) {
+      expiryTimestamp = 0;
+    } else if (customExpiryDate) {
       expiryTimestamp = new Date(customExpiryDate).getTime();
     } else if (expiryMinutes) {
       expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
@@ -757,12 +785,17 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       username,
       password_hash: hashPassword(password),
       is_active: status !== 'inactive',
+      status: status || 'active',
       subscription_end: expiryTimestamp,
       max_devices: maxDevices || 1,
+      max_storage: storage_limit || 100,
+      speed_limit: speed_limit || 10,
+      storage_used: 0,
       device_id: '',
       created_at: Date.now(),
       last_login: null,
-      created_by_key: 'master'  // ✅ مهم جداً! تعيين master للمستخدمين من Master Admin
+      login_count: 0,
+      created_by_key: 'master'
     };
     
     const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
@@ -786,12 +819,15 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
 
 app.patch('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
   try {
-    const { is_active, max_devices, notes } = req.body;
+    const { is_active, max_devices, notes, status, storage_limit, speed_limit } = req.body;
     const updateData = {};
     
     if (typeof is_active === 'boolean') updateData.is_active = is_active;
     if (max_devices) updateData.max_devices = max_devices;
     if (notes !== undefined) updateData.notes = notes;
+    if (status) updateData.status = status;
+    if (storage_limit) updateData.max_storage = storage_limit;
+    if (speed_limit) updateData.speed_limit = speed_limit;
     
     await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, updateData);
     
@@ -829,7 +865,6 @@ app.delete('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
   }
 });
 
-// ✅ حذف جميع المنتهيين دفعة واحدة (API ENDPOINT)
 app.post('/api/admin/users/delete-expired', authAdmin, apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -840,7 +875,7 @@ app.post('/api/admin/users/delete-expired', authAdmin, apiLimiter, async (req, r
     let expiredIds = [];
     
     for (const [id, user] of Object.entries(users)) {
-      if (user.subscription_end && user.subscription_end <= now) {
+      if (user.subscription_end && user.subscription_end > 0 && user.subscription_end <= now) {
         expiredIds.push(id);
         deletePromises.push(
           firebase.delete(`users/${id}.json?auth=${FB_KEY}`)
@@ -856,7 +891,6 @@ app.post('/api/admin/users/delete-expired', authAdmin, apiLimiter, async (req, r
       });
     }
     
-    // حذف دفعة واحدة
     await Promise.all(deletePromises);
     
     console.log(`🗑️ Bulk deleted ${expiredIds.length} expired users`);
@@ -969,7 +1003,8 @@ app.get('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
         expiry_timestamp: key.expiry_timestamp || null,
         usage_count: key.usage_count || 0,
         bound_device: key.bound_device || null,
-        created_at: key.created_at || null
+        created_at: key.created_at || null,
+        last_used: key.last_used || null
       };
     }
     
@@ -990,7 +1025,12 @@ app.get('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
 
 app.post('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
   try {
-    const { adminName, permissionLevel, expiryDays } = req.body;
+    const { 
+      adminName, 
+      permissionLevel, 
+      expiryDays, 
+      unlimited
+    } = req.body;
     
     if (!adminName) {
       return res.status(400).json({ 
@@ -1001,15 +1041,23 @@ app.post('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
     
     const apiKey = `AK_${crypto.randomBytes(16).toString('hex')}`;
     
+    let expiryTimestamp;
+    if (unlimited) {
+      expiryTimestamp = null;
+    } else {
+      expiryTimestamp = Date.now() + ((expiryDays || 30) * 24 * 60 * 60 * 1000);
+    }
+    
     const keyData = {
       api_key: apiKey,
       admin_name: adminName,
       permission_level: permissionLevel || 'view_only',
       is_active: true,
-      expiry_timestamp: Date.now() + ((expiryDays || 30) * 24 * 60 * 60 * 1000),
+      expiry_timestamp: expiryTimestamp,
       usage_count: 0,
       bound_device: null,
-      created_at: Date.now()
+      created_at: Date.now(),
+      last_used: null
     };
     
     await firebase.post(`api_keys.json?auth=${FB_KEY}`, keyData);
@@ -1096,15 +1144,153 @@ app.post('/api/admin/api-keys/:id/unbind-device', authAdmin, apiLimiter, async (
 });
 
 // ═══════════════════════════════════════════
-// 🔑 SUB ADMIN API - التعديلات المطلوبة
+// 👨‍💼 MASTER ADMIN - SUB-ADMINS MANAGEMENT
 // ═══════════════════════════════════════════
 
-// التحقق من مفتاح Sub Admin
+app.get('/api/admin/subadmins', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`subadmins.json?auth=${FB_KEY}`);
+    const subadmins = response.data || {};
+    
+    const formattedSubadmins = {};
+    for (const [id, subadmin] of Object.entries(subadmins)) {
+      formattedSubadmins[id] = {
+        name: subadmin.name || '',
+        email: subadmin.email || '',
+        permissions: subadmin.permissions || [],
+        is_active: subadmin.is_active !== false,
+        expiry_timestamp: subadmin.expiry_timestamp || null,
+        expiry_date: formatDate(subadmin.expiry_timestamp),
+        max_devices: subadmin.max_devices || 1,
+        access_token: subadmin.access_token || '',
+        created_at: subadmin.created_at || null,
+        last_active: subadmin.last_active || null,
+        usage_count: subadmin.usage_count || 0
+      };
+    }
+    
+    res.json({ 
+      success: true, 
+      data: formattedSubadmins, 
+      count: Object.keys(formattedSubadmins).length 
+    });
+    
+  } catch (error) {
+    console.error('Get subadmins error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch subadmins' 
+    });
+  }
+});
+
+app.post('/api/admin/subadmins', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { 
+      name, 
+      email, 
+      permissions, 
+      expiry_days, 
+      max_devices 
+    } = req.body;
+    
+    if (!name || !permissions || permissions.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Name and at least one permission required' 
+      });
+    }
+    
+    const accessToken = `SA_${crypto.randomBytes(20).toString('hex')}`;
+    
+    const expiryTimestamp = expiry_days === 0 
+      ? null 
+      : Date.now() + (expiry_days * 24 * 60 * 60 * 1000);
+    
+    const subadminData = {
+      name,
+      email: email || '',
+      permissions,
+      is_active: true,
+      expiry_timestamp: expiryTimestamp,
+      max_devices: max_devices || 2,
+      access_token: accessToken,
+      created_at: Date.now(),
+      last_active: null,
+      usage_count: 0
+    };
+    
+    const createRes = await firebase.post(`subadmins.json?auth=${FB_KEY}`, subadminData);
+    
+    console.log(`👨‍💼 Sub-Admin created: ${name}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Sub-Admin created', 
+      access_token: accessToken,
+      subadmin_id: createRes.data.name
+    });
+    
+  } catch (error) {
+    console.error('Create subadmin error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to create subadmin' 
+    });
+  }
+});
+
+app.post('/api/admin/subadmins/:id/toggle', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { is_active } = req.body;
+    
+    await firebase.patch(`subadmins/${req.params.id}.json?auth=${FB_KEY}`, { 
+      is_active 
+    });
+    
+    console.log(`🔄 Sub-Admin toggled: ${req.params.id} -> ${is_active ? 'active' : 'inactive'}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Sub-Admin status updated' 
+    });
+    
+  } catch (error) {
+    console.error('Toggle subadmin error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to toggle subadmin' 
+    });
+  }
+});
+
+app.delete('/api/admin/subadmins/:id', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    await firebase.delete(`subadmins/${req.params.id}.json?auth=${FB_KEY}`);
+    
+    console.log(`🗑️ Sub-Admin deleted: ${req.params.id}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Sub-Admin deleted' 
+    });
+    
+  } catch (error) {
+    console.error('Delete subadmin error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to delete subadmin' 
+    });
+  }
+});
+
+// ═══════════════════════════════════════════
+// 🔑 SUB ADMIN API
+// ═══════════════════════════════════════════
+
 app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
   try {
     const { apiKey, deviceFingerprint } = req.body;
-    
-    console.log('🔍 Sub Admin verify key request');
     
     if (!apiKey) {
       return res.status(400).json({ 
@@ -1113,7 +1299,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // البحث في Firebase
     const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
     const keys = response.data || {};
     
@@ -1135,7 +1320,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // التحقق من صلاحية المفتاح
     if (!foundKey.is_active) {
       return res.status(403).json({ 
         success: false, 
@@ -1150,12 +1334,10 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // ربط الجهاز
     if (!foundKey.bound_device) {
       await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, { 
         bound_device: deviceFingerprint 
       });
-      console.log(`🔗 Device bound to key: ${keyId}`);
     } else if (foundKey.bound_device !== deviceFingerprint) {
       return res.status(403).json({ 
         success: false, 
@@ -1163,13 +1345,11 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // تحديث عداد الاستخدام
     await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, {
       usage_count: (foundKey.usage_count || 0) + 1,
       last_used: Date.now()
     });
     
-    // تحديث Cache
     subAdminKeys.set(apiKey, {
       ...foundKey,
       keyId,
@@ -1183,7 +1363,7 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       success: true,
       name: foundKey.admin_name,
       permission: foundKey.permission_level || 'view_only',
-      key_id: keyId  // ✅ إرجاع معرف المفتاح المهم
+      key_id: keyId
     });
     
   } catch (error) {
@@ -1195,7 +1375,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
   }
 });
 
-// الحصول على المستخدمين - فقط المستخدمين الذين أنشأهم هذا Sub Admin ✅✅✅
 app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -1204,27 +1383,25 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
     const currentKeyId = req.subAdminKeyId;
     const formattedUsers = {};
     
-    // ✅✅✅ **التعديل المهم: فلترة حسب created_by_key**
     for (const [id, user] of Object.entries(users)) {
-      // تحقق مما إذا كان المستخدم ملكاً لهذا المسؤول الفرعي
       if (user.created_by_key === currentKeyId) {
         const subEnd = user.subscription_end || 0;
         formattedUsers[id] = {
           username: user.username || '',
           is_active: user.is_active !== false,
+          status: user.status || 'active',
           expiry_timestamp: subEnd,
           expiry_date: formatDate(subEnd),
           device_id: user.device_id || '',
           max_devices: user.max_devices || 1,
           last_login: user.last_login || 0,
+          login_count: user.login_count || 0,
           created_at: user.created_at || 0,
           created_by: user.created_by || 'sub_admin',
           created_by_key: user.created_by_key || null
         };
       }
     }
-    
-    console.log(`👥 Sub Admin [${currentKeyId}] sees ${Object.keys(formattedUsers).length} users`);
     
     res.json({ 
       success: true, 
@@ -1241,58 +1418,59 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
   }
 });
 
-
-
-// ✅ نقطة API جديدة: الحصول على تفاصيل مستخدم محدد
 app.get('/api/sub/users/:id/details', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
-    try {
-        const userId = req.params.id;
-        const currentKeyId = req.subAdminKeyId;
-        
-        const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
-        
-        if (!userRes.data) {
-            return res.status(404).json({ 
-                success: false, 
-                error: 'User not found' 
-            });
-        }
-        
-        const user = userRes.data;
-        
-        // ✅ التحقق من الملكية
-        if (user.created_by_key !== currentKeyId) {
-            return res.status(403).json({ 
-                success: false, 
-                error: 'You can only view users you created' 
-            });
-        }
-        
-        res.json({
-            success: true,
-            user: {
-                username: user.username || '',
-                is_active: user.is_active !== false,
-                device_id: user.device_id || '',
-                max_devices: user.max_devices || 1,
-                last_login: user.last_login || 0,
-                created_at: user.created_at || 0,
-                subscription_end: user.subscription_end || 0,
-                created_by: user.created_by || 'sub_admin',
-                notes: user.notes || ''
-            }
-        });
-        
-    } catch (error) {
-        console.error('Get user details error:', error.message);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to get user details' 
-        });
+  try {
+    const userId = req.params.id;
+    const currentKeyId = req.subAdminKeyId;
+    
+    const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+    
+    if (!userRes.data) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'User not found' 
+      });
     }
+    
+    const user = userRes.data;
+    
+    if (user.created_by_key !== currentKeyId) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'You can only view users you created' 
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        username: user.username || '',
+        is_active: user.is_active !== false,
+        status: user.status || 'active',
+        device_id: user.device_id || '',
+        max_devices: user.max_devices || 1,
+        last_login: user.last_login || 0,
+        login_count: user.login_count || 0,
+        created_at: user.created_at || 0,
+        subscription_end: user.subscription_end || 0,
+        expiry_date: formatDate(user.subscription_end),
+        created_by: user.created_by || 'sub_admin',
+        notes: user.notes || '',
+        email: user.email || '',
+        storage_used: user.storage_used || 0,
+        max_storage: user.max_storage || 100
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get user details error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to get user details' 
+    });
+  }
 });
 
-// الإحصائيات - فقط للمستخدمين الذين أنشأهم هذا Sub Admin
 app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -1305,14 +1483,13 @@ app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimi
     let activeUsers = 0;
     let expiredUsers = 0;
     
-    // ✅✅✅ إحصائيات صارمة جداً - فقط مستخدمي هذا المفتاح
     for (const user of Object.values(users)) {
       if (user.created_by_key === currentKeyId) {
         totalUsers++;
         if (user.is_active !== false) {
           activeUsers++;
         }
-        if (user.subscription_end && user.subscription_end <= now) {
+        if (user.subscription_end && user.subscription_end > 0 && user.subscription_end <= now) {
           expiredUsers++;
         }
       }
@@ -1336,10 +1513,9 @@ app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimi
   }
 });
 
-// إضافة مستخدم جديد - مع تخزين created_by_key ✅✅✅
 app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimiter, async (req, res) => {
   try {
-    const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
+    const { username, password, expiryMinutes, customExpiryDate, maxDevices, status, storage_limit, speed_limit } = req.body;
     
     if (!username || !password) {
       return res.status(400).json({ 
@@ -1348,7 +1524,6 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
       });
     }
     
-    // التحقق من عدم وجود نفس اسم المستخدم
     const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
     const checkRes = await firebase.get(checkUrl);
     
@@ -1359,7 +1534,6 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
       });
     }
     
-    // حساب تاريخ الانتهاء
     let expiryTimestamp;
     if (customExpiryDate) {
       expiryTimestamp = new Date(customExpiryDate).getTime();
@@ -1372,17 +1546,21 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
       });
     }
     
-    // ✅✅✅ **التعديل المهم: إضافة created_by_key**
     const userData = {
       username,
       password_hash: hashPassword(password),
       is_active: status !== 'inactive',
+      status: status || 'active',
       subscription_end: expiryTimestamp,
       max_devices: maxDevices || 1,
+      max_storage: storage_limit || 100,
+      speed_limit: speed_limit || 10,
+      storage_used: 0,
       device_id: '',
       created_at: Date.now(),
       last_login: null,
-      created_by_key: req.subAdminKeyId,  // ✅ تخزين معرف مفتاح المسؤول الفرعي
+      login_count: 0,
+      created_by_key: req.subAdminKeyId,
       created_by: req.subAdminKey.admin_name || 'sub_admin'
     };
     
@@ -1406,7 +1584,6 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
   }
 });
 
-// تمديد اشتراك - مع التحقق من الملكية ✅✅✅
 app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('extend'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
@@ -1420,7 +1597,6 @@ app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('ext
       });
     }
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1433,7 +1609,6 @@ app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('ext
     const user = userRes.data;
     
     if (user.created_by_key !== currentKeyId) {
-      console.log(`🚫 Extend denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
         success: false, 
         error: 'You can only extend users you created' 
@@ -1457,8 +1632,6 @@ app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('ext
       is_active: true
     });
     
-    console.log(`⏰ Sub Admin [${currentKeyId}] extended user: ${user.username}`);
-    
     res.json({ 
       success: true, 
       message: 'Subscription extended', 
@@ -1475,14 +1648,12 @@ app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('ext
   }
 });
 
-// تحديث حالة المستخدم - مع التحقق من الملكية ✅✅✅
 app.patch('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('edit'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
-    const { is_active } = req.body;
+    const { is_active, status } = req.body;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1495,18 +1666,17 @@ app.patch('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('edit'), a
     const user = userRes.data;
     
     if (user.created_by_key !== currentKeyId) {
-      console.log(`🚫 Edit denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
         success: false, 
         error: 'You can only edit users you created' 
       });
     }
     
-    await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
-      is_active 
-    });
+    const updateData = {};
+    if (typeof is_active === 'boolean') updateData.is_active = is_active;
+    if (status) updateData.status = status;
     
-    console.log(`✏️ Sub Admin [${currentKeyId}] updated user: ${user.username}`);
+    await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, updateData);
     
     res.json({ 
       success: true, 
@@ -1522,13 +1692,11 @@ app.patch('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('edit'), a
   }
 });
 
-// إعادة تعيين الجهاز - مع التحقق من الملكية ✅✅✅
 app.post('/api/sub/users/:id/reset-device', authSubAdmin, checkSubAdminPermission('edit'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1541,7 +1709,6 @@ app.post('/api/sub/users/:id/reset-device', authSubAdmin, checkSubAdminPermissio
     const user = userRes.data;
     
     if (user.created_by_key !== currentKeyId) {
-      console.log(`🚫 Reset device denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
         success: false, 
         error: 'You can only reset device for users you created' 
@@ -1551,8 +1718,6 @@ app.post('/api/sub/users/:id/reset-device', authSubAdmin, checkSubAdminPermissio
     await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
       device_id: '' 
     });
-    
-    console.log(`🔄 Sub Admin [${currentKeyId}] reset device for user: ${user.username}`);
     
     res.json({ 
       success: true, 
@@ -1568,13 +1733,11 @@ app.post('/api/sub/users/:id/reset-device', authSubAdmin, checkSubAdminPermissio
   }
 });
 
-// حذف مستخدم - مع التحقق من الملكية ✅✅✅
 app.delete('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('delete'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1586,9 +1749,7 @@ app.delete('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('delete')
     
     const user = userRes.data;
     
-    // تحقق مما إذا كان المستخدم ملكاً لهذا المسؤول الفرعي
     if (user.created_by_key !== currentKeyId) {
-      console.log(`🚫 Delete denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
         success: false, 
         error: 'You can only delete users you created' 
@@ -1596,8 +1757,6 @@ app.delete('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('delete')
     }
     
     await firebase.delete(`users/${userId}.json?auth=${FB_KEY}`);
-    
-    console.log(`🗑️ User deleted by Sub Admin [${currentKeyId}]: ${user.username}`);
     
     res.json({ 
       success: true, 
@@ -1614,7 +1773,7 @@ app.delete('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('delete')
 });
 
 // ═══════════════════════════════════════════
-// تنظيف دوري للـ Cache
+// تنظيف دوري
 // ═══════════════════════════════════════════
 setInterval(() => {
   const now = Date.now();
@@ -1626,45 +1785,35 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 // ═══════════════════════════════════════════
-// 🛠️ MAINTENANCE ENDPOINTS (للاستخدام مرة واحدة)
+// 🛠️ MAINTENANCE ENDPOINTS
 // ═══════════════════════════════════════════
 
-// ✅ إصلاح المستخدمين القدامى (الذين ليس لديهم created_by_key)
 app.post('/api/admin/fix-old-users', authAdmin, async (req, res) => {
   try {
-    console.log('🔧 Starting fix-old-users process...');
-    
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
     const users = response.data || {};
     
     let fixed = 0;
     let alreadyFixed = 0;
-    const fixedUsers = [];
     
     for (const [id, user] of Object.entries(users)) {
       if (!user.created_by_key) {
         await firebase.patch(`users/${id}.json?auth=${FB_KEY}`, {
           created_by_key: 'master'
         });
-        console.log(`   ✅ Fixed: ${user.username} → created_by_key: "master"`);
-        fixedUsers.push(user.username);
         fixed++;
       } else {
         alreadyFixed++;
       }
     }
     
-    console.log(`🎉 Fix completed: ${fixed} fixed, ${alreadyFixed} already had key`);
-    
     res.json({ 
       success: true, 
       message: `Fixed ${fixed} old users. ${alreadyFixed} already had created_by_key`,
-      fixed: fixed,
-      alreadyFixed: alreadyFixed,
-      fixedUsers: fixedUsers
+      fixed,
+      alreadyFixed
     });
   } catch (error) {
-    console.error('❌ Fix-old-users error:', error.message);
     res.status(500).json({ 
       success: false, 
       error: error.message 
@@ -1672,7 +1821,6 @@ app.post('/api/admin/fix-old-users', authAdmin, async (req, res) => {
   }
 });
 
-// ✅ عرض جميع المستخدمين مع created_by_key (للتشخيص)
 app.get('/api/admin/debug-users', authAdmin, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -1734,7 +1882,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🛡️ Secure API</title>
+  <title>🛡️ Secure API v3.4.0</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -1745,7 +1893,7 @@ app.get('/', (req, res) => {
       padding: 40px 20px;
       text-align: center;
     }
-    .container { max-width: 800px; margin: 0 auto; }
+    .container { max-width: 900px; margin: 0 auto; }
     h1 { color: #4cc9f0; margin-bottom: 20px; font-size: 2.5rem; }
     .badge {
       background: linear-gradient(135deg, #10b981, #059669);
@@ -1755,93 +1903,26 @@ app.get('/', (req, res) => {
       margin: 20px 0;
       font-weight: bold;
     }
-    .endpoints {
-      background: rgba(255, 255, 255, 0.05);
-      padding: 30px;
-      border-radius: 15px;
-      text-align: left;
-      margin-top: 30px;
-      border: 2px solid rgba(76, 201, 240, 0.3);
+    .new { 
+      background: #ef4444;
+      color: white;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 10px;
+      margin-right: 8px;
     }
-    .endpoints h3 {
-      color: #4cc9f0;
-      margin-bottom: 20px;
-      font-size: 1.3rem;
-    }
-    .ep {
-      margin: 10px 0;
-      padding: 12px;
-      background: rgba(255, 255, 255, 0.02);
-      border-radius: 8px;
-      border-left: 3px solid #4cc9f0;
-      font-size: 0.95rem;
-    }
-    .m {
-      display: inline-block;
-      padding: 4px 12px;
-      border-radius: 5px;
-      margin-left: 10px;
-      font-weight: bold;
-      font-size: 11px;
-      text-transform: uppercase;
-    }
-    .get { background: #10b981; }
-    .post { background: #f59e0b; }
-    .delete { background: #ef4444; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>🛡️ Secure Firebase Proxy</h1>
-    <div class="badge">✅ v3.1.0 - All Systems Online</div>
-    
-    <div class="endpoints">
-      <h3>📋 API Endpoints</h3>
-      
-      <div class="ep">
-        <span class="m get">GET</span>
-        <strong>/api/health</strong> - Health check
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/getUser</strong> - للتطبيق (Mobile App)
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/admin/login</strong> - Master Admin login
-      </div>
-      
-      <div class="ep">
-        <span class="m get">GET</span>
-        <strong>/api/admin/users</strong> - Get all users
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/admin/users/delete-expired</strong> - حذف المنتهيين (Bulk Delete)
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/sub/verify-key</strong> - Sub Admin verify
-      </div>
-      
-      <div class="ep">
-        <span class="m get">GET</span>
-        <strong>/api/sub/users</strong> - Sub Admin get users (فقط مستخدميه)
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/admin/fix-old-users</strong> - إصلاح المستخدمين القدامى
-      </div>
-    </div>
+    <div class="badge">✅ v3.4.0 - All Endpoints Active</div>
     
     <p style="margin-top: 30px; color: #64748b; font-size: 0.9rem;">
-      🔒 Protected by Rate Limiting & DDoS Protection<br>
-      🔐 Sub Admin يرى فقط مستخدميه
+      <span class="new">FIXED</span> User details endpoint active<br>
+      <span class="new">FIXED</span> Sub-Admins endpoints active<br>
+      🔒 Protected by Rate Limiting & Authentication<br>
+      ✅ Master Admin Direct Access Enabled
     </p>
   </div>
 </body>
@@ -1873,16 +1954,15 @@ app.use((err, req, res, next) => {
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
   console.log('═'.repeat(60));
-  console.log('🛡️  Secure Firebase Proxy v3.2.0');
+  console.log('🛡️  Secure Firebase Proxy v3.4.0');
   console.log(`📡 Port: ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'production'}`);
   console.log('');
   console.log('✓ Master Admin endpoints ready');
-  console.log('✓ Sub Admin endpoints ready (يرى فقط مستخدميه)');
+  console.log('✓ User details endpoint active');
+  console.log('✓ Sub-Admins endpoints active');
+  console.log('✓ Sub Admin endpoints ready');
   console.log('✓ Mobile App endpoints ready');
-  console.log('✓ Bulk delete expired users ready');
-  console.log('');
-  console.log('⚠️  IMPORTANT: For old users, run /api/admin/fix-old-users');
   console.log('');
   console.log('═'.repeat(60));
 });
