@@ -192,6 +192,7 @@ const authApp = (req, res, next) => {
 // مصادقة Master Admin
 const authAdmin = (req, res, next) => {
   const sessionToken = req.headers['x-session-token'];
+  const masterToken = process.env.MASTER_ADMIN_TOKEN;
   
   if (!sessionToken) {
     return res.status(401).json({ 
@@ -201,6 +202,13 @@ const authAdmin = (req, res, next) => {
     });
   }
   
+  // ✅ تحقق من Master Token المباشر
+  if (masterToken && sessionToken === masterToken) {
+    req.adminUser = 'master_owner';
+    return next();
+  }
+  
+  // التحقق من Session عادية
   const session = adminSessions.get(sessionToken);
   
   if (!session) {
