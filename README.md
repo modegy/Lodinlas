@@ -408,14 +408,13 @@ GET /api/health
 
 هذا المشروع مرخص تحت [MIT License](LICENSE)
 
----
-
-## 📞 الدعم
+---## 📞 الدعم
 
 إذا واجهت أي مشكلة:
-- 📧 افتح [Issue](https://github.com/yourusername/repo/issues)
+- 📧 افتح [Issue](https://github.com/modegy/Lodinlas/issues)
 - 📖 راجع [التوثيق الكامل](SECURITY.md)
-- 💬 انضم لـ [Discord Server](#)
+- 💬 انضم إلى [Telegram](https://t.me/mod_egy)
+- 💬 Discord Server (قريبًا)
 
 ---
 
