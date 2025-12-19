@@ -354,8 +354,9 @@ const checkUserOwnership = async (req, res, next) => {
     
     const user = userRes.data;
     
-    // ✅ التحقق: هل هذا المستخدم تم إنشاؤه بواسطة هذا Sub Admin؟
-    if (user.created_by_key !== currentKeyId) {
+    // ✅ التحقق الصارم: يجب أن يكون created_by_key موجود ومطابق تماماً
+    if (!user.created_by_key || user.created_by_key !== currentKeyId) {
+      console.log(`🚫 Ownership denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
         success: false, 
         error: 'You can only manage users you created' 
@@ -743,12 +744,13 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       max_devices: maxDevices || 1,
       device_id: '',
       created_at: Date.now(),
-      last_login: null
+      last_login: null,
+      created_by_key: 'master'  // ✅ مهم جداً! تعيين master للمستخدمين من Master Admin
     };
     
     const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
     
-    console.log(`✅ User created: ${username}`);
+    console.log(`✅ User created by Master Admin: ${username}`);
     
     res.json({ 
       success: true, 
@@ -1222,9 +1224,10 @@ app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimi
     let activeUsers = 0;
     let expiredUsers = 0;
     
-    // ✅ إحصائيات فقط للمستخدمين الذين أنشأهم هذا Sub Admin
+    // ✅ إحصائيات فقط للمستخدمين الذين created_by_key يطابق المفتاح الحالي
     for (const user of Object.values(users)) {
-      if (user.created_by_key === currentKeyId) {
+      // ✅ شرط صارم: يجب أن يكون created_by_key موجود ومطابق
+      if (user.created_by_key && user.created_by_key === currentKeyId) {
         totalUsers++;
         if (user.is_active !== false) {
           activeUsers++;
