@@ -1078,6 +1078,46 @@ app.post('/api/admin/api-keys/:id/unbind-device', authAdmin, apiLimiter, async (
   }
 });
 
+// ✅ Middleware تلقائي: إصلاح المستخدمين القدامى عند أول استخدام Sub Admin
+const autoFixOldUsers = async (req, res, next) => {
+  try {
+    // التحقق من علامة "تم الإصلاح من قبل"
+    const fixFlagRes = await firebase.get(`_system/users_fixed.json?auth=${FB_KEY}`);
+    
+    if (fixFlagRes.data === true) {
+      // تم الإصلاح من قبل، تخطي
+      return next();
+    }
+    
+    console.log('🔧 Auto-fixing old users without created_by_key...');
+    
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    let fixed = 0;
+    for (const [id, user] of Object.entries(users)) {
+      if (!user.created_by_key) {
+        await firebase.patch(`users/${id}.json?auth=${FB_KEY}`, {
+          created_by_key: 'master'
+        });
+        console.log(`   ✅ Fixed: ${user.username}`);
+        fixed++;
+      }
+    }
+    
+    // تعيين علامة "تم الإصلاح"
+    await firebase.put(`_system/users_fixed.json?auth=${FB_KEY}`, true);
+    
+    console.log(`✅ Auto-fix completed: ${fixed} users fixed`);
+    
+    next();
+  } catch (error) {
+    console.error('⚠️ Auto-fix error:', error.message);
+    // المتابعة حتى لو فشل
+    next();
+  }
+};
+
 // ═══════════════════════════════════════════
 // 🔑 SUB ADMIN API
 // ═══════════════════════════════════════════
@@ -1212,7 +1252,7 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
 });
 
 // الإحصائيات - فقط للمستخدمين الذين أنشأهم هذا Sub Admin
-app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
+app.get('/api/sub/stats', authSubAdmin, autoFixOldUsers, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
     const users = response.data || {};
@@ -1224,10 +1264,12 @@ app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimi
     let activeUsers = 0;
     let expiredUsers = 0;
     
-    // ✅ إحصائيات فقط للمستخدمين الذين created_by_key يطابق المفتاح الحالي
+    // ✅✅✅ إحصائيات صارمة جداً
     for (const user of Object.values(users)) {
-      // ✅ شرط صارم: يجب أن يكون created_by_key موجود ومطابق
-      if (user.created_by_key && user.created_by_key === currentKeyId) {
+      const userKeyId = user.created_by_key;
+      
+      // يجب أن يكون موجود، وليس master، ومطابق للمفتاح الحالي
+      if (userKeyId && userKeyId !== 'master' && userKeyId === currentKeyId) {
         totalUsers++;
         if (user.is_active !== false) {
           activeUsers++;
@@ -1458,6 +1500,106 @@ setInterval(() => {
     }
   }
 }, 60 * 60 * 1000);
+
+// ═══════════════════════════════════════════
+// 🛠️ MAINTENANCE ENDPOINTS (للاستخدام مرة واحدة)
+// ═══════════════════════════════════════════
+
+// ✅ إصلاح المستخدمين القدامى (الذين ليس لديهم created_by_key)
+app.post('/api/admin/fix-old-users', authAdmin, async (req, res) => {
+  try {
+    console.log('🔧 Starting fix-old-users process...');
+    
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    let fixed = 0;
+    let alreadyFixed = 0;
+    const fixedUsers = [];
+    
+    for (const [id, user] of Object.entries(users)) {
+      if (!user.created_by_key) {
+        await firebase.patch(`users/${id}.json?auth=${FB_KEY}`, {
+          created_by_key: 'master'
+        });
+        console.log(`   ✅ Fixed: ${user.username} → created_by_key: "master"`);
+        fixedUsers.push(user.username);
+        fixed++;
+      } else {
+        alreadyFixed++;
+      }
+    }
+    
+    console.log(`🎉 Fix completed: ${fixed} fixed, ${alreadyFixed} already had key`);
+    
+    res.json({ 
+      success: true, 
+      message: `Fixed ${fixed} old users. ${alreadyFixed} already had created_by_key`,
+      fixed: fixed,
+      alreadyFixed: alreadyFixed,
+      fixedUsers: fixedUsers
+    });
+  } catch (error) {
+    console.error('❌ Fix-old-users error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// ✅ عرض جميع المستخدمين مع created_by_key (للتشخيص)
+app.get('/api/admin/debug-users', authAdmin, async (req, res) => {
+  try {
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    const debugInfo = [];
+    let withKey = 0;
+    let withoutKey = 0;
+    let masterUsers = 0;
+    let subAdminUsers = 0;
+    
+    for (const [id, user] of Object.entries(users)) {
+      const keyStatus = user.created_by_key || 'MISSING';
+      
+      debugInfo.push({
+        id: id.substring(0, 10) + '...',
+        username: user.username,
+        created_by_key: keyStatus,
+        created_at: formatDate(user.created_at)
+      });
+      
+      if (user.created_by_key) {
+        withKey++;
+        if (user.created_by_key === 'master') {
+          masterUsers++;
+        } else {
+          subAdminUsers++;
+        }
+      } else {
+        withoutKey++;
+      }
+    }
+    
+    res.json({
+      success: true,
+      summary: {
+        total: Object.keys(users).length,
+        withKey,
+        withoutKey,
+        masterUsers,
+        subAdminUsers
+      },
+      users: debugInfo
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
 
 // ═══════════════════════════════════════════
 // HOME PAGE
