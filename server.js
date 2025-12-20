@@ -90,6 +90,8 @@ if (process.env.NODE_ENV === 'development') {
         }
     });
 }
+
+
 // Middleware للتحقق من التواقيع
 
 const verifySignature = (req, res, next) => {
@@ -147,7 +149,7 @@ const verifySignature = (req, res, next) => {
         });
         
         // تحويل من الثواني إلى المللي ثانية إذا كان timestamp صغيراً
-        if (requestTime < 10000000000) { // أقل من 10 مليار (ثواني)
+        if (requestTime < 10000000000) {
             requestTime = requestTime * 1000;
             console.log(`🔄 [SIGNATURE] Converted timestamp: ${timestamp}s → ${requestTime}ms`);
         }
@@ -165,21 +167,18 @@ const verifySignature = (req, res, next) => {
             });
         }
 
-        // 🔑 **الحصول على المفتاح السري من متغيرات البيئة فقط**
+        // 🔑 الحصول على المفتاح السري
         let secretKey;
         let keySource = 'unknown';
         
-        // 1. إذا كان clientId هو APP_API_KEY (التطبيق الأندرويد)
         if (clientId === process.env.APP_API_KEY) {
             secretKey = process.env.APP_SIGNING_SECRET;
             keySource = 'app_signing_secret';
         }
-        // 2. التحقق من Master Admin Token
         else if (clientId === process.env.MASTER_ADMIN_TOKEN) {
             secretKey = process.env.MASTER_SIGNING_SECRET;
             keySource = 'master_signing_secret';
         }
-        // 3. البحث في مفاتيح API Keys (للمسؤولين الفرعيين) من Firebase
         else {
             const cachedKey = subAdminKeys.get(clientId);
             if (cachedKey && cachedKey.signing_secret) {
@@ -191,7 +190,6 @@ const verifySignature = (req, res, next) => {
             }
         }
 
-        // التحقق من وجود المفتاح
         if (!secretKey) {
             console.error('❌ [SIGNATURE] No signing secret found for client');
             return res.status(401).json({
@@ -217,12 +215,14 @@ const verifySignature = (req, res, next) => {
                 stringToSign = `${req.method.toUpperCase()}:${req.path}?${sortedParams}|${timestamp}|${nonce}`;
             }
         } else {
-            const bodyString = req.body ? JSON.stringify(req.body) : '{}';
+            // ✅ التعديل المهم: استخدام rawBody بدلاً من JSON.stringify
+            const bodyString = req.rawBody || '{}';
             const bodyHash = crypto.createHash('sha256')
                 .update(bodyString)
                 .digest('hex');
             stringToSign = `${req.method.toUpperCase()}:${req.path}|${bodyHash}|${timestamp}|${nonce}`;
             
+            console.log('📝 [SIGNATURE] Raw body used:', bodyString.substring(0, 50) + '...');
             console.log('📝 [SIGNATURE] Body hash:', bodyHash);
         }
 
@@ -249,12 +249,8 @@ const verifySignature = (req, res, next) => {
 
         if (!isValid) {
             console.error(`❌ [SIGNATURE] Invalid signature`);
-            
-            // في وضع التطوير فقط، عرض معلومات إضافية
-            if (process.env.NODE_ENV === 'development') {
-                console.error('   Expected:', expectedSignature);
-                console.error('   Received:', signature);
-            }
+            console.error('   Expected:', expectedSignature);
+            console.error('   Received:', signature);
 
             return res.status(401).json({
                 success: false,
@@ -302,7 +298,15 @@ const loginLimiter = createRateLimiter(15 * 60 * 1000, 5, 'Too many login attemp
 const apiLimiter = createRateLimiter(60 * 1000, 50, 'API rate limit exceeded');
 
 app.use('/', globalLimiter);
-app.use(express.json({ limit: '2mb' }));
+
+// ✅ تعديل مهم: حفظ الـ raw body
+app.use(express.json({ 
+    limit: '2mb',
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString('utf8');
+    }
+}));
+
 
 // ═══════════════════════════════════════════
 // Brute Force Protection
@@ -2632,3 +2636,40 @@ app.listen(PORT, () => {
   console.log('');
   console.log('═'.repeat(60));
 });
+
+
+
+
+
+// ═══════════════════════════════════════════
+// Rate Limiting
+// ═══════════════════════════════════════════
+const createRateLimiter = (windowMs, max, message) => {
+  return rateLimit({
+    windowMs, 
+    max,
+    message: { success: false, error: message },
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+      return req.headers['x-forwarded-for']?.split(',')[0]?.trim() 
+        || req.headers['x-real-ip'] 
+        || req.ip 
+        || req.connection.remoteAddress;
+    }
+  });
+};
+
+const globalLimiter = createRateLimiter(60 * 1000, 100, 'Too many requests');
+const loginLimiter = createRateLimiter(15 * 60 * 1000, 5, 'Too many login attempts');
+const apiLimiter = createRateLimiter(60 * 1000, 50, 'API rate limit exceeded');
+
+app.use('/', globalLimiter);
+
+// ✅ تعديل مهم: حفظ الـ raw body
+app.use(express.json({ 
+    limit: '2mb',
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString('utf8');
+    }
+}));
