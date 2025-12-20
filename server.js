@@ -656,6 +656,60 @@ app.get('/api/serverTime', apiLimiter, (req, res) => {
   });
 });
 
+
+
+// ═══════════════════════════════════════════
+// 🔍 DEBUG ENDPOINT - لتشخيص مشاكل التوقيع
+// ═══════════════════════════════════════════
+app.post('/api/debug-signature', apiLimiter, (req, res) => {
+    try {
+        const signature = req.headers['x-api-signature'];
+        const timestamp = req.headers['x-timestamp'];
+        const nonce = req.headers['x-nonce'];
+        const clientId = req.headers['x-client-id'] || req.headers['x-api-key'];
+        
+        const secretKey = process.env.APP_SIGNING_SECRET;
+        
+        const bodyAsReceived = JSON.stringify(req.body);
+        const bodyHash = crypto.createHash('sha256').update(bodyAsReceived).digest('hex');
+        
+        const stringToSign = `POST:/api/updateDevice|${bodyHash}|${timestamp}|${nonce}|${secretKey}`;
+        
+        const expectedSignature = crypto.createHmac('sha256', secretKey)
+            .update(stringToSign)
+            .digest('base64')
+            .replace(/=+$/, '');
+        
+        res.json({
+            debug: true,
+            received_headers: {
+                signature: signature,
+                timestamp: timestamp,
+                nonce: nonce,
+                clientId: clientId ? clientId.substring(0, 15) + '...' : 'none'
+            },
+            body_analysis: {
+                body_as_received: bodyAsReceived,
+                body_hash: bodyHash,
+                body_length: bodyAsReceived.length
+            },
+            signature_computation: {
+                string_to_sign_preview: `POST:/api/updateDevice|${bodyHash}|${timestamp}|${nonce}|***SECRET***`,
+                expected_signature: expectedSignature,
+                received_signature: signature,
+                match: signature === expectedSignature
+            },
+            secret_info: {
+                secret_configured: !!secretKey,
+                secret_length: secretKey ? secretKey.length : 0
+            }
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ═══════════════════════════════════════════
 // 📱 MOBILE APP ENDPOINTS (مع حماية التواقيع)
 // ═══════════════════════════════════════════
