@@ -46,13 +46,9 @@ app.use(cors({
 // ═══════════════════════════════════════════
 // SIGNATURE VERIFICATION SYSTEM - النظام الجديد
 // ═══════════════════════════════════════════
-
-// مفاتيح التوقيع
-const SIGNING_SECRETS = {
-    // المفتاح الرئيسي للتطبيق
-    'MySecureAppKey@2024#Firebase$': 'Ma7moud55##@2024SecureSigningKey!',
-    // يمكن إضافة مفاتيح أخرى هنا
-};
+// ═══════════════════════════════════════════
+// SIGNATURE CONFIGURATION
+// ═══════════════════════════════════════════
 
 // قائمة بالـ APIs التي تتطلب توقيعاً
 const SIGNED_ENDPOINTS = [
@@ -68,9 +64,38 @@ const SIGNED_ENDPOINTS = [
     '/api/sub/stats'
 ];
 
+// ═══════════════════════════════════════════
+// دالة لاختبار التوقيع (للتطوير فقط)
+// ═══════════════════════════════════════════
+if (process.env.NODE_ENV === 'development') {
+    app.post('/api/test-signature-debug', (req, res) => {
+        try {
+            const { method, path, body, timestamp, nonce, clientId } = req.body;
+            
+            // فقط في وضع التطوير، يمكن إرجاع معلومات للتشخيص
+            res.json({
+                success: true,
+                info: 'Debug endpoint for development only',
+                note: 'In production, this endpoint is disabled',
+                clientId: clientId ? clientId.substring(0, 5) + '...' : 'none',
+                required_headers: [
+                    'x-api-signature',
+                    'x-timestamp', 
+                    'x-nonce',
+                    'x-client-id'
+                ]
+            });
+        } catch (error) {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    });
+}
 // Middleware للتحقق من التواقيع
+
 const verifySignature = (req, res, next) => {
     try {
+        console.log('🔐 [SIGNATURE] Starting verification for:', req.method, req.path);
+        
         // التحقق مما إذا كانت النقطة تتطلب توقيعاً
         const path = req.path;
         const needsSignature = SIGNED_ENDPOINTS.some(endpoint => {
@@ -83,8 +108,11 @@ const verifySignature = (req, res, next) => {
         });
 
         if (!needsSignature) {
+            console.log('🔐 [SIGNATURE] No signature required for:', path);
             return next();
         }
+
+        console.log('🔐 [SIGNATURE] Signature required for:', path);
 
         // الحصول على رؤوس التوقيع
         const signature = req.headers['x-api-signature'];
@@ -92,21 +120,44 @@ const verifySignature = (req, res, next) => {
         const nonce = req.headers['x-nonce'];
         const clientId = req.headers['x-client-id'] || req.headers['x-api-key'];
 
+        console.log('🔐 [SIGNATURE] Headers received:', {
+            signature: signature ? `${signature.substring(0, 10)}...` : 'none',
+            timestamp: timestamp,
+            nonce: nonce,
+            clientId: clientId ? `${clientId.substring(0, 10)}...` : 'none'
+        });
+
         if (!signature || !timestamp || !nonce || !clientId) {
+            console.log('❌ [SIGNATURE] Missing signature headers');
             return res.status(401).json({
                 success: false,
-                error: 'Missing signature headers (x-api-signature, x-timestamp, x-nonce, x-client-id)',
+                error: 'Missing signature headers',
                 code: 401
             });
         }
 
-        // التحقق من صلاحية الطابع الزمني (منع إعادة استخدام الطلبات القديمة)
+        // التحقق من صلاحية الطابع الزمني
         const now = Date.now();
-        const requestTime = parseInt(timestamp);
+        let requestTime = parseInt(timestamp);
+        
+        console.log('⏰ [SIGNATURE] Time check:', {
+            now: now,
+            received: requestTime,
+            isSeconds: requestTime < 10000000000
+        });
+        
+        // تحويل من الثواني إلى المللي ثانية إذا كان timestamp صغيراً
+        if (requestTime < 10000000000) { // أقل من 10 مليار (ثواني)
+            requestTime = requestTime * 1000;
+            console.log(`🔄 [SIGNATURE] Converted timestamp: ${timestamp}s → ${requestTime}ms`);
+        }
         
         // السماح بفارق زمني 5 دقائق (300000 مللي ثانية)
-        if (isNaN(requestTime) || Math.abs(now - requestTime) > 300000) {
-            console.warn(`⚠️ Rejected request with invalid timestamp: ${timestamp}, now: ${now}`);
+        const timeDiff = Math.abs(now - requestTime);
+        console.log(`⏰ [SIGNATURE] Time difference: ${timeDiff}ms`);
+        
+        if (isNaN(requestTime) || timeDiff > 300000) {
+            console.warn(`❌ [SIGNATURE] Rejected request with invalid timestamp: diff ${timeDiff}ms`);
             return res.status(401).json({
                 success: false,
                 error: 'Request timestamp is invalid or too old',
@@ -114,37 +165,50 @@ const verifySignature = (req, res, next) => {
             });
         }
 
-        // الحصول على المفتاح السري المناسب
+        // 🔑 **الحصول على المفتاح السري من متغيرات البيئة فقط**
         let secretKey;
+        let keySource = 'unknown';
         
-        // 1. التحقق من المفاتيح المحلية أولاً
-        if (SIGNING_SECRETS[clientId]) {
-            secretKey = SIGNING_SECRETS[clientId];
-        } 
+        // 1. إذا كان clientId هو APP_API_KEY (التطبيق الأندرويد)
+        if (clientId === process.env.APP_API_KEY) {
+            secretKey = process.env.APP_SIGNING_SECRET;
+            keySource = 'app_signing_secret';
+        }
         // 2. التحقق من Master Admin Token
         else if (clientId === process.env.MASTER_ADMIN_TOKEN) {
-            secretKey = process.env.MASTER_SIGNING_SECRET || 'MasterSigningSecret@2024';
+            secretKey = process.env.MASTER_SIGNING_SECRET;
+            keySource = 'master_signing_secret';
         }
-        // 3. البحث في مفاتيح API Keys (للمسؤولين الفرعيين)
+        // 3. البحث في مفاتيح API Keys (للمسؤولين الفرعيين) من Firebase
         else {
-            // البحث في الذاكرة المؤقتة أولاً
             const cachedKey = subAdminKeys.get(clientId);
             if (cachedKey && cachedKey.signing_secret) {
                 secretKey = cachedKey.signing_secret;
+                keySource = 'cached_sub_admin';
             } else {
-                // إذا لم يتم العثور عليه، استخدام المفتاح الافتراضي
-                secretKey = process.env.DEFAULT_SIGNING_SECRET || 'DefaultSigningSecret@2024';
+                secretKey = process.env.DEFAULT_SIGNING_SECRET;
+                keySource = 'default_signing_secret';
             }
         }
+
+        // التحقق من وجود المفتاح
+        if (!secretKey) {
+            console.error('❌ [SIGNATURE] No signing secret found for client');
+            return res.status(401).json({
+                success: false,
+                error: 'Authentication failed',
+                code: 401
+            });
+        }
+
+        console.log(`🔑 [SIGNATURE] Using key from: ${keySource}`);
 
         // إنشاء السلسلة للتوقيع
         let stringToSign = '';
         
         if (req.method === 'GET' || req.method === 'DELETE') {
-            // للطلبات GET/DELETE: المسار + الطابع الزمني + النونس
             stringToSign = `${req.method.toUpperCase()}:${req.path}|${timestamp}|${nonce}`;
             
-            // إضافة معلمات الاستعلام إذا وجدت
             if (Object.keys(req.query).length > 0) {
                 const sortedParams = Object.keys(req.query)
                     .sort()
@@ -153,68 +217,58 @@ const verifySignature = (req, res, next) => {
                 stringToSign = `${req.method.toUpperCase()}:${req.path}?${sortedParams}|${timestamp}|${nonce}`;
             }
         } else {
-            // للطلبات POST/PUT/PATCH: المسار + الجسم + الطابع الزمني + النونس
             const bodyString = req.body ? JSON.stringify(req.body) : '{}';
             const bodyHash = crypto.createHash('sha256')
                 .update(bodyString)
                 .digest('hex');
             stringToSign = `${req.method.toUpperCase()}:${req.path}|${bodyHash}|${timestamp}|${nonce}`;
+            
+            console.log('📝 [SIGNATURE] Body hash:', bodyHash);
         }
 
         // إضافة المفتاح السري
         stringToSign += `|${secretKey}`;
+        
+        console.log('📝 [SIGNATURE] String to sign (without secret):', 
+            stringToSign.substring(0, stringToSign.length - secretKey.length)
+        );
 
         // توليد التوقيع المتوقع
         const expectedSignature = crypto.createHmac('sha256', secretKey)
             .update(stringToSign)
             .digest('base64')
-            .replace(/=+$/, ''); // إزالة = الزائدة
+            .replace(/=+$/, '');
 
-        // المقارنة بأمان ضد هجمات التوقيت
-        const isValid = crypto.timingSafeEqual(
-            Buffer.from(signature),
-            Buffer.from(expectedSignature)
-        );
+        console.log('🔍 [SIGNATURE] Signature comparison:', {
+            expected_length: expectedSignature.length,
+            received_length: signature.length
+        });
+
+        // مقارنة التواقيع
+        const isValid = (signature === expectedSignature);
 
         if (!isValid) {
-            console.error(`❌ Invalid signature for client: ${clientId.substring(0, 15)}...`);
-            console.error(`   Path: ${req.method} ${req.path}`);
-            console.error(`   Expected: ${expectedSignature.substring(0, 20)}...`);
-            console.error(`   Received: ${signature.substring(0, 20)}...`);
+            console.error(`❌ [SIGNATURE] Invalid signature`);
             
-            // تسجيل محاولة توقيع فاشلة للتحليل الأمني
-            const failedAttempt = {
-                clientId: clientId.substring(0, 10) + '...',
-                ip: req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip,
-                timestamp: new Date().toISOString(),
-                path: req.path,
-                method: req.method
-            };
-            console.warn('🚨 Failed signature attempt:', failedAttempt);
+            // في وضع التطوير فقط، عرض معلومات إضافية
+            if (process.env.NODE_ENV === 'development') {
+                console.error('   Expected:', expectedSignature);
+                console.error('   Received:', signature);
+            }
 
             return res.status(401).json({
                 success: false,
                 error: 'Invalid signature',
-                code: 401,
-                hint: 'Check your signing headers and secret key'
+                code: 401
             });
         }
 
-        // تخزين معلومات التحقق في الطلب لاستخدامها لاحقاً
-        req.signatureInfo = {
-            clientId,
-            timestamp: requestTime,
-            nonce,
-            isValid,
-            secretKeyHash: crypto.createHash('sha256').update(secretKey).digest('hex').substring(0, 10)
-        };
-
-        // ✅ التوقيع صالح - المتابعة
-        console.log(`✅ Valid signature from ${clientId.substring(0, 10)}... for ${req.method} ${req.path}`);
+        // ✅ التوقيع صالح
+        console.log(`✅ [SIGNATURE] Valid signature for ${req.method} ${req.path}`);
         next();
 
     } catch (error) {
-        console.error('Signature verification error:', error.message);
+        console.error('❌ [SIGNATURE] Verification error:', error.message);
         res.status(500).json({
             success: false,
             error: 'Signature verification failed',
@@ -223,27 +277,6 @@ const verifySignature = (req, res, next) => {
     }
 };
 
-// دالة مساعدة لتوليد توقيع (للاستخدام في التوثيق والاختبار)
-const generateClientSignature = (method, path, body, timestamp, nonce, secretKey) => {
-    let stringToSign = '';
-    
-    if (method === 'GET' || method === 'DELETE') {
-        stringToSign = `${method.toUpperCase()}:${path}|${timestamp}|${nonce}`;
-    } else {
-        const bodyString = body ? JSON.stringify(body) : '{}';
-        const bodyHash = crypto.createHash('sha256')
-            .update(bodyString)
-            .digest('hex');
-        stringToSign = `${method.toUpperCase()}:${path}|${bodyHash}|${timestamp}|${nonce}`;
-    }
-    
-    stringToSign += `|${secretKey}`;
-    
-    return crypto.createHmac('sha256', secretKey)
-        .update(stringToSign)
-        .digest('base64')
-        .replace(/=+$/, '');
-};
 
 // ═══════════════════════════════════════════
 // Rate Limiting
