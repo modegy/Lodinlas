@@ -31,25 +31,17 @@ app.use(helmet({
 // 🛡️ ADVANCED DDOS & SECURITY PROTECTION
 // ═══════════════════════════════════════════
 
-// تتبع الطلبات لكل IP
 const requestTracker = new Map();
 const blockedIPs = new Set();
-const suspiciousIPs = new Map();
 
-// ═══════════════════════════════════════════
-// 🚫 حظر IPs المشبوهة تلقائياً
-// ═══════════════════════════════════════════
 const ddosProtection = (req, res, next) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
     const now = Date.now();
     
-    // إذا IP محظور نهائياً
     if (blockedIPs.has(ip)) {
-        console.warn(`🚫 [BLOCKED] Request from banned IP: ${ip}`);
         return res.status(403).end();
     }
     
-    // إنشاء أو تحديث tracker
     if (!requestTracker.has(ip)) {
         requestTracker.set(ip, { 
             count: 0, 
@@ -61,7 +53,6 @@ const ddosProtection = (req, res, next) => {
     
     const tracker = requestTracker.get(ip);
     
-    // إذا محظور مؤقتاً (10 دقائق)
     if (tracker.blocked) {
         if (now - tracker.blockedAt < 600000) {
             return res.status(429).json({ 
@@ -69,13 +60,11 @@ const ddosProtection = (req, res, next) => {
                 retry_after: Math.ceil((600000 - (now - tracker.blockedAt)) / 1000)
             });
         } else {
-            // رفع الحظر المؤقت
             tracker.blocked = false;
             tracker.count = 0;
         }
     }
     
-    // إعادة تعيين العداد كل دقيقة
     if (now - tracker.firstRequest > 60000) {
         tracker.count = 0;
         tracker.firstRequest = now;
@@ -83,255 +72,96 @@ const ddosProtection = (req, res, next) => {
     
     tracker.count++;
     
-    // ═══════════════════════════════════════════
-    // مستويات الحماية
-    // ═══════════════════════════════════════════
-    
-    // أكثر من 60 طلب في الدقيقة = تحذير
     if (tracker.count > 60 && tracker.count <= 100) {
-        console.warn(`⚠️ [WARNING] High traffic from IP: ${ip} (${tracker.count} req/min)`);
+        console.warn(`⚠️ [WARNING] High traffic from: ${ip} (${tracker.count} req/min)`);
     }
     
-    // أكثر من 100 طلب = حظر مؤقت
     if (tracker.count > 100) {
         tracker.blocked = true;
         tracker.blockedAt = now;
         tracker.violations++;
         
-        console.error(`🚫 [BLOCKED] IP blocked for DDoS: ${ip} (violation #${tracker.violations})`);
+        console.error(`🚫 [BLOCKED] IP: ${ip} (violation #${tracker.violations})`);
         
-        // 3 مخالفات = حظر دائم
         if (tracker.violations >= 3) {
             blockedIPs.add(ip);
-            console.error(`⛔ [BANNED] IP permanently banned: ${ip}`);
+            console.error(`⛔ [BANNED] IP permanently: ${ip}`);
         }
         
-        return res.status(429).json({ 
-            error: 'Rate limit exceeded. Blocked for 10 minutes.',
-            retry_after: 600
-        });
+        return res.status(429).json({ error: 'Rate limit exceeded' });
     }
     
     next();
 };
 
-// ═══════════════════════════════════════════
-// 🔍 فحص الطلبات المشبوهة
-// ═══════════════════════════════════════════
 const suspiciousRequestFilter = (req, res, next) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
     const userAgent = req.headers['user-agent'] || '';
-    const contentType = req.headers['content-type'] || '';
     
-    // ═══════════════════════════════════════════
-    // 1. حظر الطلبات بدون User-Agent
-    // ═══════════════════════════════════════════
     if (!userAgent || userAgent.length < 5) {
-        console.warn(`🚫 [SUSPICIOUS] No User-Agent from: ${ip}`);
         return res.status(403).json({ error: 'Forbidden' });
     }
     
-    // ═══════════════════════════════════════════
-    // 2. حظر أدوات الهجوم المعروفة
-    // ═══════════════════════════════════════════
     const blockedAgents = [
-        'sqlmap', 'nikto', 'nmap', 'masscan',
-        'zgrab', 'gobuster', 'dirbuster', 'wfuzz',
-        'hydra', 'medusa', 'burp', 'zap',
-        'havij', 'acunetix', 'nessus', 'openvas',
-        'metasploit', 'slowloris', 'hulk', 'goldeneye',
-        'xerxes', 'loic', 'hoic', 'slowhttptest'
+        'sqlmap', 'nikto', 'nmap', 'masscan', 'zgrab', 
+        'gobuster', 'dirbuster', 'hydra', 'burp', 'zap',
+        'slowloris', 'hulk', 'goldeneye', 'loic', 'hoic'
     ];
     
     const userAgentLower = userAgent.toLowerCase();
     for (const agent of blockedAgents) {
         if (userAgentLower.includes(agent)) {
             blockedIPs.add(ip);
-            console.error(`⛔ [BANNED] Attack tool detected from ${ip}: ${agent}`);
+            console.error(`⛔ [BANNED] Attack tool: ${agent} from ${ip}`);
             return res.status(403).end();
         }
     }
-    
-    // ═══════════════════════════════════════════
-    // 3. حظر Bots المشبوهة (اختياري)
-    // ═══════════════════════════════════════════
-    const suspiciousBots = [
-        'python-requests', 'python-urllib', 'python/',
-        'go-http-client', 'java/', 'libwww-perl',
-        'httpclient', 'okhttp', 'axios/', 'node-fetch'
-    ];
-    
-    // سماح للتطبيقات الشرعية (أضف User-Agent تطبيقك هنا)
-    const allowedAgents = ['okhttp', 'android', 'iphone', 'ipad', 'mobile'];
-    const isAllowed = allowedAgents.some(a => userAgentLower.includes(a));
-    
-    if (!isAllowed) {
-        for (const bot of suspiciousBots) {
-            if (userAgentLower.includes(bot)) {
-                console.warn(`⚠️ [SUSPICIOUS BOT] ${bot} from: ${ip}`);
-                // لا نحظر، فقط نسجل - يمكنك تفعيل الحظر
-                // return res.status(403).json({ error: 'Forbidden' });
-            }
-        }
-    }
-    
-    // ═══════════════════════════════════════════
-    // 4. فحص حجم الطلب
-    // ═══════════════════════════════════════════
-    const contentLength = parseInt(req.headers['content-length'] || '0');
-    if (contentLength > 2 * 1024 * 1024) { // أكثر من 2MB
-        console.warn(`🚫 [LARGE REQUEST] ${contentLength} bytes from: ${ip}`);
-        return res.status(413).json({ error: 'Request too large' });
-    }
-    
-    // ═══════════════════════════════════════════
-    // 5. حماية من SQL Injection في URL
-    // ═══════════════════════════════════════════
-    const sqlPatterns = [
-        /(\%27)|(\')|(\-\-)|(\%23)|(#)/i,
-        /((\%3D)|(=))[^\n]*((\%27)|(\')|(\-\-)|(\%3B)|(;))/i,
-        /\w*((\%27)|(\'))((\%6F)|o|(\%4F))((\%72)|r|(\%52))/i,
-        /((\%27)|(\'))union/i,
-        /exec(\s|\+)+(s|x)p\w+/i,
-        /union(.*)select/i,
-        /select(.*)from/i,
-        /insert(.*)into/i,
-        /drop(.*)table/i,
-        /delete(.*)from/i,
-        /update(.*)set/i
-    ];
     
     const fullUrl = req.originalUrl || req.url;
-    for (const pattern of sqlPatterns) {
-        if (pattern.test(fullUrl)) {
-            blockedIPs.add(ip);
-            console.error(`⛔ [SQL INJECTION] Attempt from: ${ip} - URL: ${fullUrl}`);
-            return res.status(403).end();
-        }
+    if (/union.*select|select.*from|drop.*table|insert.*into/i.test(fullUrl)) {
+        blockedIPs.add(ip);
+        console.error(`⛔ [SQL INJECTION] from: ${ip}`);
+        return res.status(403).end();
     }
     
-    // ═══════════════════════════════════════════
-    // 6. حماية من XSS
-    // ═══════════════════════════════════════════
-    const xssPatterns = [
-        /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi,
-        /javascript:/gi,
-        /on\w+\s*=/gi,
-        /<iframe/gi,
-        /<object/gi,
-        /<embed/gi
-    ];
-    
-    for (const pattern of xssPatterns) {
-        if (pattern.test(fullUrl)) {
-            console.error(`⛔ [XSS] Attempt from: ${ip}`);
-            return res.status(403).end();
-        }
+    if (/<script|javascript:|on\w+\s*=/i.test(fullUrl)) {
+        console.error(`⛔ [XSS] from: ${ip}`);
+        return res.status(403).end();
     }
     
     next();
 };
 
-// ═══════════════════════════════════════════
-// 🌍 حظر دول معينة (اختياري)
-// ═══════════════════════════════════════════
-const blockedCountries = []; // أضف أكواد الدول: ['CN', 'RU', 'KP']
-
-const geoBlock = (req, res, next) => {
-    // هذا يحتاج خدمة GeoIP - Cloudflare يوفرها مجاناً
-    const country = req.headers['cf-ipcountry'];
-    
-    if (country && blockedCountries.includes(country)) {
-        console.warn(`🌍 [GEO-BLOCKED] Request from: ${country}`);
-        return res.status(403).json({ error: 'Service not available in your region' });
-    }
-    
-    next();
-};
-
-// ═══════════════════════════════════════════
-// 📊 تسجيل الهجمات
-// ═══════════════════════════════════════════
 const attackLogger = (req, res, next) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
-    
-    // تسجيل كل الطلبات للـ endpoints الحساسة
     const sensitiveEndpoints = ['/api/admin', '/api/sub'];
-    const isSensitive = sensitiveEndpoints.some(ep => req.path.startsWith(ep));
     
-    if (isSensitive) {
-        console.log(`📋 [AUDIT] ${req.method} ${req.path} | IP: ${ip} | UA: ${req.headers['user-agent']?.substring(0, 50)}`);
+    if (sensitiveEndpoints.some(ep => req.path.startsWith(ep))) {
+        console.log(`📋 [AUDIT] ${req.method} ${req.path} | IP: ${ip}`);
     }
     
     next();
 };
 
-// ═══════════════════════════════════════════
-// 🔄 تنظيف دوري للذاكرة
-// ═══════════════════════════════════════════
-setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    for (const [ip, data] of requestTracker.entries()) {
-        // حذف السجلات الأقدم من ساعة
-        if (now - data.firstRequest > 3600000) {
-            requestTracker.delete(ip);
-            cleaned++;
-        }
-    }
-    
-    if (cleaned > 0) {
-        console.log(`🧹 [CLEANUP] Removed ${cleaned} old IP records`);
-    }
-    
-    console.log(`📊 [STATS] Tracking: ${requestTracker.size} IPs | Blocked: ${blockedIPs.size} IPs`);
-}, 3600000); // كل ساعة
-
-// ═══════════════════════════════════════════
-// 🚀 تطبيق الحماية - أضف هذه الأسطر بالترتيب
-// ═══════════════════════════════════════════
+// تطبيق الحماية
 app.use(ddosProtection);
 app.use(suspiciousRequestFilter);
-app.use(geoBlock);
 app.use(attackLogger);
 
-// ═══════════════════════════════════════════
-// 📡 Endpoint لعرض حالة الحماية (للأدمن فقط)
-// ═══════════════════════════════════════════
-app.get('/api/admin/security-stats', authAdmin, (req, res) => {
-    res.json({
-        success: true,
-        stats: {
-            tracked_ips: requestTracker.size,
-            blocked_ips: blockedIPs.size,
-            blocked_list: Array.from(blockedIPs).slice(0, 20), // أول 20 فقط
-            memory_usage: process.memoryUsage()
+// تنظيف دوري
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, data] of requestTracker.entries()) {
+        if (now - data.firstRequest > 3600000) {
+            requestTracker.delete(ip);
         }
-    });
-});
-
-// ═══════════════════════════════════════════
-// 🔓 Endpoint لرفع الحظر عن IP (للأدمن فقط)
-// ═══════════════════════════════════════════
-app.post('/api/admin/unblock-ip', authAdmin, (req, res) => {
-    const { ip } = req.body;
-    
-    if (!ip) {
-        return res.status(400).json({ error: 'IP required' });
     }
-    
-    blockedIPs.delete(ip);
-    requestTracker.delete(ip);
-    
-    console.log(`✅ [UNBLOCKED] IP unblocked by admin: ${ip}`);
-    
-    res.json({ 
-        success: true, 
-        message: `IP ${ip} unblocked` 
-    });
-});
+    console.log(`📊 [STATS] Tracking: ${requestTracker.size} IPs | Blocked: ${blockedIPs.size}`);
+}, 3600000);
 
+// ═══════════════════════════════════════════
+// CORS
+// ═══════════════════════════════════════════
 app.use(cors({
   origin: function(origin, callback) {
     const allowedOrigins = process.env.ALLOWED_ORIGINS 
@@ -349,13 +179,9 @@ app.use(cors({
 }));
 
 // ═══════════════════════════════════════════
-// SIGNATURE VERIFICATION SYSTEM - النظام الجديد
-// ═══════════════════════════════════════════
-// ═══════════════════════════════════════════
-// SIGNATURE CONFIGURATION
+// SIGNATURE VERIFICATION SYSTEM
 // ═══════════════════════════════════════════
 
-// قائمة بالـ APIs التي تتطلب توقيعاً
 const SIGNED_ENDPOINTS = [
     '/api/getUser',
     '/api/verifyAccount',
@@ -2034,6 +1860,31 @@ app.post('/api/admin/api-keys/:id/regenerate-secret', authAdmin, apiLimiter, asy
       error: 'Failed to regenerate secret' 
     });
   }
+});
+
+
+// ═══════════════════════════════════════════
+// 📡 Security Stats Endpoints
+// ═══════════════════════════════════════════
+app.get('/api/admin/security-stats', authAdmin, (req, res) => {
+    res.json({
+        success: true,
+        stats: {
+            tracked_ips: requestTracker.size,
+            blocked_ips: blockedIPs.size,
+            blocked_list: Array.from(blockedIPs).slice(0, 20)
+        }
+    });
+});
+
+app.post('/api/admin/unblock-ip', authAdmin, (req, res) => {
+    const { ip } = req.body;
+    if (!ip) return res.status(400).json({ error: 'IP required' });
+    
+    blockedIPs.delete(ip);
+    requestTracker.delete(ip);
+    
+    res.json({ success: true, message: `IP ${ip} unblocked` });
 });
 
 // ═══════════════════════════════════════════
