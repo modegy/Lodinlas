@@ -2638,38 +2638,3 @@ app.listen(PORT, () => {
 });
 
 
-
-
-
-// ═══════════════════════════════════════════
-// Rate Limiting
-// ═══════════════════════════════════════════
-const createRateLimiter = (windowMs, max, message) => {
-  return rateLimit({
-    windowMs, 
-    max,
-    message: { success: false, error: message },
-    standardHeaders: true,
-    legacyHeaders: false,
-    keyGenerator: (req) => {
-      return req.headers['x-forwarded-for']?.split(',')[0]?.trim() 
-        || req.headers['x-real-ip'] 
-        || req.ip 
-        || req.connection.remoteAddress;
-    }
-  });
-};
-
-const globalLimiter = createRateLimiter(60 * 1000, 100, 'Too many requests');
-const loginLimiter = createRateLimiter(15 * 60 * 1000, 5, 'Too many login attempts');
-const apiLimiter = createRateLimiter(60 * 1000, 50, 'API rate limit exceeded');
-
-app.use('/', globalLimiter);
-
-// ✅ تعديل مهم: حفظ الـ raw body
-app.use(express.json({ 
-    limit: '2mb',
-    verify: (req, res, buf) => {
-        req.rawBody = buf.toString('utf8');
-    }
-}));
