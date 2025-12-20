@@ -12,11 +12,35 @@ const PORT = process.env.PORT || 10000;
 app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 
 // ═══════════════════════════════════════════
+// 🔐 SECURITY SYSTEM INITIALIZATION
+// ═══════════════════════════════════════════
+if (!global.requestCache) {
+  global.requestCache = new Map();
+}
+
+// تنظيف الـ cache كل ساعة
+setInterval(() => {
+  if (global.requestCache && global.requestCache.size > 1000) {
+    const oneHourAgo = Date.now() - (60 * 60 * 1000);
+    for (const [key, timestamp] of global.requestCache.entries()) {
+      if (timestamp < oneHourAgo) {
+        global.requestCache.delete(key);
+      }
+    }
+  }
+}, 60 * 60 * 1000);
+
+// ═══════════════════════════════════════════
 // التحقق من المتغيرات البيئية
 // ═══════════════════════════════════════════
 if (!process.env.FIREBASE_URL || !process.env.FIREBASE_KEY) {
   console.error('❌ FIREBASE_URL أو FIREBASE_KEY غير موجود');
   process.exit(1);
+}
+
+// تحقق من وجود مفاتيح الأمان
+if (!process.env.APP_SECRET_KEY || !process.env.APP_API_KEY) {
+  console.warn('⚠️  APP_SECRET_KEY أو APP_API_KEY غير موجود - بعض الحماية قد لا تعمل');
 }
 
 // ═══════════════════════════════════════════
@@ -68,6 +92,178 @@ const apiLimiter = createRateLimiter(60 * 1000, 50, 'API rate limit exceeded');
 
 app.use('/', globalLimiter);
 app.use(express.json({ limit: '2mb' }));
+
+// ═══════════════════════════════════════════
+// 🔐 VERIFY APP SIGNATURE MIDDLEWARE
+// ═══════════════════════════════════════════
+const verifyAppSignature = async (req, res, next) => {
+  try {
+    // استثناء لبعض الـ endpoints
+    const excludedPaths = [
+      '/api/health',
+      '/api/serverTime',
+      '/api/admin/login',
+      '/api/admin/verify-session',
+      '/api/sub/verify-key',
+      '/'
+    ];
+    
+    // استثناء الـ admin و sub routes
+    if (req.path.startsWith('/api/admin/') || req.path.startsWith('/api/sub/')) {
+      // استثناء login و verify فقط، الباقي يخضع للتحقق
+      if (req.path === '/api/admin/login' || req.path === '/api/admin/verify-session' || req.path === '/api/sub/verify-key') {
+        return next();
+      }
+    }
+    
+    if (excludedPaths.includes(req.path)) {
+      return next();
+    }
+    
+    // جلب الهيدرات
+    const clientSignature = req.headers['x-signature'];
+    const timestamp = req.headers['x-timestamp'];
+    const apiKey = req.headers['x-api-key'];
+    const nonce = req.headers['x-nonce'];
+    
+    // التحقق من وجود جميع الهيدرات
+    if (!clientSignature || !timestamp || !apiKey) {
+      console.log(`🚨 Missing headers for: ${req.path}`);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Missing authentication headers',
+        code: 'AUTH_001'
+      });
+    }
+    
+    // التحقق من API Key
+    const validApiKey = process.env.APP_API_KEY || 'MySecureAppKey@2024#Firebase$';
+    if (apiKey !== validApiKey) {
+      console.log(`🚨 Invalid API Key for: ${req.path}`);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid API Key',
+        code: 'AUTH_002'
+      });
+    }
+    
+    // التحقق من صلاحية الطلب (عدم تكرار الطلب)
+    const requestKey = `${apiKey}_${nonce || 'none'}_${timestamp}`;
+    if (global.requestCache?.has(requestKey)) {
+      console.log(`🚨 Replay attack detected: ${requestKey}`);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Duplicate request detected',
+        code: 'AUTH_003'
+      });
+    }
+    
+    // التحقق من التوقيت (منع الطلبات القديمة)
+    const currentTime = Math.floor(Date.now() / 1000);
+    const requestTime = parseInt(timestamp);
+    const expiryTime = parseInt(process.env.SIGNATURE_EXPIRY) || 300;
+    
+    if (Math.abs(currentTime - requestTime) > expiryTime) {
+      console.log(`🚨 Expired request: ${requestTime} vs ${currentTime}`);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Request expired',
+        code: 'AUTH_004'
+      });
+    }
+    
+    // بناء البيانات للتوقيع
+    let dataToSign = '';
+    
+    // حسب نوع الطلب
+    if (req.method === 'GET') {
+      dataToSign = req.originalUrl;
+    } else {
+      // للطلبات التي فيها body
+      if (req.body && Object.keys(req.body).length > 0) {
+        // ترتيب البيانات أبجديًا لتجنب اختلاف الترتيب
+        const sortedBody = JSON.stringify(req.body, Object.keys(req.body).sort());
+        dataToSign = req.originalUrl + '|' + sortedBody;
+      } else {
+        dataToSign = req.originalUrl;
+      }
+    }
+    
+    // إضافة التوقيت والمفتاح السري
+    const secretKey = process.env.APP_SECRET_KEY || 'Ma7moud55##@2024SecureSigningKey!';
+    const fullData = `${dataToSign}|${timestamp}|${secretKey}`;
+    
+    // إنشاء التوقيع المتوقع
+    const expectedSignature = crypto
+      .createHmac('sha256', secretKey)
+      .update(fullData)
+      .digest('base64')
+      .trim();
+    
+    // مقارنة التوقيعات
+    if (clientSignature !== expectedSignature) {
+      console.log('🚨 Signature mismatch!');
+      console.log('Expected:', expectedSignature);
+      console.log('Received:', clientSignature);
+      console.log('Data signed:', dataToSign);
+      
+      // تسجيل محاولة الهجوم
+      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+      console.log(`⚠️ Potential attack from IP: ${ip}`);
+      
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Invalid signature',
+        code: 'AUTH_005'
+      });
+    }
+    
+    // تخزين الطلب في الـ cache لمنع التكرار
+    if (nonce) {
+      global.requestCache.set(requestKey, Date.now());
+      
+      // تنظيف الـ cache بعد وقت الصلاحية
+      setTimeout(() => {
+        if (global.requestCache?.has(requestKey)) {
+          global.requestCache.delete(requestKey);
+        }
+      }, expiryTime * 1000);
+    }
+    
+    console.log(`✅ Signature verified for: ${req.path}`);
+    next();
+    
+  } catch (error) {
+    console.error('❌ Signature verification error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Signature verification failed',
+      code: 'AUTH_006'
+    });
+  }
+};
+
+// ═══════════════════════════════════════════
+// 🔐 APPLY SIGNATURE VERIFICATION
+// ═══════════════════════════════════════════
+app.use((req, res, next) => {
+  // استثناء بعض الـ endpoints
+  const publicPaths = [
+    '/api/health',
+    '/api/serverTime',
+    '/api/admin/login',
+    '/api/admin/verify-session',
+    '/api/sub/verify-key',
+    '/'
+  ];
+  
+  if (publicPaths.includes(req.path)) {
+    return next();
+  }
+  
+  // التحقق من التوقيع للباقي
+  return verifyAppSignature(req, res, next);
+});
 
 // ═══════════════════════════════════════════
 // Brute Force Protection
@@ -166,33 +362,9 @@ setInterval(() => {
 // المصادقة - Middlewares
 // ═══════════════════════════════════════════
 
-// مصادقة التطبيق
-const authApp = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  
-  if (!apiKey) {
-    return res.status(401).json({ 
-      success: false, 
-      error: 'API Key required', 
-      code: 401 
-    });
-  }
-  
-  if (apiKey === APP_API_KEY) {
-    return next();
-  }
-  
-  res.status(401).json({ 
-    success: false, 
-    error: 'Invalid API Key', 
-    code: 401 
-  });
-};
-
 // مصادقة Master Admin
 const authAdmin = (req, res, next) => {
   const sessionToken = req.headers['x-session-token'];
-  const masterToken = process.env.MASTER_ADMIN_TOKEN;
   
   if (!sessionToken) {
     return res.status(401).json({ 
@@ -202,13 +374,6 @@ const authAdmin = (req, res, next) => {
     });
   }
   
-  // ✅ تحقق من Master Token المباشر
-  if (masterToken && sessionToken === masterToken) {
-    req.adminUser = 'master_owner';
-    return next();
-  }
-  
-  // التحقق من Session عادية
   const session = adminSessions.get(sessionToken);
   
   if (!session) {
@@ -405,12 +570,21 @@ app.use((req, res, next) => {
 // PUBLIC ENDPOINTS
 // ═══════════════════════════════════════════
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    version: '3.1.0', 
-    uptime: Math.floor(process.uptime()), 
-    timestamp: Date.now() 
-  });
+  const health = {
+    status: 'healthy',
+    version: '4.0.0',
+    security: {
+      signature_verification: true,
+      replay_protection: true,
+      timestamp_validation: true,
+      request_cache_size: global.requestCache?.size || 0
+    },
+    uptime: Math.floor(process.uptime()),
+    timestamp: Date.now(),
+    environment: process.env.NODE_ENV || 'production'
+  };
+  
+  res.json(health);
 });
 
 app.get('/api/serverTime', apiLimiter, (req, res) => {
@@ -424,7 +598,7 @@ app.get('/api/serverTime', apiLimiter, (req, res) => {
 // ═══════════════════════════════════════════
 // 📱 MOBILE APP ENDPOINTS
 // ═══════════════════════════════════════════
-app.post('/api/getUser', authApp, apiLimiter, async (req, res) => {
+app.post('/api/getUser', apiLimiter, async (req, res) => {
   try {
     const { username } = req.body;
     
@@ -458,7 +632,7 @@ app.post('/api/getUser', authApp, apiLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/verifyAccount', authApp, apiLimiter, async (req, res) => {
+app.post('/api/verifyAccount', apiLimiter, async (req, res) => {
   try {
     const { username, password, deviceId } = req.body;
     
@@ -510,13 +684,9 @@ app.post('/api/verifyAccount', authApp, apiLimiter, async (req, res) => {
   }
 });
 
-
-// ═══════════════════════════════════════════
-// 📱 تحديث معلومات الجهاز والدخول (محسّن واحترافي)
-// ═══════════════════════════════════════════
-app.post('/api/updateDevice', authApp, apiLimiter, async (req, res) => {
+app.post('/api/updateDevice', apiLimiter, async (req, res) => {
   try {
-    const { username, deviceId, deviceInfo } = req.body;
+    const { username, deviceId } = req.body;
     
     if (!username || !deviceId) {
       return res.status(400).json({ 
@@ -537,101 +707,18 @@ app.post('/api/updateDevice', authApp, apiLimiter, async (req, res) => {
     }
     
     const userId = Object.keys(users)[0];
-    const user = users[userId];
-    
-    // ✅ Get IP and User Agent
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
-    const userAgent = req.headers['user-agent'] || '';
-    
-    // ✅ إعداد بيانات التحديث الأساسية
-    const updateData = {
-      device_id: deviceId,
-      last_login: Date.now(),
-      login_count: (user.login_count || 0) + 1,
-      ip_address: ip,
-      user_agent: userAgent
-    };
-    
-    // ✅ إضافة معلومات الجهاز إذا كانت موجودة
-    if (deviceInfo) {
-      // Device Info
-      updateData.device_model = deviceInfo.device_model || 'Unknown';
-      updateData.device_brand = deviceInfo.device_brand || 'Unknown';
-      updateData.device_manufacturer = deviceInfo.device_manufacturer || 'Unknown';
-      updateData.device_product = deviceInfo.device_product || 'Unknown';
-      updateData.device_type = deviceInfo.device_type || 'Phone';
-      
-      // OS Info
-      updateData.android_version = deviceInfo.android_version || 'Unknown';
-      updateData.sdk_version = deviceInfo.sdk_version || 0;
-      
-      // Security Info
-      updateData.is_rooted = deviceInfo.is_rooted || false;
-      updateData.has_screen_lock = deviceInfo.has_screen_lock || false;
-      updateData.fingerprint_enabled = deviceInfo.fingerprint_enabled || false;
-      
-      // Hardware Info
-      updateData.total_ram = deviceInfo.total_ram || 'Unknown';
-      updateData.screen_size = deviceInfo.screen_size || 'Unknown';
-      updateData.screen_density = deviceInfo.screen_density || 0;
-      
-      // Network Info
-      updateData.network_type = deviceInfo.network_type || 'Unknown';
-      updateData.carrier_name = deviceInfo.carrier_name || 'Unknown';
-      
-      // Battery Info
-      updateData.battery_level = deviceInfo.battery_level || 0;
-      updateData.is_charging = deviceInfo.is_charging || false;
-      
-      // Location (optional)
-      if (deviceInfo.location) {
-        updateData.location = deviceInfo.location;
-      }
-    }
-    
-    // ✅ إضافة إلى سجل تسجيل الدخول (Login History)
-    const loginEntry = {
-      timestamp: Date.now(),
-      ip: ip,
-      device: deviceInfo?.device_model || 'Unknown',
-      os_version: deviceInfo?.android_version || 'Unknown',
-      network: deviceInfo?.network_type || 'Unknown',
-      carrier: deviceInfo?.carrier_name || 'Unknown',
-      battery: deviceInfo?.battery_level || 0,
-      is_rooted: deviceInfo?.is_rooted || false
-    };
-    
-    // الاحتفاظ بآخر 10 عمليات دخول فقط
-    const existingHistory = user.login_history || [];
-    updateData.login_history = [
-      ...existingHistory.slice(-9), // آخر 9
-      loginEntry // الجديد
-    ];
-    
-    // ✅ تحديث البيانات في Firebase
-    await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, updateData);
-    
-    // ✅ تسجيل في Console للمراقبة
-    console.log(`📱 Login: ${username} | Device: ${deviceInfo?.device_brand || 'Unknown'} ${deviceInfo?.device_model || 'Unknown'} | Android: ${deviceInfo?.android_version || '?'} | Root: ${deviceInfo?.is_rooted ? '⚠️ YES' : '✅ NO'} | Network: ${deviceInfo?.network_type || '?'} | IP: ${ip}`);
-    
-    // ✅ تنبيه إذا كان الجهاز مروت
-    if (deviceInfo?.is_rooted) {
-      console.warn(`🚨 WARNING: User "${username}" is using a ROOTED device!`);
-    }
+    await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
+      device_id: deviceId, 
+      last_login: Date.now() 
+    });
     
     res.json({ 
       success: true, 
-      message: 'Device updated successfully',
-      user_info: {
-        username: user.username,
-        login_count: updateData.login_count,
-        is_rooted: updateData.is_rooted,
-        last_login: updateData.last_login
-      }
+      message: 'Device updated' 
     });
     
   } catch (error) {
-    console.error('❌ Update device error:', error.message);
+    console.error('Update device error:', error.message);
     res.status(500).json({ 
       success: false, 
       error: 'Server error' 
@@ -640,232 +727,8 @@ app.post('/api/updateDevice', authApp, apiLimiter, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-// 📊 إحصائيات الأجهزة المتقدمة
-// ═══════════════════════════════════════════
-app.get('/api/admin/device-stats', authAdmin, apiLimiter, async (req, res) => {
-  try {
-    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-    const users = response.data || {};
-    
-    const stats = {
-      total_users: Object.keys(users).length,
-      total_devices: 0,
-      rooted_devices: 0,
-      rooted_percentage: 0,
-      
-      // Device Brands
-      device_brands: {},
-      top_brands: [],
-      
-      // Android Versions
-      android_versions: {},
-      top_android_versions: [],
-      
-      // Device Types
-      device_types: { Phone: 0, Tablet: 0, Unknown: 0 },
-      
-      // Network Types
-      network_types: {},
-      top_networks: [],
-      
-      // Carriers
-      carriers: {},
-      top_carriers: [],
-      
-      // Battery Stats
-      average_battery: 0,
-      charging_devices: 0,
-      low_battery_devices: 0,
-      
-      // Security Stats
-      screen_lock_enabled: 0,
-      fingerprint_enabled: 0,
-      
-      // Active Users
-      active_last_hour: 0,
-      active_last_day: 0,
-      active_last_week: 0
-    };
-    
-    let batterySum = 0;
-    let batteryCount = 0;
-    const now = Date.now();
-    const oneHour = 60 * 60 * 1000;
-    const oneDay = 24 * oneHour;
-    const oneWeek = 7 * oneDay;
-    
-    for (const user of Object.values(users)) {
-      // Total Devices
-      if (user.device_id) {
-        stats.total_devices++;
-        
-        // Rooted
-        if (user.is_rooted) stats.rooted_devices++;
-        
-        // Device Brands
-        const brand = user.device_brand || 'Unknown';
-        stats.device_brands[brand] = (stats.device_brands[brand] || 0) + 1;
-        
-        // Android Versions
-        const version = user.android_version || 'Unknown';
-        stats.android_versions[version] = (stats.android_versions[version] || 0) + 1;
-        
-        // Device Types
-        const type = user.device_type || 'Unknown';
-        stats.device_types[type]++;
-        
-        // Network Types
-        const network = user.network_type || 'Unknown';
-        stats.network_types[network] = (stats.network_types[network] || 0) + 1;
-        
-        // Carriers
-        const carrier = user.carrier_name || 'Unknown';
-        stats.carriers[carrier] = (stats.carriers[carrier] || 0) + 1;
-        
-        // Battery
-        if (user.battery_level) {
-          batterySum += user.battery_level;
-          batteryCount++;
-          if (user.battery_level <= 20) stats.low_battery_devices++;
-        }
-        if (user.is_charging) stats.charging_devices++;
-        
-        // Security
-        if (user.has_screen_lock) stats.screen_lock_enabled++;
-        if (user.fingerprint_enabled) stats.fingerprint_enabled++;
-      }
-      
-      // Active Users
-      if (user.last_login) {
-        const timeSince = now - user.last_login;
-        if (timeSince < oneHour) stats.active_last_hour++;
-        if (timeSince < oneDay) stats.active_last_day++;
-        if (timeSince < oneWeek) stats.active_last_week++;
-      }
-    }
-    
-    // Calculations
-    stats.average_battery = batteryCount > 0 ? Math.round(batterySum / batteryCount) : 0;
-    stats.rooted_percentage = stats.total_devices > 0 ? Math.round((stats.rooted_devices / stats.total_devices) * 100) : 0;
-    
-    // Top Brands (أكثر 5 علامات تجارية)
-    stats.top_brands = Object.entries(stats.device_brands)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([brand, count]) => ({ brand, count }));
-    
-    // Top Android Versions
-    stats.top_android_versions = Object.entries(stats.android_versions)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([version, count]) => ({ version, count }));
-    
-    // Top Networks
-    stats.top_networks = Object.entries(stats.network_types)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([network, count]) => ({ network, count }));
-    
-    // Top Carriers
-    stats.top_carriers = Object.entries(stats.carriers)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([carrier, count]) => ({ carrier, count }));
-    
-    res.json({ 
-      success: true, 
-      data: stats 
-    });
-    
-  } catch (error) {
-    console.error('Device stats error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch device stats' 
-    });
-  }
-});
-
-// ═══════════════════════════════════════════
-// 🚨 الحصول على قائمة الأجهزة المروتة
-// ═══════════════════════════════════════════
-app.get('/api/admin/rooted-devices', authAdmin, apiLimiter, async (req, res) => {
-  try {
-    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-    const users = response.data || {};
-    
-    const rootedDevices = [];
-    
-    for (const [userId, user] of Object.entries(users)) {
-      if (user.is_rooted) {
-        rootedDevices.push({
-          user_id: userId,
-          username: user.username,
-          device_model: user.device_model || 'Unknown',
-          device_brand: user.device_brand || 'Unknown',
-          android_version: user.android_version || 'Unknown',
-          last_login: user.last_login,
-          ip_address: user.ip_address || 'Unknown',
-          network_type: user.network_type || 'Unknown'
-        });
-      }
-    }
-    
-    res.json({ 
-      success: true, 
-      data: rootedDevices,
-      count: rootedDevices.length 
-    });
-    
-  } catch (error) {
-    console.error('Rooted devices error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch rooted devices' 
-    });
-  }
-});
-
-// ═══════════════════════════════════════════
-// 📋 سجل تسجيل الدخول لمستخدم معين
-// ═══════════════════════════════════════════
-app.get('/api/admin/users/:id/login-history', authAdmin, apiLimiter, async (req, res) => {
-  try {
-    const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
-    
-    if (!response.data) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'User not found' 
-      });
-    }
-    
-    const user = response.data;
-    const history = user.login_history || [];
-    
-    res.json({ 
-      success: true, 
-      data: {
-        username: user.username,
-        total_logins: user.login_count || 0,
-        login_history: history.reverse() // الأحدث أولاً
-      }
-    });
-    
-  } catch (error) {
-    console.error('Login history error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch login history' 
-    });
-  }
-});
-
-
-// ═══════════════════════════════════════════
 // 👑 MASTER ADMIN - AUTH
 // ═══════════════════════════════════════════
-
 app.post('/api/admin/login', loginLimiter, bruteForceProtection, async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -920,10 +783,6 @@ app.post('/api/admin/login', loginLimiter, bruteForceProtection, async (req, res
     }
 });
 
-
-
-
-
 app.post('/api/admin/logout', authAdmin, (req, res) => {
   const sessionToken = req.headers['x-session-token'];
   if (sessionToken) {
@@ -954,6 +813,50 @@ app.get('/api/admin/verify-session', authAdmin, (req, res) => {
 });
 
 // ═══════════════════════════════════════════
+// 🔧 SECURITY UTILITY ENDPOINTS
+// ═══════════════════════════════════════════
+app.post('/api/test/signature', (req, res) => {
+  res.json({ 
+    success: true, 
+    message: 'Signature verified successfully!',
+    data: req.body 
+  });
+});
+
+app.post('/api/admin/reset-security-cache', authAdmin, (req, res) => {
+  if (global.requestCache) {
+    const oldSize = global.requestCache.size;
+    global.requestCache.clear();
+    console.log(`🔄 Security cache cleared: ${oldSize} entries removed`);
+    res.json({ 
+      success: true, 
+      message: `Security cache cleared (${oldSize} entries)` 
+    });
+  } else {
+    res.json({ 
+      success: false, 
+      error: 'Cache not initialized' 
+    });
+  }
+});
+
+app.get('/api/admin/security-status', authAdmin, (req, res) => {
+  res.json({
+    success: true,
+    security: {
+      request_cache_size: global.requestCache?.size || 0,
+      signature_enabled: true,
+      replay_protection: true,
+      timestamp_validation: true,
+      login_attempts: loginAttempts.size,
+      admin_sessions: adminSessions.size,
+      subadmin_keys: subAdminKeys.size,
+      signature_expiry: process.env.SIGNATURE_EXPIRY || 300
+    }
+  });
+});
+
+// ═══════════════════════════════════════════
 // 👑 MASTER ADMIN - USER MANAGEMENT
 // ═══════════════════════════════════════════
 app.get('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
@@ -974,7 +877,7 @@ app.get('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
         device_id: user.device_id || '',
         max_devices: user.max_devices || 1,
         notes: user.notes || '',
-        created_by_key: user.created_by_key || 'master' // ✅ إضافة هذا الحقل
+        created_by_key: user.created_by_key || 'master'
       };
     }
     
@@ -1015,7 +918,7 @@ app.get('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
         expiry_date: formatDate(user.subscription_end),
         device_id: user.device_id || '',
         max_devices: user.max_devices || 1,
-        created_by_key: user.created_by_key || 'master' // ✅ إضافة هذا الحقل
+        created_by_key: user.created_by_key || 'master'
       }
     });
     
@@ -1072,7 +975,7 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       device_id: '',
       created_at: Date.now(),
       last_login: null,
-      created_by_key: 'master'  // ✅ مهم جداً! تعيين master للمستخدمين من Master Admin
+      created_by_key: 'master'
     };
     
     const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
@@ -1139,7 +1042,7 @@ app.delete('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
   }
 });
 
-// ✅ حذف جميع المنتهيين دفعة واحدة (API ENDPOINT)
+// ✅ حذف جميع المنتهيين دفعة واحدة
 app.post('/api/admin/users/delete-expired', authAdmin, apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -1166,7 +1069,6 @@ app.post('/api/admin/users/delete-expired', authAdmin, apiLimiter, async (req, r
       });
     }
     
-    // حذف دفعة واحدة
     await Promise.all(deletePromises);
     
     console.log(`🗑️ Bulk deleted ${expiredIds.length} expired users`);
@@ -1406,10 +1308,8 @@ app.post('/api/admin/api-keys/:id/unbind-device', authAdmin, apiLimiter, async (
 });
 
 // ═══════════════════════════════════════════
-// 🔑 SUB ADMIN API - التعديلات المطلوبة
+// 🔑 SUB ADMIN API
 // ═══════════════════════════════════════════
-
-// التحقق من مفتاح Sub Admin
 app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
   try {
     const { apiKey, deviceFingerprint } = req.body;
@@ -1493,7 +1393,7 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       success: true,
       name: foundKey.admin_name,
       permission: foundKey.permission_level || 'view_only',
-      key_id: keyId  // ✅ إرجاع معرف المفتاح المهم
+      key_id: keyId
     });
     
   } catch (error) {
@@ -1505,7 +1405,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
   }
 });
 
-// الحصول على المستخدمين - فقط المستخدمين الذين أنشأهم هذا Sub Admin ✅✅✅
 app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -1514,9 +1413,7 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
     const currentKeyId = req.subAdminKeyId;
     const formattedUsers = {};
     
-    // ✅✅✅ **التعديل المهم: فلترة حسب created_by_key**
     for (const [id, user] of Object.entries(users)) {
-      // تحقق مما إذا كان المستخدم ملكاً لهذا المسؤول الفرعي
       if (user.created_by_key === currentKeyId) {
         const subEnd = user.subscription_end || 0;
         formattedUsers[id] = {
@@ -1551,9 +1448,6 @@ app.get('/api/sub/users', authSubAdmin, checkSubAdminPermission('view'), apiLimi
   }
 });
 
-
-
-// ✅ نقطة API جديدة: الحصول على تفاصيل مستخدم محدد
 app.get('/api/sub/users/:id/details', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
     try {
         const userId = req.params.id;
@@ -1570,7 +1464,6 @@ app.get('/api/sub/users/:id/details', authSubAdmin, checkSubAdminPermission('vie
         
         const user = userRes.data;
         
-        // ✅ التحقق من الملكية
         if (user.created_by_key !== currentKeyId) {
             return res.status(403).json({ 
                 success: false, 
@@ -1602,7 +1495,6 @@ app.get('/api/sub/users/:id/details', authSubAdmin, checkSubAdminPermission('vie
     }
 });
 
-// الإحصائيات - فقط للمستخدمين الذين أنشأهم هذا Sub Admin
 app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -1615,7 +1507,6 @@ app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimi
     let activeUsers = 0;
     let expiredUsers = 0;
     
-    // ✅✅✅ إحصائيات صارمة جداً - فقط مستخدمي هذا المفتاح
     for (const user of Object.values(users)) {
       if (user.created_by_key === currentKeyId) {
         totalUsers++;
@@ -1646,7 +1537,6 @@ app.get('/api/sub/stats', authSubAdmin, checkSubAdminPermission('view'), apiLimi
   }
 });
 
-// إضافة مستخدم جديد - مع تخزين created_by_key ✅✅✅
 app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimiter, async (req, res) => {
   try {
     const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
@@ -1658,7 +1548,6 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
       });
     }
     
-    // التحقق من عدم وجود نفس اسم المستخدم
     const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
     const checkRes = await firebase.get(checkUrl);
     
@@ -1669,7 +1558,6 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
       });
     }
     
-    // حساب تاريخ الانتهاء
     let expiryTimestamp;
     if (customExpiryDate) {
       expiryTimestamp = new Date(customExpiryDate).getTime();
@@ -1682,7 +1570,6 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
       });
     }
     
-    // ✅✅✅ **التعديل المهم: إضافة created_by_key**
     const userData = {
       username,
       password_hash: hashPassword(password),
@@ -1692,7 +1579,7 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
       device_id: '',
       created_at: Date.now(),
       last_login: null,
-      created_by_key: req.subAdminKeyId,  // ✅ تخزين معرف مفتاح المسؤول الفرعي
+      created_by_key: req.subAdminKeyId,
       created_by: req.subAdminKey.admin_name || 'sub_admin'
     };
     
@@ -1716,7 +1603,6 @@ app.post('/api/sub/users', authSubAdmin, checkSubAdminPermission('add'), apiLimi
   }
 });
 
-// تمديد اشتراك - مع التحقق من الملكية ✅✅✅
 app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('extend'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
@@ -1730,7 +1616,6 @@ app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('ext
       });
     }
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1785,14 +1670,12 @@ app.post('/api/sub/users/:id/extend', authSubAdmin, checkSubAdminPermission('ext
   }
 });
 
-// تحديث حالة المستخدم - مع التحقق من الملكية ✅✅✅
 app.patch('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('edit'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     const { is_active } = req.body;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1832,13 +1715,11 @@ app.patch('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('edit'), a
   }
 });
 
-// إعادة تعيين الجهاز - مع التحقق من الملكية ✅✅✅
 app.post('/api/sub/users/:id/reset-device', authSubAdmin, checkSubAdminPermission('edit'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1878,13 +1759,11 @@ app.post('/api/sub/users/:id/reset-device', authSubAdmin, checkSubAdminPermissio
   }
 });
 
-// حذف مستخدم - مع التحقق من الملكية ✅✅✅
 app.delete('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('delete'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -1896,7 +1775,6 @@ app.delete('/api/sub/users/:id', authSubAdmin, checkSubAdminPermission('delete')
     
     const user = userRes.data;
     
-    // تحقق مما إذا كان المستخدم ملكاً لهذا المسؤول الفرعي
     if (user.created_by_key !== currentKeyId) {
       console.log(`🚫 Delete denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
@@ -1936,10 +1814,8 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 // ═══════════════════════════════════════════
-// 🛠️ MAINTENANCE ENDPOINTS (للاستخدام مرة واحدة)
+// 🛠️ MAINTENANCE ENDPOINTS
 // ═══════════════════════════════════════════
-
-// ✅ إصلاح المستخدمين القدامى (الذين ليس لديهم created_by_key)
 app.post('/api/admin/fix-old-users', authAdmin, async (req, res) => {
   try {
     console.log('🔧 Starting fix-old-users process...');
@@ -1982,7 +1858,6 @@ app.post('/api/admin/fix-old-users', authAdmin, async (req, res) => {
   }
 });
 
-// ✅ عرض جميع المستخدمين مع created_by_key (للتشخيص)
 app.get('/api/admin/debug-users', authAdmin, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -2044,7 +1919,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🛡️ Secure API</title>
+  <title>🛡️ Secure API v4.0</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -2056,14 +1931,49 @@ app.get('/', (req, res) => {
       text-align: center;
     }
     .container { max-width: 800px; margin: 0 auto; }
-    h1 { color: #4cc9f0; margin-bottom: 20px; font-size: 2.5rem; }
-    .badge {
+    h1 { 
+      color: #4cc9f0; 
+      margin-bottom: 10px; 
+      font-size: 2.8rem;
+      text-shadow: 0 2px 10px rgba(76, 201, 240, 0.3);
+    }
+    .subtitle {
+      color: #94a3b8;
+      margin-bottom: 30px;
+      font-size: 1.1rem;
+    }
+    .security-badge {
       background: linear-gradient(135deg, #10b981, #059669);
-      padding: 10px 20px;
-      border-radius: 20px;
+      padding: 15px 30px;
+      border-radius: 25px;
       display: inline-block;
       margin: 20px 0;
       font-weight: bold;
+      font-size: 1.1rem;
+      box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+    }
+    .security-features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 15px;
+      margin: 30px 0;
+    }
+    .feature {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 20px;
+      border-radius: 12px;
+      border: 1px solid rgba(76, 201, 240, 0.2);
+      text-align: left;
+      position: relative;
+      padding-left: 50px;
+    }
+    .feature:before {
+      content: "✅";
+      position: absolute;
+      left: 15px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 1.2rem;
     }
     .endpoints {
       background: rgba(255, 255, 255, 0.05);
@@ -2076,46 +1986,100 @@ app.get('/', (req, res) => {
     .endpoints h3 {
       color: #4cc9f0;
       margin-bottom: 20px;
-      font-size: 1.3rem;
+      font-size: 1.5rem;
+      border-bottom: 2px solid rgba(76, 201, 240, 0.3);
+      padding-bottom: 10px;
     }
     .ep {
-      margin: 10px 0;
-      padding: 12px;
+      margin: 12px 0;
+      padding: 15px;
       background: rgba(255, 255, 255, 0.02);
-      border-radius: 8px;
-      border-left: 3px solid #4cc9f0;
+      border-radius: 10px;
+      border-left: 4px solid #4cc9f0;
       font-size: 0.95rem;
+      transition: all 0.3s;
+    }
+    .ep:hover {
+      background: rgba(255, 255, 255, 0.05);
+      transform: translateX(5px);
     }
     .m {
       display: inline-block;
-      padding: 4px 12px;
-      border-radius: 5px;
+      padding: 5px 15px;
+      border-radius: 6px;
       margin-left: 10px;
       font-weight: bold;
-      font-size: 11px;
+      font-size: 12px;
       text-transform: uppercase;
+      min-width: 60px;
+      text-align: center;
     }
     .get { background: #10b981; }
     .post { background: #f59e0b; }
     .delete { background: #ef4444; }
+    .patch { background: #8b5cf6; }
+    .status {
+      margin-top: 30px;
+      padding: 15px;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 10px;
+      border: 1px solid rgba(76, 201, 240, 0.1);
+    }
+    .status-item {
+      display: flex;
+      justify-content: space-between;
+      margin: 8px 0;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .status-value {
+      color: #4cc9f0;
+      font-weight: bold;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>🛡️ Secure Firebase Proxy</h1>
-    <div class="badge">✅ v3.1.0 - All Systems Online</div>
+    <div class="subtitle">v4.0 • HMAC-SHA256 Signature Protection</div>
+    
+    <div class="security-badge">🔐 SIGNATURE VERIFICATION: ACTIVE</div>
+    
+    <div class="security-features">
+      <div class="feature">HMAC-SHA256 Signature</div>
+      <div class="feature">Replay Attack Protection</div>
+      <div class="feature">Timestamp Validation (5 min)</div>
+      <div class="feature">Request Caching System</div>
+      <div class="feature">API Key Verification</div>
+      <div class="feature">Brute Force Protection</div>
+    </div>
+    
+    <div class="status">
+      <div class="status-item">
+        <span>🔄 Request Cache:</span>
+        <span class="status-value">${global.requestCache?.size || 0} entries</span>
+      </div>
+      <div class="status-item">
+        <span>⏱️ Uptime:</span>
+        <span class="status-value">${Math.floor(process.uptime())}s</span>
+      </div>
+      <div class="status-item">
+        <span>🔑 Security Level:</span>
+        <span class="status-value">MAXIMUM</span>
+      </div>
+    </div>
     
     <div class="endpoints">
       <h3>📋 API Endpoints</h3>
       
       <div class="ep">
         <span class="m get">GET</span>
-        <strong>/api/health</strong> - Health check
+        <strong>/api/health</strong> - Health check & security status
       </div>
       
       <div class="ep">
         <span class="m post">POST</span>
-        <strong>/api/getUser</strong> - للتطبيق (Mobile App)
+        <strong>/api/getUser</strong> - Mobile app (HMAC-SHA256 required)
       </div>
       
       <div class="ep">
@@ -2125,33 +2089,32 @@ app.get('/', (req, res) => {
       
       <div class="ep">
         <span class="m get">GET</span>
-        <strong>/api/admin/users</strong> - Get all users
+        <strong>/api/admin/users</strong> - Get all users (Admin only)
       </div>
       
       <div class="ep">
         <span class="m post">POST</span>
-        <strong>/api/admin/users/delete-expired</strong> - حذف المنتهيين (Bulk Delete)
+        <strong>/api/admin/users/delete-expired</strong> - Bulk delete expired users
       </div>
       
       <div class="ep">
         <span class="m post">POST</span>
-        <strong>/api/sub/verify-key</strong> - Sub Admin verify
+        <strong>/api/sub/verify-key</strong> - Sub Admin verification
       </div>
       
       <div class="ep">
         <span class="m get">GET</span>
-        <strong>/api/sub/users</strong> - Sub Admin get users (فقط مستخدميه)
+        <strong>/api/sub/users</strong> - Sub Admin get users (only his users)
       </div>
       
       <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/admin/fix-old-users</strong> - إصلاح المستخدمين القدامى
+        <span class="m get">GET</span>
+        <strong>/api/admin/security-status</strong> - Security system status
       </div>
     </div>
     
     <p style="margin-top: 30px; color: #64748b; font-size: 0.9rem;">
-      🔒 Protected by Rate Limiting & DDoS Protection<br>
-      🔐 Sub Admin يرى فقط مستخدميه
+      🔒 Protected by HMAC-SHA256 • 🔐 Sub Admin isolation • 🛡️ Replay attack protection
     </p>
   </div>
 </body>
@@ -2183,15 +2146,23 @@ app.use((err, req, res, next) => {
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
   console.log('═'.repeat(60));
-  console.log('🛡️  Secure Firebase Proxy v3.2.0');
+  console.log('🛡️  Secure Firebase Proxy v4.0');
+  console.log('🔐 SECURITY SYSTEM INITIALIZED:');
+  console.log('   ✓ HMAC-SHA256 Signature Verification');
+  console.log('   ✓ Replay Attack Protection');
+  console.log('   ✓ Timestamp Validation (300s)');
+  console.log('   ✓ Request Caching System');
+  console.log('');
   console.log(`📡 Port: ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'production'}`);
+  console.log(`🔑 Security Level: MAXIMUM`);
   console.log('');
-  console.log('✓ Master Admin endpoints ready');
-  console.log('✓ Sub Admin endpoints ready (يرى فقط مستخدميه)');
-  console.log('✓ Mobile App endpoints ready');
-  console.log('✓ Bulk delete expired users ready');
+  console.log('✓ Mobile App endpoints protected with HMAC-SHA256');
+  console.log('✓ Master Admin endpoints secured');
+  console.log('✓ Sub Admin endpoints isolated');
+  console.log('✓ Rate limiting active');
   console.log('');
+  console.log('⚠️  IMPORTANT: Verify APP_SECRET_KEY matches APK');
   console.log('⚠️  IMPORTANT: For old users, run /api/admin/fix-old-users');
   console.log('');
   console.log('═'.repeat(60));
