@@ -1029,7 +1029,7 @@ app.post('/api/admin/logout', authAdmin, (req, res) => {
 });
 
 app.get('/api/admin/verify-session', authAdmin, (req, res) => {
-  const sessionToken = req.headers['x-session-token');
+  const sessionToken = req.headers['x-session-token'];
   const session = adminSessions.get(sessionToken);
   
   if (!session) {
