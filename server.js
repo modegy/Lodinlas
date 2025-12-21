@@ -1766,6 +1766,71 @@ app.post('/api/sub/verify-key', verifySignature, apiLimiter, async (req, res) =>
   }
 });
 
+
+// ═══════════════════════════════════════════
+// 🔓 UNBIND DEVICE ENDPOINT
+// ═══════════════════════════════════════════
+app.post('/api/sub/unbind-device', verifySignature, apiLimiter, async (req, res) => {
+    try {
+        console.log('🔓 Unbind device request received');
+        
+        const { apiKey } = req.body;
+        
+        if (!apiKey) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'API key required' 
+            });
+        }
+        
+        const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
+        const keys = response.data || {};
+        
+        let foundKey = null;
+        let keyId = null;
+        
+        for (const [id, key] of Object.entries(keys)) {
+            if (key.api_key === apiKey) {
+                foundKey = key;
+                keyId = id;
+                break;
+            }
+        }
+        
+        if (!foundKey) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'API key not found' 
+            });
+        }
+        
+        // إعادة تعيين device binding
+        await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, { 
+            bound_device: null,
+            last_unbind: Date.now()
+        });
+        
+        // تنظيف الكاش
+        subAdminKeys.delete(apiKey);
+        
+        console.log(`✅ Device unbound for API key: ${keyId}`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Device unbound successfully',
+            key_id: keyId
+        });
+        
+    } catch (error) {
+        console.error('❌ Unbind device error:', error.message);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Failed to unbind device' 
+        });
+    }
+});
+
+
 app.get('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -2350,3 +2415,5 @@ app.listen(PORT, () => {
   console.log('');
   console.log('═'.repeat(60));
 });
+
+
