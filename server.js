@@ -20,6 +20,18 @@ if (!process.env.FIREBASE_URL || !process.env.FIREBASE_KEY) {
 }
 
 // ═══════════════════════════════════════════
+// 🔐 إعدادات التوقيع الآمنة
+// ═══════════════════════════════════════════
+const SIGNING_SALT = process.env.SIGNING_SALT || 'SubAdminSecureSalt@2024!NoOneKnows';
+
+// دالة توليد مفتاح التوقيع من API Key
+function deriveSigningKey(apiKey) {
+    return crypto.createHmac('sha256', SIGNING_SALT)
+        .update(apiKey)
+        .digest('hex');
+}
+
+// ═══════════════════════════════════════════
 // الأمان والحماية
 // ═══════════════════════════════════════════
 app.use(helmet({ 
@@ -30,7 +42,6 @@ app.use(helmet({
 // ═══════════════════════════════════════════
 // 🛡️ ADVANCED DDOS & SECURITY PROTECTION
 // ═══════════════════════════════════════════
-
 const requestTracker = new Map();
 const blockedIPs = new Set();
 
@@ -143,7 +154,6 @@ const attackLogger = (req, res, next) => {
     next();
 };
 
-// تطبيق الحماية
 app.use(ddosProtection);
 app.use(suspiciousRequestFilter);
 app.use(attackLogger);
@@ -181,7 +191,6 @@ app.use(cors({
 // ═══════════════════════════════════════════
 // SIGNATURE VERIFICATION SYSTEM
 // ═══════════════════════════════════════════
-
 const SIGNED_ENDPOINTS = [
     '/api/getUser',
     '/api/verifyAccount',
@@ -194,216 +203,6 @@ const SIGNED_ENDPOINTS = [
     '/api/sub/users/:id/details',
     '/api/sub/stats'
 ];
-
-// ═══════════════════════════════════════════
-// دالة لاختبار التوقيع (للتطوير فقط)
-// ═══════════════════════════════════════════
-if (process.env.NODE_ENV === 'development') {
-    app.post('/api/test-signature-debug', (req, res) => {
-        try {
-            const { method, path, body, timestamp, nonce, clientId } = req.body;
-            
-            // فقط في وضع التطوير، يمكن إرجاع معلومات للتشخيص
-            res.json({
-                success: true,
-                info: 'Debug endpoint for development only',
-                note: 'In production, this endpoint is disabled',
-                clientId: clientId ? clientId.substring(0, 5) + '...' : 'none',
-                required_headers: [
-                    'x-api-signature',
-                    'x-timestamp', 
-                    'x-nonce',
-                    'x-client-id'
-                ]
-            });
-        } catch (error) {
-            res.status(500).json({ success: false, error: error.message });
-        }
-    });
-}
-
-
-// Middleware للتحقق من التواقيع
-
-const verifySignature = (req, res, next) => {
-    try {
-        console.log('🔐 [SIGNATURE] Starting verification for:', req.method, req.path);
-        
-        // التحقق مما إذا كانت النقطة تتطلب توقيعاً
-        const path = req.path;
-        const needsSignature = SIGNED_ENDPOINTS.some(endpoint => {
-            if (endpoint.includes(':')) {
-                const pattern = endpoint.replace(/:[^/]+/g, '([^/]+)');
-                const regex = new RegExp(`^${pattern}$`);
-                return regex.test(path);
-            }
-            return endpoint === path;
-        });
-
-        if (!needsSignature) {
-            console.log('🔐 [SIGNATURE] No signature required for:', path);
-            return next();
-        }
-
-        console.log('🔐 [SIGNATURE] Signature required for:', path);
-
-        // الحصول على رؤوس التوقيع
-        const signature = req.headers['x-api-signature'];
-        const timestamp = req.headers['x-timestamp'];
-        const nonce = req.headers['x-nonce'];
-        const clientId = req.headers['x-client-id'] || req.headers['x-api-key'];
-
-        console.log('🔐 [SIGNATURE] Headers received:', {
-            signature: signature ? `${signature.substring(0, 10)}...` : 'none',
-            timestamp: timestamp,
-            nonce: nonce,
-            clientId: clientId ? `${clientId.substring(0, 10)}...` : 'none'
-        });
-
-        if (!signature || !timestamp || !nonce || !clientId) {
-            console.log('❌ [SIGNATURE] Missing signature headers');
-            return res.status(401).json({
-                success: false,
-                error: 'Missing signature headers',
-                code: 401
-            });
-        }
-
-        // التحقق من صلاحية الطابع الزمني
-        const now = Date.now();
-        let requestTime = parseInt(timestamp);
-        
-        console.log('⏰ [SIGNATURE] Time check:', {
-            now: now,
-            received: requestTime,
-            isSeconds: requestTime < 10000000000
-        });
-        
-        // تحويل من الثواني إلى المللي ثانية إذا كان timestamp صغيراً
-        if (requestTime < 10000000000) {
-            requestTime = requestTime * 1000;
-            console.log(`🔄 [SIGNATURE] Converted timestamp: ${timestamp}s → ${requestTime}ms`);
-        }
-        
-        // السماح بفارق زمني 5 دقائق (300000 مللي ثانية)
-        const timeDiff = Math.abs(now - requestTime);
-        console.log(`⏰ [SIGNATURE] Time difference: ${timeDiff}ms`);
-        
-        if (isNaN(requestTime) || timeDiff > 300000) {
-            console.warn(`❌ [SIGNATURE] Rejected request with invalid timestamp: diff ${timeDiff}ms`);
-            return res.status(401).json({
-                success: false,
-                error: 'Request timestamp is invalid or too old',
-                code: 401
-            });
-        }
-
-        // 🔑 الحصول على المفتاح السري
-        let secretKey;
-        let keySource = 'unknown';
-        
-        if (clientId === process.env.APP_API_KEY) {
-            secretKey = process.env.APP_SIGNING_SECRET;
-            keySource = 'app_signing_secret';
-        }
-        else if (clientId === process.env.MASTER_ADMIN_TOKEN) {
-            secretKey = process.env.MASTER_SIGNING_SECRET;
-            keySource = 'master_signing_secret';
-        }
-        else {
-            const cachedKey = subAdminKeys.get(clientId);
-            if (cachedKey && cachedKey.signing_secret) {
-                secretKey = cachedKey.signing_secret;
-                keySource = 'cached_sub_admin';
-            } else {
-                secretKey = process.env.DEFAULT_SIGNING_SECRET;
-                keySource = 'default_signing_secret';
-            }
-        }
-
-        if (!secretKey) {
-            console.error('❌ [SIGNATURE] No signing secret found for client');
-            return res.status(401).json({
-                success: false,
-                error: 'Authentication failed',
-                code: 401
-            });
-        }
-
-        console.log(`🔑 [SIGNATURE] Using key from: ${keySource}`);
-
-        // إنشاء السلسلة للتوقيع
-        let stringToSign = '';
-        
-        if (req.method === 'GET' || req.method === 'DELETE') {
-            stringToSign = `${req.method.toUpperCase()}:${req.path}|${timestamp}|${nonce}`;
-            
-            if (Object.keys(req.query).length > 0) {
-                const sortedParams = Object.keys(req.query)
-                    .sort()
-                    .map(key => `${key}=${req.query[key]}`)
-                    .join('&');
-                stringToSign = `${req.method.toUpperCase()}:${req.path}?${sortedParams}|${timestamp}|${nonce}`;
-            }
-        } else {
-            // ✅ التعديل المهم: استخدام rawBody بدلاً من JSON.stringify
-            const bodyString = req.rawBody || '{}';
-            const bodyHash = crypto.createHash('sha256')
-                .update(bodyString)
-                .digest('hex');
-            stringToSign = `${req.method.toUpperCase()}:${req.path}|${bodyHash}|${timestamp}|${nonce}`;
-            
-            console.log('📝 [SIGNATURE] Raw body used:', bodyString.substring(0, 50) + '...');
-            console.log('📝 [SIGNATURE] Body hash:', bodyHash);
-        }
-
-        // إضافة المفتاح السري
-        stringToSign += `|${secretKey}`;
-        
-        console.log('📝 [SIGNATURE] String to sign (without secret):', 
-            stringToSign.substring(0, stringToSign.length - secretKey.length)
-        );
-
-        // توليد التوقيع المتوقع
-        const expectedSignature = crypto.createHmac('sha256', secretKey)
-            .update(stringToSign)
-            .digest('base64')
-            .replace(/=+$/, '');
-
-        console.log('🔍 [SIGNATURE] Signature comparison:', {
-            expected_length: expectedSignature.length,
-            received_length: signature.length
-        });
-
-        // مقارنة التواقيع
-        const isValid = (signature === expectedSignature);
-
-        if (!isValid) {
-            console.error(`❌ [SIGNATURE] Invalid signature`);
-            console.error('   Expected:', expectedSignature);
-            console.error('   Received:', signature);
-
-            return res.status(401).json({
-                success: false,
-                error: 'Invalid signature',
-                code: 401
-            });
-        }
-
-        // ✅ التوقيع صالح
-        console.log(`✅ [SIGNATURE] Valid signature for ${req.method} ${req.path}`);
-        next();
-
-    } catch (error) {
-        console.error('❌ [SIGNATURE] Verification error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Signature verification failed',
-            code: 500
-        });
-    }
-};
-
 
 // ═══════════════════════════════════════════
 // Rate Limiting
@@ -430,14 +229,13 @@ const apiLimiter = createRateLimiter(60 * 1000, 50, 'API rate limit exceeded');
 
 app.use('/', globalLimiter);
 
-// ✅ تعديل مهم: حفظ الـ raw body
+// حفظ الـ raw body
 app.use(express.json({ 
     limit: '2mb',
     verify: (req, res, buf) => {
         req.rawBody = buf.toString('utf8');
     }
 }));
-
 
 // ═══════════════════════════════════════════
 // Brute Force Protection
@@ -453,7 +251,6 @@ const bruteForceProtection = (req, res, next) => {
   
   const attempt = loginAttempts.get(ip);
   
-  // إعادة تعيين بعد 15 دقيقة
   if (Date.now() - attempt.lastAttempt > 15 * 60 * 1000) {
     attempt.count = 0;
   }
@@ -469,7 +266,6 @@ const bruteForceProtection = (req, res, next) => {
   next();
 };
 
-// تنظيف دوري للمحاولات القديمة
 setInterval(() => {
   const now = Date.now();
   for (const [ip, attempt] of loginAttempts.entries()) {
@@ -522,7 +318,6 @@ function formatDate(timestamp) {
   return `${day}/${month}/${year} ${hours}:${mins}`;
 }
 
-// تنظيف الجلسات المنتهية
 setInterval(() => {
   const now = Date.now();
   for (const [token, session] of adminSessions.entries()) {
@@ -532,15 +327,162 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
+// ═══════════════════════════════════════════
+// 🔐 SIGNATURE VERIFICATION MIDDLEWARE
+// ═══════════════════════════════════════════
+const verifySignature = (req, res, next) => {
+    try {
+        console.log('🔐 [SIGNATURE] Starting verification for:', req.method, req.path);
+        
+        const path = req.path;
+        const needsSignature = SIGNED_ENDPOINTS.some(endpoint => {
+            if (endpoint.includes(':')) {
+                const pattern = endpoint.replace(/:[^/]+/g, '([^/]+)');
+                const regex = new RegExp(`^${pattern}$`);
+                return regex.test(path);
+            }
+            return endpoint === path;
+        });
 
+        if (!needsSignature) {
+            console.log('🔐 [SIGNATURE] No signature required for:', path);
+            return next();
+        }
 
+        console.log('🔐 [SIGNATURE] Signature required for:', path);
 
+        const signature = req.headers['x-api-signature'];
+        const timestamp = req.headers['x-timestamp'];
+        const nonce = req.headers['x-nonce'];
+        const clientId = req.headers['x-client-id'] || req.headers['x-api-key'];
+
+        console.log('🔐 [SIGNATURE] Headers received:', {
+            signature: signature ? `${signature.substring(0, 15)}...` : 'none',
+            timestamp: timestamp,
+            nonce: nonce,
+            clientId: clientId ? `${clientId.substring(0, 10)}...` : 'none'
+        });
+
+        if (!signature || !timestamp || !nonce || !clientId) {
+            console.log('❌ [SIGNATURE] Missing signature headers');
+            return res.status(401).json({
+                success: false,
+                error: 'Missing signature headers',
+                code: 401
+            });
+        }
+
+        const now = Date.now();
+        let requestTime = parseInt(timestamp);
+        
+        if (requestTime < 10000000000) {
+            requestTime = requestTime * 1000;
+        }
+        
+        const timeDiff = Math.abs(now - requestTime);
+        
+        if (isNaN(requestTime) || timeDiff > 300000) {
+            console.warn(`❌ [SIGNATURE] Invalid timestamp: diff ${timeDiff}ms`);
+            return res.status(401).json({
+                success: false,
+                error: 'Request timestamp is invalid or too old',
+                code: 401
+            });
+        }
+
+        // 🔑 الحصول على المفتاح السري
+        let secretKey;
+        let keySource = 'unknown';
+        
+        if (clientId === process.env.APP_API_KEY) {
+            secretKey = process.env.APP_SIGNING_SECRET;
+            keySource = 'app_signing_secret';
+        }
+        else if (clientId === process.env.MASTER_ADMIN_TOKEN) {
+            secretKey = process.env.MASTER_SIGNING_SECRET;
+            keySource = 'master_signing_secret';
+        }
+        else {
+            // ✅ تحقق من Cache أولاً (للطلبات بعد verify-key)
+            const cachedKey = subAdminKeys.get(clientId);
+            if (cachedKey && cachedKey.signing_secret) {
+                secretKey = cachedKey.signing_secret;
+                keySource = 'cached_sub_admin_secret';
+            } else {
+                // ✅ للطلب الأول (verify-key): توليد من API Key
+                secretKey = deriveSigningKey(clientId);
+                keySource = 'derived_from_api_key';
+            }
+        }
+
+        if (!secretKey) {
+            console.error('❌ [SIGNATURE] No signing secret found for client');
+            return res.status(401).json({
+                success: false,
+                error: 'Authentication failed',
+                code: 401
+            });
+        }
+
+        console.log(`🔑 [SIGNATURE] Using key from: ${keySource}`);
+
+        let stringToSign = '';
+        
+        if (req.method === 'GET' || req.method === 'DELETE') {
+            stringToSign = `${req.method.toUpperCase()}:${req.path}|${timestamp}|${nonce}`;
+            
+            if (Object.keys(req.query).length > 0) {
+                const sortedParams = Object.keys(req.query)
+                    .sort()
+                    .map(key => `${key}=${req.query[key]}`)
+                    .join('&');
+                stringToSign = `${req.method.toUpperCase()}:${req.path}?${sortedParams}|${timestamp}|${nonce}`;
+            }
+        } else {
+            const bodyString = req.rawBody || '{}';
+            const bodyHash = crypto.createHash('sha256')
+                .update(bodyString)
+                .digest('hex');
+            stringToSign = `${req.method.toUpperCase()}:${req.path}|${bodyHash}|${timestamp}|${nonce}`;
+        }
+
+        stringToSign += `|${secretKey}`;
+
+        const expectedSignature = crypto.createHmac('sha256', secretKey)
+            .update(stringToSign)
+            .digest('base64')
+            .replace(/=+$/, '');
+
+        const isValid = (signature === expectedSignature);
+
+        if (!isValid) {
+            console.error(`❌ [SIGNATURE] Invalid signature`);
+            console.error('   Expected:', expectedSignature.substring(0, 20) + '...');
+            console.error('   Received:', signature.substring(0, 20) + '...');
+
+            return res.status(401).json({
+                success: false,
+                error: 'Invalid signature',
+                code: 401
+            });
+        }
+
+        console.log(`✅ [SIGNATURE] Valid signature for ${req.method} ${req.path}`);
+        next();
+
+    } catch (error) {
+        console.error('❌ [SIGNATURE] Verification error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: 'Signature verification failed',
+            code: 500
+        });
+    }
+};
 
 // ═══════════════════════════════════════════
 // المصادقة - Middlewares
 // ═══════════════════════════════════════════
-
-// مصادقة التطبيق
 const authApp = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
   
@@ -563,7 +505,6 @@ const authApp = (req, res, next) => {
   });
 };
 
-// مصادقة Master Admin
 const authAdmin = (req, res, next) => {
   const sessionToken = req.headers['x-session-token'];
   const masterToken = process.env.MASTER_ADMIN_TOKEN;
@@ -576,13 +517,11 @@ const authAdmin = (req, res, next) => {
     });
   }
   
-  // ✅ تحقق من Master Token المباشر
   if (masterToken && sessionToken === masterToken) {
     req.adminUser = 'master_owner';
     return next();
   }
   
-  // التحقق من Session عادية
   const session = adminSessions.get(sessionToken);
   
   if (!session) {
@@ -606,7 +545,6 @@ const authAdmin = (req, res, next) => {
   next();
 };
 
-// مصادقة Sub Admin
 const authSubAdmin = async (req, res, next) => {
   try {
     const apiKey = req.headers['x-api-key'];
@@ -619,7 +557,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // التحقق من Cache أولاً
     const cached = subAdminKeys.get(apiKey);
     if (cached && cached.device === deviceFingerprint) {
       if (cached.expiry_timestamp > Date.now() && cached.is_active) {
@@ -629,7 +566,6 @@ const authSubAdmin = async (req, res, next) => {
       }
     }
     
-    // البحث في Firebase
     const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
     const keys = response.data || {};
     
@@ -651,7 +587,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // التحقق من الصلاحيات
     if (!foundKey.is_active) {
       return res.status(403).json({ 
         success: false, 
@@ -673,7 +608,6 @@ const authSubAdmin = async (req, res, next) => {
       });
     }
     
-    // تحديث Cache
     subAdminKeys.set(apiKey, {
       ...foundKey,
       keyId,
@@ -694,7 +628,6 @@ const authSubAdmin = async (req, res, next) => {
   }
 };
 
-// التحقق من صلاحيات Sub Admin
 const checkSubAdminPermission = (requiredPermission) => {
   return (req, res, next) => {
     const keyData = req.subAdminKey;
@@ -719,13 +652,11 @@ const checkSubAdminPermission = (requiredPermission) => {
   };
 };
 
-// ✅ التحقق من ملكية المستخدم (Sub Admin يمكنه التعديل فقط على مستخدميه)
 const checkUserOwnership = async (req, res, next) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     
-    // جلب بيانات المستخدم
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -737,7 +668,6 @@ const checkUserOwnership = async (req, res, next) => {
     
     const user = userRes.data;
     
-    // ✅ التحقق الصارم: يجب أن يكون created_by_key موجود ومطابق تماماً
     if (!user.created_by_key || user.created_by_key !== currentKeyId) {
       console.log(`🚫 Ownership denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
@@ -781,7 +711,7 @@ app.use((req, res, next) => {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
-    version: '3.2.0', 
+    version: '3.3.0', 
     uptime: Math.floor(process.uptime()), 
     timestamp: Date.now() 
   });
@@ -796,59 +726,7 @@ app.get('/api/serverTime', apiLimiter, (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-// 🔍 DEBUG ENDPOINT - لتشخيص مشاكل التوقيع
-// ═══════════════════════════════════════════
-app.post('/api/debug-signature', apiLimiter, (req, res) => {
-    try {
-        const signature = req.headers['x-api-signature'];
-        const timestamp = req.headers['x-timestamp'];
-        const nonce = req.headers['x-nonce'];
-        const clientId = req.headers['x-client-id'] || req.headers['x-api-key'];
-        
-        const secretKey = process.env.APP_SIGNING_SECRET;
-        
-        const bodyAsReceived = JSON.stringify(req.body);
-        const bodyHash = crypto.createHash('sha256').update(bodyAsReceived).digest('hex');
-        
-        const stringToSign = `POST:/api/updateDevice|${bodyHash}|${timestamp}|${nonce}|${secretKey}`;
-        
-        const expectedSignature = crypto.createHmac('sha256', secretKey)
-            .update(stringToSign)
-            .digest('base64')
-            .replace(/=+$/, '');
-        
-        res.json({
-            debug: true,
-            received_headers: {
-                signature: signature,
-                timestamp: timestamp,
-                nonce: nonce,
-                clientId: clientId ? clientId.substring(0, 15) + '...' : 'none'
-            },
-            body_analysis: {
-                body_as_received: bodyAsReceived,
-                body_hash: bodyHash,
-                body_length: bodyAsReceived.length
-            },
-            signature_computation: {
-                string_to_sign_preview: `POST:/api/updateDevice|${bodyHash}|${timestamp}|${nonce}|***SECRET***`,
-                expected_signature: expectedSignature,
-                received_signature: signature,
-                match: signature === expectedSignature
-            },
-            secret_info: {
-                secret_configured: !!secretKey,
-                secret_length: secretKey ? secretKey.length : 0
-            }
-        });
-        
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ═══════════════════════════════════════════
-// 📱 MOBILE APP ENDPOINTS (مع حماية التواقيع)
+// 📱 MOBILE APP ENDPOINTS
 // ═══════════════════════════════════════════
 app.post('/api/getUser', verifySignature, authApp, apiLimiter, async (req, res) => {
   try {
@@ -936,11 +814,6 @@ app.post('/api/verifyAccount', verifySignature, authApp, apiLimiter, async (req,
   }
 });
 
-
-
-// ═══════════════════════════════════════════
-// 📱 تحديث معلومات الجهاز والدخول (محسّن واحترافي)
-// ═══════════════════════════════════════════
 app.post('/api/updateDevice', verifySignature, authApp, apiLimiter, async (req, res) => {
   try {
     const { username, deviceId, deviceInfo } = req.body;
@@ -966,11 +839,9 @@ app.post('/api/updateDevice', verifySignature, authApp, apiLimiter, async (req, 
     const userId = Object.keys(users)[0];
     const user = users[userId];
     
-    // ✅ Get IP and User Agent
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
     const userAgent = req.headers['user-agent'] || '';
     
-    // ✅ إعداد بيانات التحديث الأساسية
     const updateData = {
       device_id: deviceId,
       last_login: Date.now(),
@@ -979,44 +850,30 @@ app.post('/api/updateDevice', verifySignature, authApp, apiLimiter, async (req, 
       user_agent: userAgent
     };
     
-    // ✅ إضافة معلومات الجهاز إذا كانت موجودة
     if (deviceInfo) {
-      // Device Info
       updateData.device_model = deviceInfo.device_model || 'Unknown';
       updateData.device_brand = deviceInfo.device_brand || 'Unknown';
       updateData.device_manufacturer = deviceInfo.device_manufacturer || 'Unknown';
       updateData.device_product = deviceInfo.device_product || 'Unknown';
       updateData.device_type = deviceInfo.device_type || 'Phone';
-      
-      // OS Info
       updateData.android_version = deviceInfo.android_version || 'Unknown';
       updateData.sdk_version = deviceInfo.sdk_version || 0;
-      
-      // Security Info
       updateData.is_rooted = deviceInfo.is_rooted || false;
       updateData.has_screen_lock = deviceInfo.has_screen_lock || false;
       updateData.fingerprint_enabled = deviceInfo.fingerprint_enabled || false;
-      
-      // Hardware Info
       updateData.total_ram = deviceInfo.total_ram || 'Unknown';
       updateData.screen_size = deviceInfo.screen_size || 'Unknown';
       updateData.screen_density = deviceInfo.screen_density || 0;
-      
-      // Network Info
       updateData.network_type = deviceInfo.network_type || 'Unknown';
       updateData.carrier_name = deviceInfo.carrier_name || 'Unknown';
-      
-      // Battery Info
       updateData.battery_level = deviceInfo.battery_level || 0;
       updateData.is_charging = deviceInfo.is_charging || false;
       
-      // Location (optional)
       if (deviceInfo.location) {
         updateData.location = deviceInfo.location;
       }
     }
     
-    // ✅ إضافة إلى سجل تسجيل الدخول (Login History)
     const loginEntry = {
       timestamp: Date.now(),
       ip: ip,
@@ -1028,20 +885,16 @@ app.post('/api/updateDevice', verifySignature, authApp, apiLimiter, async (req, 
       is_rooted: deviceInfo?.is_rooted || false
     };
     
-    // الاحتفاظ بآخر 10 عمليات دخول فقط
     const existingHistory = user.login_history || [];
     updateData.login_history = [
-      ...existingHistory.slice(-9), // آخر 9
-      loginEntry // الجديد
+      ...existingHistory.slice(-9),
+      loginEntry
     ];
     
-    // ✅ تحديث البيانات في Firebase
     await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, updateData);
     
-    // ✅ تسجيل في Console للمراقبة
-    console.log(`📱 Login: ${username} | Device: ${deviceInfo?.device_brand || 'Unknown'} ${deviceInfo?.device_model || 'Unknown'} | Android: ${deviceInfo?.android_version || '?'} | Root: ${deviceInfo?.is_rooted ? '⚠️ YES' : '✅ NO'} | Network: ${deviceInfo?.network_type || '?'} | IP: ${ip}`);
+    console.log(`📱 Login: ${username} | Device: ${deviceInfo?.device_brand || 'Unknown'} ${deviceInfo?.device_model || 'Unknown'} | IP: ${ip}`);
     
-    // ✅ تنبيه إذا كان الجهاز مروت
     if (deviceInfo?.is_rooted) {
       console.warn(`🚨 WARNING: User "${username}" is using a ROOTED device!`);
     }
@@ -1067,232 +920,8 @@ app.post('/api/updateDevice', verifySignature, authApp, apiLimiter, async (req, 
 });
 
 // ═══════════════════════════════════════════
-// 📊 إحصائيات الأجهزة المتقدمة
-// ═══════════════════════════════════════════
-app.get('/api/admin/device-stats', authAdmin, apiLimiter, async (req, res) => {
-  try {
-    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-    const users = response.data || {};
-    
-    const stats = {
-      total_users: Object.keys(users).length,
-      total_devices: 0,
-      rooted_devices: 0,
-      rooted_percentage: 0,
-      
-      // Device Brands
-      device_brands: {},
-      top_brands: [],
-      
-      // Android Versions
-      android_versions: {},
-      top_android_versions: [],
-      
-      // Device Types
-      device_types: { Phone: 0, Tablet: 0, Unknown: 0 },
-      
-      // Network Types
-      network_types: {},
-      top_networks: [],
-      
-      // Carriers
-      carriers: {},
-      top_carriers: [],
-      
-      // Battery Stats
-      average_battery: 0,
-      charging_devices: 0,
-      low_battery_devices: 0,
-      
-      // Security Stats
-      screen_lock_enabled: 0,
-      fingerprint_enabled: 0,
-      
-      // Active Users
-      active_last_hour: 0,
-      active_last_day: 0,
-      active_last_week: 0
-    };
-    
-    let batterySum = 0;
-    let batteryCount = 0;
-    const now = Date.now();
-    const oneHour = 60 * 60 * 1000;
-    const oneDay = 24 * oneHour;
-    const oneWeek = 7 * oneDay;
-    
-    for (const user of Object.values(users)) {
-      // Total Devices
-      if (user.device_id) {
-        stats.total_devices++;
-        
-        // Rooted
-        if (user.is_rooted) stats.rooted_devices++;
-        
-        // Device Brands
-        const brand = user.device_brand || 'Unknown';
-        stats.device_brands[brand] = (stats.device_brands[brand] || 0) + 1;
-        
-        // Android Versions
-        const version = user.android_version || 'Unknown';
-        stats.android_versions[version] = (stats.android_versions[version] || 0) + 1;
-        
-        // Device Types
-        const type = user.device_type || 'Unknown';
-        stats.device_types[type]++;
-        
-        // Network Types
-        const network = user.network_type || 'Unknown';
-        stats.network_types[network] = (stats.network_types[network] || 0) + 1;
-        
-        // Carriers
-        const carrier = user.carrier_name || 'Unknown';
-        stats.carriers[carrier] = (stats.carriers[carrier] || 0) + 1;
-        
-        // Battery
-        if (user.battery_level) {
-          batterySum += user.battery_level;
-          batteryCount++;
-          if (user.battery_level <= 20) stats.low_battery_devices++;
-        }
-        if (user.is_charging) stats.charging_devices++;
-        
-        // Security
-        if (user.has_screen_lock) stats.screen_lock_enabled++;
-        if (user.fingerprint_enabled) stats.fingerprint_enabled++;
-      }
-      
-      // Active Users
-      if (user.last_login) {
-        const timeSince = now - user.last_login;
-        if (timeSince < oneHour) stats.active_last_hour++;
-        if (timeSince < oneDay) stats.active_last_day++;
-        if (timeSince < oneWeek) stats.active_last_week++;
-      }
-    }
-    
-    // Calculations
-    stats.average_battery = batteryCount > 0 ? Math.round(batterySum / batteryCount) : 0;
-    stats.rooted_percentage = stats.total_devices > 0 ? Math.round((stats.rooted_devices / stats.total_devices) * 100) : 0;
-    
-    // Top Brands (أكثر 5 علامات تجارية)
-    stats.top_brands = Object.entries(stats.device_brands)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([brand, count]) => ({ brand, count }));
-    
-    // Top Android Versions
-    stats.top_android_versions = Object.entries(stats.android_versions)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([version, count]) => ({ version, count }));
-    
-    // Top Networks
-    stats.top_networks = Object.entries(stats.network_types)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([network, count]) => ({ network, count }));
-    
-    // Top Carriers
-    stats.top_carriers = Object.entries(stats.carriers)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([carrier, count]) => ({ carrier, count }));
-    
-    res.json({ 
-      success: true, 
-      data: stats 
-    });
-    
-  } catch (error) {
-    console.error('Device stats error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch device stats' 
-    });
-  }
-});
-
-// ═══════════════════════════════════════════
-// 🚨 الحصول على قائمة الأجهزة المروتة
-// ═══════════════════════════════════════════
-app.get('/api/admin/rooted-devices', authAdmin, apiLimiter, async (req, res) => {
-  try {
-    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-    const users = response.data || {};
-    
-    const rootedDevices = [];
-    
-    for (const [userId, user] of Object.entries(users)) {
-      if (user.is_rooted) {
-        rootedDevices.push({
-          user_id: userId,
-          username: user.username,
-          device_model: user.device_model || 'Unknown',
-          device_brand: user.device_brand || 'Unknown',
-          android_version: user.android_version || 'Unknown',
-          last_login: user.last_login,
-          ip_address: user.ip_address || 'Unknown',
-          network_type: user.network_type || 'Unknown'
-        });
-      }
-    }
-    
-    res.json({ 
-      success: true, 
-      data: rootedDevices,
-      count: rootedDevices.length 
-    });
-    
-  } catch (error) {
-    console.error('Rooted devices error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch rooted devices' 
-    });
-  }
-});
-
-// ═══════════════════════════════════════════
-// 📋 سجل تسجيل الدخول لمستخدم معين
-// ═══════════════════════════════════════════
-app.get('/api/admin/users/:id/login-history', authAdmin, apiLimiter, async (req, res) => {
-  try {
-    const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
-    
-    if (!response.data) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'User not found' 
-      });
-    }
-    
-    const user = response.data;
-    const history = user.login_history || [];
-    
-    res.json({ 
-      success: true, 
-      data: {
-        username: user.username,
-        total_logins: user.login_count || 0,
-        login_history: history.reverse() // الأحدث أولاً
-      }
-    });
-    
-  } catch (error) {
-    console.error('Login history error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch login history' 
-    });
-  }
-});
-
-
-// ═══════════════════════════════════════════
 // 👑 MASTER ADMIN - AUTH
 // ═══════════════════════════════════════════
-
 app.post('/api/admin/login', loginLimiter, bruteForceProtection, async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -1305,7 +934,6 @@ app.post('/api/admin/login', loginLimiter, bruteForceProtection, async (req, res
             });
         }
         
-        // ✅ **إضافة تأخير بسيط لحماية إضافية**
         await new Promise(resolve => setTimeout(resolve, 1000));
         
         if (username !== ADMIN_CREDENTIALS.username || password !== ADMIN_CREDENTIALS.password) {
@@ -1347,7 +975,6 @@ app.post('/api/admin/login', loginLimiter, bruteForceProtection, async (req, res
     }
 });
 
-
 app.post('/api/admin/logout', authAdmin, (req, res) => {
   const sessionToken = req.headers['x-session-token'];
   if (sessionToken) {
@@ -1362,6 +989,11 @@ app.post('/api/admin/logout', authAdmin, (req, res) => {
 app.get('/api/admin/verify-session', authAdmin, (req, res) => {
   const sessionToken = req.headers['x-session-token'];
   const session = adminSessions.get(sessionToken);
+  
+  if (!session) {
+    return res.json({ success: true, session: { username: 'master_owner' } });
+  }
+  
   const expiresIn = 24 * 60 * 60 * 1000 - (Date.now() - session.createdAt);
   
   res.json({
@@ -1398,7 +1030,7 @@ app.get('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
         device_id: user.device_id || '',
         max_devices: user.max_devices || 1,
         notes: user.notes || '',
-        created_by_key: user.created_by_key || 'master' // ✅ إضافة هذا الحقل
+        created_by_key: user.created_by_key || 'master'
       };
     }
     
@@ -1439,7 +1071,7 @@ app.get('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
         expiry_date: formatDate(user.subscription_end),
         device_id: user.device_id || '',
         max_devices: user.max_devices || 1,
-        created_by_key: user.created_by_key || 'master' // ✅ إضافة هذا الحقل
+        created_by_key: user.created_by_key || 'master'
       }
     });
     
@@ -1463,7 +1095,6 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       });
     }
     
-    // التحقق من عدم وجود نفس الاسم
     const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
     const checkRes = await firebase.get(checkUrl);
     
@@ -1474,7 +1105,6 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       });
     }
     
-    // حساب تاريخ الانتهاء
     let expiryTimestamp;
     if (customExpiryDate) {
       expiryTimestamp = new Date(customExpiryDate).getTime();
@@ -1496,7 +1126,7 @@ app.post('/api/admin/users', authAdmin, apiLimiter, async (req, res) => {
       device_id: '',
       created_at: Date.now(),
       last_login: null,
-      created_by_key: 'master'  // ✅ مهم جداً! تعيين master للمستخدمين من Master Admin
+      created_by_key: 'master'
     };
     
     const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
@@ -1563,7 +1193,6 @@ app.delete('/api/admin/users/:id', authAdmin, apiLimiter, async (req, res) => {
   }
 });
 
-// ✅ حذف جميع المنتهيين دفعة واحدة (API ENDPOINT)
 app.post('/api/admin/users/delete-expired', authAdmin, apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -1590,7 +1219,6 @@ app.post('/api/admin/users/delete-expired', authAdmin, apiLimiter, async (req, r
       });
     }
     
-    // حذف دفعة واحدة
     await Promise.all(deletePromises);
     
     console.log(`🗑️ Bulk deleted ${expiredIds.length} expired users`);
@@ -1704,7 +1332,7 @@ app.get('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
         usage_count: key.usage_count || 0,
         bound_device: key.bound_device || null,
         created_at: key.created_at || null,
-        signing_secret: key.signing_secret ? '*****' : null // إخفاء المفتاح السري
+        signing_secret: key.signing_secret ? '*****' : null
       };
     }
     
@@ -1735,7 +1363,6 @@ app.post('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
     }
     
     const apiKey = `AK_${crypto.randomBytes(16).toString('hex')}`;
-    // ✅ إنشاء مفتاح توقيع فريد لكل API Key
     const signingSecret = `SS_${crypto.randomBytes(32).toString('hex')}`;
     
     const keyData = {
@@ -1747,20 +1374,18 @@ app.post('/api/admin/api-keys', authAdmin, apiLimiter, async (req, res) => {
       usage_count: 0,
       bound_device: null,
       created_at: Date.now(),
-      signing_secret: signingSecret // ✅ تخزين مفتاح التوقيع
+      signing_secret: signingSecret
     };
     
     await firebase.post(`api_keys.json?auth=${FB_KEY}`, keyData);
     
     console.log(`🔑 API Key created for: ${adminName}`);
-    console.log(`   API Key: ${apiKey}`);
-    console.log(`   Signing Secret: ${signingSecret.substring(0, 20)}...`);
     
     res.json({ 
       success: true, 
       message: 'API Key created', 
       apiKey,
-      signingSecret, // ✅ إرجاع مفتاح التوقيع للعميل مرة واحدة فقط
+      signingSecret,
       warning: 'Save the signing secret immediately. It will not be shown again.'
     });
     
@@ -1837,7 +1462,6 @@ app.post('/api/admin/api-keys/:id/unbind-device', authAdmin, apiLimiter, async (
   }
 });
 
-// ✅ إنشاء مفتاح توقيع جديد لـ API Key موجود
 app.post('/api/admin/api-keys/:id/regenerate-secret', authAdmin, apiLimiter, async (req, res) => {
   try {
     const newSecret = `SS_${crypto.randomBytes(32).toString('hex')}`;
@@ -1853,7 +1477,7 @@ app.post('/api/admin/api-keys/:id/regenerate-secret', authAdmin, apiLimiter, asy
       success: true, 
       message: 'Signing secret regenerated',
       signingSecret: newSecret,
-      warning: 'Save this new secret immediately. All existing signed requests with old secret will fail.'
+      warning: 'Save this new secret immediately.'
     });
     
   } catch (error) {
@@ -1864,7 +1488,6 @@ app.post('/api/admin/api-keys/:id/regenerate-secret', authAdmin, apiLimiter, asy
     });
   }
 });
-
 
 // ═══════════════════════════════════════════
 // 📡 Security Stats Endpoints
@@ -1890,13 +1513,114 @@ app.post('/api/admin/unblock-ip', authAdmin, (req, res) => {
     res.json({ success: true, message: `IP ${ip} unblocked` });
 });
 
+// ═══════════════════════════════════════════
+// 📊 Device Stats
+// ═══════════════════════════════════════════
+app.get('/api/admin/device-stats', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    const stats = {
+      total_users: Object.keys(users).length,
+      total_devices: 0,
+      rooted_devices: 0,
+      device_brands: {},
+      android_versions: {},
+      active_last_day: 0,
+      active_last_week: 0
+    };
+    
+    const now = Date.now();
+    const oneDay = 24 * 60 * 60 * 1000;
+    const oneWeek = 7 * oneDay;
+    
+    for (const user of Object.values(users)) {
+      if (user.device_id) {
+        stats.total_devices++;
+        if (user.is_rooted) stats.rooted_devices++;
+        
+        const brand = user.device_brand || 'Unknown';
+        stats.device_brands[brand] = (stats.device_brands[brand] || 0) + 1;
+        
+        const version = user.android_version || 'Unknown';
+        stats.android_versions[version] = (stats.android_versions[version] || 0) + 1;
+      }
+      
+      if (user.last_login) {
+        const timeSince = now - user.last_login;
+        if (timeSince < oneDay) stats.active_last_day++;
+        if (timeSince < oneWeek) stats.active_last_week++;
+      }
+    }
+    
+    res.json({ success: true, data: stats });
+    
+  } catch (error) {
+    console.error('Device stats error:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch device stats' });
+  }
+});
+
+app.get('/api/admin/rooted-devices', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+    const users = response.data || {};
+    
+    const rootedDevices = [];
+    
+    for (const [userId, user] of Object.entries(users)) {
+      if (user.is_rooted) {
+        rootedDevices.push({
+          user_id: userId,
+          username: user.username,
+          device_model: user.device_model || 'Unknown',
+          device_brand: user.device_brand || 'Unknown',
+          android_version: user.android_version || 'Unknown',
+          last_login: user.last_login,
+          ip_address: user.ip_address || 'Unknown'
+        });
+      }
+    }
+    
+    res.json({ success: true, data: rootedDevices, count: rootedDevices.length });
+    
+  } catch (error) {
+    console.error('Rooted devices error:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch rooted devices' });
+  }
+});
+
+app.get('/api/admin/users/:id/login-history', authAdmin, apiLimiter, async (req, res) => {
+  try {
+    const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
+    
+    if (!response.data) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    
+    const user = response.data;
+    const history = user.login_history || [];
+    
+    res.json({ 
+      success: true, 
+      data: {
+        username: user.username,
+        total_logins: user.login_count || 0,
+        login_history: history.reverse()
+      }
+    });
+    
+  } catch (error) {
+    console.error('Login history error:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch login history' });
+  }
+});
 
 // ═══════════════════════════════════════════
-// 🔑 SUB ADMIN API - التحقق من المفتاح
+// 🔑 SUB ADMIN API
 // ═══════════════════════════════════════════
-
-// ✅ التحقق من مفتاح Sub Admin - بدون verifySignature لأنه أول طلب
-app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
+app.post('/api/sub/verify-key', verifySignature, apiLimiter, async (req, res) => {
   try {
     const { apiKey, deviceFingerprint } = req.body;
     
@@ -1909,7 +1633,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // البحث في Firebase
     const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
     const keys = response.data || {};
     
@@ -1931,7 +1654,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // التحقق من صلاحية المفتاح
     if (!foundKey.is_active) {
       return res.status(403).json({ 
         success: false, 
@@ -1946,7 +1668,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // ربط الجهاز
     if (!foundKey.bound_device) {
       await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, { 
         bound_device: deviceFingerprint 
@@ -1959,13 +1680,11 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
       });
     }
     
-    // تحديث عداد الاستخدام
     await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, {
       usage_count: (foundKey.usage_count || 0) + 1,
       last_used: Date.now()
     });
     
-    // تحديث Cache
     subAdminKeys.set(apiKey, {
       ...foundKey,
       keyId,
@@ -1975,13 +1694,12 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
     
     console.log(`✅ Sub Admin verified: ${foundKey.admin_name} (ID: ${keyId})`);
     
-    // ✅✅✅ إرجاع signing_secret - هذا هو التعديل المهم!
     res.json({
       success: true,
       name: foundKey.admin_name,
       permission: foundKey.permission_level || 'view_only',
       key_id: keyId,
-      signing_secret: foundKey.signing_secret  // ⬅️ هذا السطر مهم جداً!
+      signing_secret: foundKey.signing_secret
     });
     
   } catch (error) {
@@ -1993,7 +1711,6 @@ app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
   }
 });
 
-// الحصول على المستخدمين - فقط المستخدمين الذين أنشأهم هذا Sub Admin ✅✅✅
 app.get('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -2002,9 +1719,7 @@ app.get('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermission
     const currentKeyId = req.subAdminKeyId;
     const formattedUsers = {};
     
-    // ✅✅✅ **التعديل المهم: فلترة حسب created_by_key**
     for (const [id, user] of Object.entries(users)) {
-      // تحقق مما إذا كان المستخدم ملكاً لهذا المسؤول الفرعي
       if (user.created_by_key === currentKeyId) {
         const subEnd = user.subscription_end || 0;
         formattedUsers[id] = {
@@ -2039,7 +1754,6 @@ app.get('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermission
   }
 });
 
-// ✅ نقطة API جديدة: الحصول على تفاصيل مستخدم محدد
 app.get('/api/sub/users/:id/details', verifySignature, authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
     try {
         const userId = req.params.id;
@@ -2056,7 +1770,6 @@ app.get('/api/sub/users/:id/details', verifySignature, authSubAdmin, checkSubAdm
         
         const user = userRes.data;
         
-        // ✅ التحقق من الملكية
         if (user.created_by_key !== currentKeyId) {
             return res.status(403).json({ 
                 success: false, 
@@ -2088,7 +1801,6 @@ app.get('/api/sub/users/:id/details', verifySignature, authSubAdmin, checkSubAdm
     }
 });
 
-// الإحصائيات - فقط للمستخدمين الذين أنشأهم هذا Sub Admin
 app.get('/api/sub/stats', verifySignature, authSubAdmin, checkSubAdminPermission('view'), apiLimiter, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -2101,7 +1813,6 @@ app.get('/api/sub/stats', verifySignature, authSubAdmin, checkSubAdminPermission
     let activeUsers = 0;
     let expiredUsers = 0;
     
-    // ✅✅✅ إحصائيات صارمة جداً - فقط مستخدمي هذا المفتاح
     for (const user of Object.values(users)) {
       if (user.created_by_key === currentKeyId) {
         totalUsers++;
@@ -2132,7 +1843,6 @@ app.get('/api/sub/stats', verifySignature, authSubAdmin, checkSubAdminPermission
   }
 });
 
-// إضافة مستخدم جديد - مع تخزين created_by_key ✅✅✅
 app.post('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermission('add'), apiLimiter, async (req, res) => {
   try {
     const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
@@ -2144,7 +1854,6 @@ app.post('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermissio
       });
     }
     
-    // التحقق من عدم وجود نفس اسم المستخدم
     const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
     const checkRes = await firebase.get(checkUrl);
     
@@ -2155,7 +1864,6 @@ app.post('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermissio
       });
     }
     
-    // حساب تاريخ الانتهاء
     let expiryTimestamp;
     if (customExpiryDate) {
       expiryTimestamp = new Date(customExpiryDate).getTime();
@@ -2168,7 +1876,6 @@ app.post('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermissio
       });
     }
     
-    // ✅✅✅ **التعديل المهم: إضافة created_by_key**
     const userData = {
       username,
       password_hash: hashPassword(password),
@@ -2178,7 +1885,7 @@ app.post('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermissio
       device_id: '',
       created_at: Date.now(),
       last_login: null,
-      created_by_key: req.subAdminKeyId,  // ✅ تخزين معرف مفتاح المسؤول الفرعي
+      created_by_key: req.subAdminKeyId,
       created_by: req.subAdminKey.admin_name || 'sub_admin'
     };
     
@@ -2202,7 +1909,6 @@ app.post('/api/sub/users', verifySignature, authSubAdmin, checkSubAdminPermissio
   }
 });
 
-// تمديد اشتراك - مع التحقق من الملكية ✅✅✅
 app.post('/api/sub/users/:id/extend', verifySignature, authSubAdmin, checkSubAdminPermission('extend'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
@@ -2216,7 +1922,6 @@ app.post('/api/sub/users/:id/extend', verifySignature, authSubAdmin, checkSubAdm
       });
     }
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -2271,14 +1976,12 @@ app.post('/api/sub/users/:id/extend', verifySignature, authSubAdmin, checkSubAdm
   }
 });
 
-// تحديث حالة المستخدم - مع التحقق من الملكية ✅✅✅
 app.patch('/api/sub/users/:id', verifySignature, authSubAdmin, checkSubAdminPermission('edit'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     const { is_active } = req.body;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -2318,13 +2021,11 @@ app.patch('/api/sub/users/:id', verifySignature, authSubAdmin, checkSubAdminPerm
   }
 });
 
-// إعادة تعيين الجهاز - مع التحقق من الملكية ✅✅✅
 app.post('/api/sub/users/:id/reset-device', verifySignature, authSubAdmin, checkSubAdminPermission('edit'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -2364,13 +2065,11 @@ app.post('/api/sub/users/:id/reset-device', verifySignature, authSubAdmin, check
   }
 });
 
-// حذف مستخدم - مع التحقق من الملكية ✅✅✅
 app.delete('/api/sub/users/:id', verifySignature, authSubAdmin, checkSubAdminPermission('delete'), apiLimiter, async (req, res) => {
   try {
     const userId = req.params.id;
     const currentKeyId = req.subAdminKeyId;
     
-    // ✅ **التحقق من الملكية أولاً**
     const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
     
     if (!userRes.data) {
@@ -2382,7 +2081,6 @@ app.delete('/api/sub/users/:id', verifySignature, authSubAdmin, checkSubAdminPer
     
     const user = userRes.data;
     
-    // تحقق مما إذا كان المستخدم ملكاً لهذا المسؤول الفرعي
     if (user.created_by_key !== currentKeyId) {
       console.log(`🚫 Delete denied: User created_by_key="${user.created_by_key}" vs Current key="${currentKeyId}"`);
       return res.status(403).json({ 
@@ -2410,10 +2108,8 @@ app.delete('/api/sub/users/:id', verifySignature, authSubAdmin, checkSubAdminPer
 });
 
 // ═══════════════════════════════════════════
-// 🛠️ MAINTENANCE ENDPOINTS (للاستخدام مرة واحدة)
+// 🛠️ MAINTENANCE ENDPOINTS
 // ═══════════════════════════════════════════
-
-// ✅ إصلاح المستخدمين القدامى (الذين ليس لديهم created_by_key)
 app.post('/api/admin/fix-old-users', authAdmin, async (req, res) => {
   try {
     console.log('🔧 Starting fix-old-users process...');
@@ -2456,7 +2152,6 @@ app.post('/api/admin/fix-old-users', authAdmin, async (req, res) => {
   }
 });
 
-// ✅ عرض جميع المستخدمين مع created_by_key (للتشخيص)
 app.get('/api/admin/debug-users', authAdmin, async (req, res) => {
   try {
     const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -2509,65 +2204,7 @@ app.get('/api/admin/debug-users', authAdmin, async (req, res) => {
   }
 });
 
-// ✅ نقطة API لاختبار التوقيع (للأغراض التعليمية والتجريبية)
-app.post('/api/test-signature', apiLimiter, (req, res) => {
-  try {
-    const { method, path, body, timestamp, nonce, clientId, secretKey } = req.body;
-    
-    if (!method || !path || !timestamp || !nonce || !clientId || !secretKey) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required parameters'
-      });
-    }
-    
-    // إنشاء السلسلة للتوقيع
-    let stringToSign = '';
-    
-    if (method === 'GET' || method === 'DELETE') {
-      stringToSign = `${method.toUpperCase()}:${path}|${timestamp}|${nonce}`;
-    } else {
-      const bodyString = body ? JSON.stringify(body) : '{}';
-      const bodyHash = crypto.createHash('sha256')
-        .update(bodyString)
-        .digest('hex');
-      stringToSign = `${method.toUpperCase()}:${path}|${bodyHash}|${timestamp}|${nonce}`;
-    }
-    
-    stringToSign += `|${secretKey}`;
-    
-    const signature = crypto.createHmac('sha256', secretKey)
-      .update(stringToSign)
-      .digest('base64')
-      .replace(/=+$/, '');
-    
-    res.json({
-      success: true,
-      data: {
-        signature,
-        string_to_sign: stringToSign,
-        headers_needed: {
-          'x-api-signature': signature,
-          'x-timestamp': timestamp,
-          'x-nonce': nonce,
-          'x-client-id': clientId,
-          'x-api-key': clientId
-        }
-      }
-    });
-    
-  } catch (error) {
-    console.error('Test signature error:', error.message);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to generate signature'
-    });
-  }
-});
-
-// ═══════════════════════════════════════════
-// تنظيف دوري للـ Cache
-// ═══════════════════════════════════════════
+// تنظيف Cache
 setInterval(() => {
   const now = Date.now();
   for (const [apiKey, keyData] of subAdminKeys.entries()) {
@@ -2586,11 +2223,11 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🛡️ Secure API v3.2.0</title>
+  <title>🛡️ Secure API v3.3.0</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: system-ui, -apple-system, sans-serif;
+      font-family: system-ui, sans-serif;
       background: linear-gradient(135deg, #1a1a2e, #16213e);
       color: #fff;
       min-height: 100vh;
@@ -2598,155 +2235,24 @@ app.get('/', (req, res) => {
       text-align: center;
     }
     .container { max-width: 800px; margin: 0 auto; }
-    h1 { color: #4cc9f0; margin-bottom: 20px; font-size: 2.5rem; }
+    h1 { color: #4cc9f0; margin-bottom: 20px; }
     .badge {
       background: linear-gradient(135deg, #10b981, #059669);
       padding: 10px 20px;
       border-radius: 20px;
       display: inline-block;
       margin: 20px 0;
-      font-weight: bold;
-    }
-    .security-badge {
-      background: linear-gradient(135deg, #f59e0b, #d97706);
-      padding: 8px 16px;
-      border-radius: 15px;
-      display: inline-block;
-      margin: 10px 5px;
-      font-size: 0.9rem;
-    }
-    .endpoints {
-      background: rgba(255, 255, 255, 0.05);
-      padding: 30px;
-      border-radius: 15px;
-      text-align: left;
-      margin-top: 30px;
-      border: 2px solid rgba(76, 201, 240, 0.3);
-    }
-    .endpoints h3 {
-      color: #4cc9f0;
-      margin-bottom: 20px;
-      font-size: 1.3rem;
-    }
-    .ep {
-      margin: 10px 0;
-      padding: 12px;
-      background: rgba(255, 255, 255, 0.02);
-      border-radius: 8px;
-      border-left: 3px solid #4cc9f0;
-      font-size: 0.95rem;
-      position: relative;
-    }
-    .ep.signed {
-      border-left-color: #f59e0b;
-    }
-    .m {
-      display: inline-block;
-      padding: 4px 12px;
-      border-radius: 5px;
-      margin-left: 10px;
-      font-weight: bold;
-      font-size: 11px;
-      text-transform: uppercase;
-    }
-    .get { background: #10b981; }
-    .post { background: #f59e0b; }
-    .delete { background: #ef4444; }
-    .patch { background: #8b5cf6; }
-    .signature-badge {
-      position: absolute;
-      right: 10px;
-      top: 10px;
-      background: #f59e0b;
-      color: #000;
-      padding: 2px 8px;
-      border-radius: 10px;
-      font-size: 10px;
-      font-weight: bold;
     }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>🛡️ Secure Firebase Proxy</h1>
-    <div class="badge">✅ v3.2.0 - Signature Protection Enabled</div>
-    
-    <div>
-      <span class="security-badge">🔐 Request Signing</span>
-      <span class="security-badge">🚫 Rate Limiting</span>
-      <span class="security-badge">🛡️ DDoS Protection</span>
-      <span class="security-badge">🔑 API Keys</span>
-    </div>
-    
-    <div class="endpoints">
-      <h3>📋 API Endpoints (التي تتطلب توقيع)</h3>
-      
-      <div class="ep signed">
-        <span class="signature-badge">SIGNED</span>
-        <span class="m post">POST</span>
-        <strong>/api/getUser</strong> - للتطبيق (Mobile App)
-      </div>
-      
-      <div class="ep signed">
-        <span class="signature-badge">SIGNED</span>
-        <span class="m post">POST</span>
-        <strong>/api/verifyAccount</strong> - التحقق من الحساب
-      </div>
-      
-      <div class="ep signed">
-        <span class="signature-badge">SIGNED</span>
-        <span class="m post">POST</span>
-        <strong>/api/updateDevice</strong> - تحديث الجهاز
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/admin/login</strong> - Master Admin login
-      </div>
-      
-      <div class="ep">
-        <span class="m get">GET</span>
-        <strong>/api/admin/users</strong> - Get all users
-      </div>
-      
-      <div class="ep signed">
-        <span class="signature-badge">SIGNED</span>
-        <span class="m post">POST</span>
-        <strong>/api/sub/verify-key</strong> - Sub Admin verify
-      </div>
-      
-      <div class="ep signed">
-        <span class="signature-badge">SIGNED</span>
-        <span class="m get">GET</span>
-        <strong>/api/sub/users</strong> - Sub Admin get users (فقط مستخدميه)
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/admin/fix-old-users</strong> - إصلاح المستخدمين القدامى
-      </div>
-      
-      <div class="ep">
-        <span class="m post">POST</span>
-        <strong>/api/test-signature</strong> - اختبار توليد التوقيع
-      </div>
-    </div>
-    
-    <div style="margin-top: 30px; padding: 20px; background: rgba(245, 158, 11, 0.1); border-radius: 10px; border: 1px solid #f59e0b;">
-      <h4 style="color: #f59e0b;">📝 تعليمات التوقيع:</h4>
-      <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 10px;">
-        يجب إضافة الرؤوس التالية للطلبات الموقعة:<br>
-        • <code>x-api-signature</code>: التوقيع HMAC-SHA256<br>
-        • <code>x-timestamp</code>: الطابع الزمني بالمللي ثانية<br>
-        • <code>x-nonce</code>: قيمة عشوائية فريدة<br>
-        • <code>x-client-id</code>: معرف العميل (API Key)<br>
-        • <code>x-api-key</code>: مفتاح API (اختياري)
-      </p>
-    </div>
-    
-    <p style="margin-top: 30px; color: #64748b; font-size: 0.9rem;">
-      🔒 Protected by Request Signing & Rate Limiting<br>
-      🔐 Sub Admin يرى فقط مستخدميه | ✅ Master Admin كامل الصلاحيات
+    <div class="badge">✅ v3.3.0 - Secure Signature System</div>
+    <p style="margin-top: 30px; color: #64748b;">
+      🔐 Protected by HMAC-SHA256 Signatures<br>
+      🔑 Derived Keys from API Key<br>
+      🛡️ DDoS & Rate Limiting Protection
     </p>
   </div>
 </body>
@@ -2778,23 +2284,12 @@ app.use((err, req, res, next) => {
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
   console.log('═'.repeat(60));
-  console.log('🛡️  Secure Firebase Proxy v3.2.0');
+  console.log('🛡️  Secure Firebase Proxy v3.3.0');
   console.log(`📡 Port: ${PORT}`);
-  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'production'}`);
   console.log('');
-  console.log('✅ Master Admin endpoints ready');
-  console.log('✅ Sub Admin endpoints ready (يرى فقط مستخدميه)');
-  console.log('✅ Mobile App endpoints ready (مع حماية التواقيع)');
-  console.log('✅ Bulk delete expired users ready');
-  console.log('');
-  console.log('🔐 REQUEST SIGNING PROTECTION ENABLED');
-  console.log('   - Mobile app endpoints require signatures');
-  console.log('   - Sub Admin endpoints require signatures');
-  console.log('   - Master Admin endpoints do not require signatures');
-  console.log('');
-  console.log('⚠️  IMPORTANT: For old users, run /api/admin/fix-old-users');
+  console.log('🔐 SECURE SIGNATURE SYSTEM ENABLED');
+  console.log('   - Derived keys from API Key + Salt');
+  console.log('   - No hardcoded secrets in client');
   console.log('');
   console.log('═'.repeat(60));
 });
-
-
