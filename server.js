@@ -532,6 +532,10 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
+
+
+
+
 // ═══════════════════════════════════════════
 // المصادقة - Middlewares
 // ═══════════════════════════════════════════
@@ -791,8 +795,6 @@ app.get('/api/serverTime', apiLimiter, (req, res) => {
   });
 });
 
-
-
 // ═══════════════════════════════════════════
 // 🔍 DEBUG ENDPOINT - لتشخيص مشاكل التوقيع
 // ═══════════════════════════════════════════
@@ -933,6 +935,7 @@ app.post('/api/verifyAccount', verifySignature, authApp, apiLimiter, async (req,
     });
   }
 });
+
 
 
 // ═══════════════════════════════════════════
@@ -1887,12 +1890,13 @@ app.post('/api/admin/unblock-ip', authAdmin, (req, res) => {
     res.json({ success: true, message: `IP ${ip} unblocked` });
 });
 
+
 // ═══════════════════════════════════════════
-// 🔑 SUB ADMIN API - مع حماية التواقيع
+// 🔑 SUB ADMIN API - التحقق من المفتاح
 // ═══════════════════════════════════════════
 
-// التحقق من مفتاح Sub Admin
-app.post('/api/sub/verify-key', verifySignature, apiLimiter, async (req, res) => {
+// ✅ التحقق من مفتاح Sub Admin - بدون verifySignature لأنه أول طلب
+app.post('/api/sub/verify-key', apiLimiter, async (req, res) => {
   try {
     const { apiKey, deviceFingerprint } = req.body;
     
@@ -1971,13 +1975,13 @@ app.post('/api/sub/verify-key', verifySignature, apiLimiter, async (req, res) =>
     
     console.log(`✅ Sub Admin verified: ${foundKey.admin_name} (ID: ${keyId})`);
     
+    // ✅✅✅ إرجاع signing_secret - هذا هو التعديل المهم!
     res.json({
       success: true,
       name: foundKey.admin_name,
       permission: foundKey.permission_level || 'view_only',
-      key_id: keyId,  // ✅ إرجاع معرف المفتاح المهم
-      requires_signing: true, // ✅ إعلام العميل بأنه يحتاج لتوقيع الطلبات
-      signing_guide: 'All future requests must be signed with x-api-signature, x-timestamp, x-nonce headers'
+      key_id: keyId,
+      signing_secret: foundKey.signing_secret  // ⬅️ هذا السطر مهم جداً!
     });
     
   } catch (error) {
