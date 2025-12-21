@@ -328,9 +328,58 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 // ═══════════════════════════════════════════
+// 🔐 دالة مساعدة لجلب signing_secret
+// ═══════════════════════════════════════════
+async function getSubAdminSigningSecret(clientId, currentPath) {
+    try {
+        // 1. تحقق من الكاش أولاً
+        const cachedKey = subAdminKeys.get(clientId);
+        if (cachedKey && cachedKey.signing_secret) {
+            console.log(`🔑 [SIGNATURE] Found in cache: ${clientId.substring(0, 10)}...`);
+            return cachedKey.signing_secret;
+        }
+
+        // 2. للطلب الأول (verify-key): استخدم derived key
+        if (currentPath === '/api/sub/verify-key') {
+            console.log(`🔑 [SIGNATURE] Using derived key for verify-key: ${clientId.substring(0, 10)}...`);
+            return deriveSigningKey(clientId);
+        }
+
+        // 3. للطلبات الأخرى: جلب من Firebase
+        console.log(`🔍 [SIGNATURE] Fetching from Firebase for: ${clientId.substring(0, 10)}...`);
+        
+        const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
+        const keys = response.data || {};
+        
+        let foundKey = null;
+        for (const key of Object.values(keys)) {
+            if (key.api_key === clientId) {
+                foundKey = key;
+                break;
+            }
+        }
+        
+        if (foundKey && foundKey.signing_secret) {
+            // حفظ في الكاش
+            subAdminKeys.set(clientId, foundKey);
+            console.log(`✅ [SIGNATURE] Retrieved secret from Firebase for: ${clientId.substring(0, 10)}...`);
+            return foundKey.signing_secret;
+        }
+        
+        // 4. كحل أخير: استخدام derived key
+        console.warn(`⚠️ [SIGNATURE] Using fallback derived key for: ${clientId.substring(0, 10)}...`);
+        return deriveSigningKey(clientId);
+        
+    } catch (error) {
+        console.error('❌ [SIGNATURE] Error getting signing secret:', error.message);
+        return deriveSigningKey(clientId); // fallback
+    }
+}
+
+// ═══════════════════════════════════════════
 // 🔐 SIGNATURE VERIFICATION MIDDLEWARE
 // ═══════════════════════════════════════════
-const verifySignature = (req, res, next) => {
+const verifySignature = async (req, res, next) => {
     try {
         console.log('🔐 [SIGNATURE] Starting verification for:', req.method, req.path);
         
@@ -403,16 +452,9 @@ const verifySignature = (req, res, next) => {
             keySource = 'master_signing_secret';
         }
         else {
-            // ✅ تحقق من Cache أولاً (للطلبات بعد verify-key)
-            const cachedKey = subAdminKeys.get(clientId);
-            if (cachedKey && cachedKey.signing_secret) {
-                secretKey = cachedKey.signing_secret;
-                keySource = 'cached_sub_admin_secret';
-            } else {
-                // ✅ للطلب الأول (verify-key): توليد من API Key
-                secretKey = deriveSigningKey(clientId);
-                keySource = 'derived_from_api_key';
-            }
+            // 🔄 للحصول على مفتاح Sub Admin
+            secretKey = await getSubAdminSigningSecret(clientId, path);
+            keySource = 'sub_admin_secret';
         }
 
         if (!secretKey) {
@@ -987,7 +1029,7 @@ app.post('/api/admin/logout', authAdmin, (req, res) => {
 });
 
 app.get('/api/admin/verify-session', authAdmin, (req, res) => {
-  const sessionToken = req.headers['x-session-token'];
+  const sessionToken = req.headers['x-session-token');
   const session = adminSessions.get(sessionToken);
   
   if (!session) {
@@ -1668,6 +1710,18 @@ app.post('/api/sub/verify-key', verifySignature, apiLimiter, async (req, res) =>
       });
     }
     
+    // ⚠️ **التعديل الهام**: تأكد من وجود signing_secret
+    if (!foundKey.signing_secret) {
+      // إذا لم يكن موجودًا، قم بإنشاء واحد
+      const newSigningSecret = `SS_${crypto.randomBytes(32).toString('hex')}`;
+      await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, {
+        signing_secret: newSigningSecret,
+        last_secret_update: Date.now()
+      });
+      foundKey.signing_secret = newSigningSecret;
+      console.log(`🔄 Generated new signing secret for: ${keyId}`);
+    }
+    
     if (!foundKey.bound_device) {
       await firebase.patch(`api_keys/${keyId}.json?auth=${FB_KEY}`, { 
         bound_device: deviceFingerprint 
@@ -1685,6 +1739,7 @@ app.post('/api/sub/verify-key', verifySignature, apiLimiter, async (req, res) =>
       last_used: Date.now()
     });
     
+    // ⚠️ **التعديل الهام**: حفظ في الكاش مع signing_secret
     subAdminKeys.set(apiKey, {
       ...foundKey,
       keyId,
@@ -1699,7 +1754,7 @@ app.post('/api/sub/verify-key', verifySignature, apiLimiter, async (req, res) =>
       name: foundKey.admin_name,
       permission: foundKey.permission_level || 'view_only',
       key_id: keyId,
-      signing_secret: foundKey.signing_secret
+      signing_secret: foundKey.signing_secret  // ⚠️ تأكد من إرساله
     });
     
   } catch (error) {
@@ -2204,15 +2259,17 @@ app.get('/api/admin/debug-users', authAdmin, async (req, res) => {
   }
 });
 
-// تنظيف Cache
+// تنظيف الكاش دوريًا
 setInterval(() => {
   const now = Date.now();
   for (const [apiKey, keyData] of subAdminKeys.entries()) {
-    if (now - keyData.last_used > 30 * 60 * 1000) {
+    // حذف إذا لم يستخدم لأكثر من 30 دقيقة
+    if (now - (keyData.last_used || 0) > 30 * 60 * 1000) {
       subAdminKeys.delete(apiKey);
+      console.log(`🧹 Cleared cache for: ${apiKey.substring(0, 10)}...`);
     }
   }
-}, 60 * 60 * 1000);
+}, 15 * 60 * 1000); // كل 15 دقيقة
 
 // ═══════════════════════════════════════════
 // HOME PAGE
