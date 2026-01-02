@@ -120,9 +120,12 @@ const SECURITY_CONFIG = {
         ? process.env.TRUSTED_PROXIES.split(',').map(p => p.trim())
         : ['127.0.0.1'],
     
-    // Exempt Paths
-    EXEMPT_PATHS: ['/health', '/favicon.ico', '/robots.txt', '/api/health'],
+    // Exempt Paths (لا تفحصها)
+    EXEMPT_PATHS: ['/health', '/favicon.ico', '/robots.txt', '/api/health', '/', '/api/serverTime'],
     STATIC_EXTENSIONS: /\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map)$/i,
+    
+    // IPs المستثناة من الفحص (localhost + internal)
+    EXEMPT_IPS: ['127.0.0.1', '::1', '::ffff:127.0.0.1'],
     
     // WAF Settings
     WAF: { 
@@ -971,12 +974,24 @@ const securityMiddleware = async (req, res, next) => {
     try {
         const path = req.path || req.url?.split('?')[0] || '/';
         
-        // Skip static files
+        // Skip static files and exempt paths
         if (SECURITY_CONFIG.STATIC_EXTENSIONS.test(path) || SECURITY_CONFIG.EXEMPT_PATHS.includes(path)) {
             return next();
         }
         
         const ip = getClientIP(req);
+        
+        // ✅ Skip security checks for localhost/internal IPs
+        const isExemptIP = SECURITY_CONFIG.EXEMPT_IPS?.includes(ip) || 
+                          ip === '127.0.0.1' || 
+                          ip === '::1' || 
+                          ip.startsWith('::ffff:127.');
+        
+        if (isExemptIP) {
+            req.security = { ip, requestId, reputation: 100, internal: true };
+            return next();
+        }
+        
         if (!SecureUtils.isValidIP(ip)) {
             return res.status(400).json({ error: 'Invalid request', requestId });
         }
