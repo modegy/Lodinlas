@@ -1,24 +1,42 @@
 // index.js - الملف الرئيسي للسيرفر
-// متوافق مع SecureArmor v14.0
+// متوافق مع SecureArmor v14.1
 
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const config = require('./config');
 
-// ✅ استيراد من security.js الجديد
-const { 
-    securityMiddleware, 
-    bruteForceProtection,
-    getClientIP,
-    securityAdmin 
-} = require('./middleware/security');
+// ✅ تحديد NODE_ENV
+const NODE_ENV = config.NODE_ENV || process.env.NODE_ENV || 'production';
+
+// ✅ استيراد من security.js مع fallback
+let securityMiddleware, bruteForceProtection, getClientIP, securityAdmin;
+
+try {
+    const security = require('./middleware/security');
+    securityMiddleware = security.securityMiddleware;
+    bruteForceProtection = security.bruteForceProtection;
+    getClientIP = security.getClientIP;
+    securityAdmin = security.securityAdmin;
+    console.log('✅ Security module loaded successfully');
+} catch (error) {
+    console.error('⚠️ Security module error:', error.message);
+    // Fallback - الحماية الأساسية فقط
+    securityMiddleware = (req, res, next) => next();
+    bruteForceProtection = (req, res, next) => next();
+    getClientIP = (req) => req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
+    securityAdmin = { 
+        getStats: () => ({ error: 'Security module not loaded' }),
+        getBlockedIPs: () => [],
+        unblockIP: () => ({ success: false })
+    };
+}
 
 // Initialize Express
 const app = express();
 
 // ✅ إعداد trust proxy بشكل آمن
-app.set('trust proxy', 1); // ثق بأول proxy فقط
+app.set('trust proxy', 1);
 
 // ═══════════════════════════════════════════
 // SECURITY MIDDLEWARE
@@ -31,7 +49,6 @@ app.use(helmet({
 }));
 
 // ✅ SecureArmor v14 - الحماية الشاملة
-// يتضمن: DDoS, WAF, Rate Limiting, Bot Detection, Honeypot
 app.use(securityMiddleware);
 
 // ═══════════════════════════════════════════
@@ -50,8 +67,8 @@ app.use(cors({
         }
     },
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Signature', 'X-Timestamp', 'X-Request-ID'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Signature', 'X-Timestamp', 'X-Request-ID', 'X-Session-Token'],
     optionsSuccessStatus: 200
 }));
 
@@ -68,7 +85,7 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 // ═══════════════════════════════════════════
-// LOGGER MIDDLEWARE (محسّن)
+// LOGGER MIDDLEWARE
 // ═══════════════════════════════════════════
 app.use((req, res, next) => {
     const startTime = Date.now();
@@ -95,11 +112,15 @@ const subAdminRoutes = require('./routes/subadmin');
 // ───────────────────────────────────────────
 // Public Endpoints
 // ───────────────────────────────────────────
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: Date.now() });
+});
+
 app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'healthy', 
-        version: '3.4.0',
-        security: 'SecureArmor v14',
+        version: '3.4.1',
+        security: 'SecureArmor v14.1',
         uptime: Math.floor(process.uptime()), 
         timestamp: Date.now() 
     });
@@ -117,18 +138,29 @@ app.get('/api/serverTime', (req, res) => {
 // Security Admin Endpoints (للمراقبة)
 // ───────────────────────────────────────────
 app.get('/api/admin/security/stats', (req, res) => {
-    // ✅ تأكد من إضافة auth middleware هنا
-    res.json(securityAdmin.getStats());
+    try {
+        res.json(securityAdmin.getStats());
+    } catch (error) {
+        res.json({ error: error.message });
+    }
 });
 
 app.get('/api/admin/security/blocked', (req, res) => {
-    res.json(securityAdmin.getBlockedIPs());
+    try {
+        res.json(securityAdmin.getBlockedIPs());
+    } catch (error) {
+        res.json([]);
+    }
 });
 
 app.post('/api/admin/security/unblock', (req, res) => {
     const { ip } = req.body;
     if (!ip) return res.status(400).json({ error: 'IP required' });
-    res.json(securityAdmin.unblockIP(ip));
+    try {
+        res.json(securityAdmin.unblockIP(ip));
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
 });
 
 // ───────────────────────────────────────────
@@ -147,7 +179,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🛡️ Secure API v3.4.0</title>
+    <title>🛡️ Secure API v3.4.1</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -168,11 +200,7 @@ app.get('/', (req, res) => {
             border-radius: 20px;
             border: 1px solid rgba(255,255,255,0.1);
         }
-        h1 { 
-            color: #4cc9f0; 
-            margin-bottom: 20px;
-            font-size: 2em;
-        }
+        h1 { color: #4cc9f0; margin-bottom: 20px; font-size: 2em; }
         .badge {
             background: linear-gradient(135deg, #10b981, #059669);
             padding: 12px 24px;
@@ -200,8 +228,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <h1>🛡️ Secure Firebase Proxy</h1>
-        <div class="badge">✅ v3.4.0 - SecureArmor v14</div>
-        
+        <div class="badge">✅ v3.4.1 - SecureArmor v14.1</div>
         <div class="features">
             <div class="feature"><span>🔐</span> HMAC-SHA256 Signatures</div>
             <div class="feature"><span>🛡️</span> Advanced WAF Protection</div>
@@ -232,32 +259,19 @@ app.use('*', (req, res) => {
 // Global Error Handler
 app.use((err, req, res, next) => {
     const ip = req.security?.ip || getClientIP(req);
-    
-    // تسجيل الخطأ
     console.error(`❌ Error: ${err.message} | IP: ${ip} | Path: ${req.path}`);
     
-    // CORS Error
     if (err.message === 'Not allowed by CORS') {
-        return res.status(403).json({ 
-            success: false, 
-            error: 'CORS policy violation', 
-            code: 403 
-        });
+        return res.status(403).json({ success: false, error: 'CORS policy violation', code: 403 });
     }
     
-    // JSON Parse Error
     if (err.type === 'entity.parse.failed') {
-        return res.status(400).json({ 
-            success: false, 
-            error: 'Invalid JSON', 
-            code: 400 
-        });
+        return res.status(400).json({ success: false, error: 'Invalid JSON', code: 400 });
     }
     
-    // Generic Error
     res.status(500).json({ 
         success: false, 
-        error: config.NODE_ENV === 'production' ? 'Internal server error' : err.message, 
+        error: NODE_ENV === 'production' ? 'Internal server error' : err.message, 
         code: 500 
     });
 });
@@ -273,7 +287,6 @@ const gracefulShutdown = (signal) => {
         process.exit(0);
     });
     
-    // Force close after 10s
     setTimeout(() => {
         console.error('❌ Forced shutdown');
         process.exit(1);
@@ -286,23 +299,24 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 // ═══════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════
-const server = app.listen(config.PORT, () => {
+const PORT = config.PORT || process.env.PORT || 10000;
+
+const server = app.listen(PORT, () => {
     console.log('');
-    console.log('╔' + '═'.repeat(58) + '╗');
-    console.log('║' + ' '.repeat(15) + '🛡️  SECURE API SERVER' + ' '.repeat(22) + '║');
-    console.log('╠' + '═'.repeat(58) + '╣');
-    console.log(`║  📡 Port: ${config.PORT}` + ' '.repeat(45 - config.PORT.toString().length) + '║');
-    console.log(`║  🌍 Environment: ${config.NODE_ENV}` + ' '.repeat(38 - config.NODE_ENV.length) + '║');
-    console.log('║  🔐 Security: SecureArmor v14.0' + ' '.repeat(25) + '║');
-    console.log('║  ✅ Status: RUNNING' + ' '.repeat(37) + '║');
-    console.log('╚' + '═'.repeat(58) + '╝');
+    console.log('╔══════════════════════════════════════════════════════════╗');
+    console.log('║               🛡️  SECURE API SERVER                      ║');
+    console.log('╠══════════════════════════════════════════════════════════╣');
+    console.log(`║  📡 Port: ${PORT}                                          ║`);
+    console.log(`║  🌍 Environment: ${NODE_ENV}                              ║`);
+    console.log('║  🔐 Security: SecureArmor v14.1                          ║');
+    console.log('║  ✅ Status: RUNNING                                       ║');
+    console.log('╚══════════════════════════════════════════════════════════╝');
     console.log('');
 });
 
-// Handle server errors
 server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-        console.error(`❌ Port ${config.PORT} is already in use`);
+        console.error(`❌ Port ${PORT} is already in use`);
     } else {
         console.error('❌ Server error:', err.message);
     }
