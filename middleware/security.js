@@ -77,34 +77,74 @@ const SecureUtils = {
 // CONFIGURATION - الإعدادات المحسّنة
 // ============================================
 const SECURITY_CONFIG = {
+    // Rate Limits
     RATE_LIMITS: {
-        global: { capacity: config.SECURITY?.RATE_LIMITS?.GLOBAL?.capacity || 100, refillRate: config.SECURITY?.RATE_LIMITS?.GLOBAL?.refill || 10 },
-        auth: { capacity: config.SECURITY?.RATE_LIMITS?.AUTH?.capacity || 5, refillRate: config.SECURITY?.RATE_LIMITS?.AUTH?.refill || 0.5 },
-        api: { capacity: config.SECURITY?.RATE_LIMITS?.API?.capacity || 50, refillRate: config.SECURITY?.RATE_LIMITS?.API?.refill || 5 },
-        admin: { capacity: config.SECURITY?.RATE_LIMITS?.ADMIN?.capacity || 20, refillRate: config.SECURITY?.RATE_LIMITS?.ADMIN?.refill || 2 }
+        global: { 
+            capacity: config.SECURITY?.RATE_LIMITS?.GLOBAL?.capacity || 100, 
+            refillRate: config.SECURITY?.RATE_LIMITS?.GLOBAL?.refill || 10 
+        },
+        auth: { 
+            capacity: config.SECURITY?.RATE_LIMITS?.AUTH?.capacity || 5, 
+            refillRate: config.SECURITY?.RATE_LIMITS?.AUTH?.refill || 0.5 
+        },
+        api: { 
+            capacity: config.SECURITY?.RATE_LIMITS?.API?.capacity || 50, 
+            refillRate: config.SECURITY?.RATE_LIMITS?.API?.refill || 5 
+        },
+        admin: { 
+            capacity: config.SECURITY?.RATE_LIMITS?.ADMIN?.capacity || 20, 
+            refillRate: config.SECURITY?.RATE_LIMITS?.ADMIN?.refill || 2 
+        }
     },
+    
+    // Protection Settings
     PROTECTION_LEVEL: config.SECURITY?.PROTECTION_LEVEL || 'balanced',
     ENABLE_WAF: config.SECURITY?.ENABLE_WAF !== false,
     ENABLE_RATE_LIMIT: config.SECURITY?.ENABLE_RATE_LIMIT !== false,
-    ANOMALY_THRESHOLD: config.SECURITY?.ANOMALY_THRESHOLD || 70,
-    APPEAL_CONTACT: config.SECURITY?.APPEAL_CONTACT || 'security@yourdomain.com',
-    ALERT_WEBHOOK: config.SECURITY?.ALERT_WEBHOOK || null,
-    IP_CACHE_TTL: (config.SECURITY?.IP_CACHE_TTL || 300) * 1000,
+    ENABLE_BOT_DETECTION: config.SECURITY?.ENABLE_BOT_DETECTION !== false,
+    ENABLE_HONEYPOT: config.SECURITY?.ENABLE_HONEYPOT !== false,
     
-    // ✅ إصلاح #2: تعريف SOFT_BLOCK_VIOLATIONS
+    // Thresholds
+    ANOMALY_THRESHOLD: config.SECURITY?.ANOMALY_THRESHOLD || 70,
     SOFT_BLOCK_VIOLATIONS: config.SECURITY?.SOFT_BLOCK_VIOLATIONS || 3,
     
-    // ✅ إصلاح #1: Trusted Proxies محددة بدقة
+    // Contact & Alerts
+    APPEAL_CONTACT: config.SECURITY?.APPEAL_CONTACT || 'security@yourdomain.com',
+    ALERT_WEBHOOK: config.SECURITY?.ALERT_WEBHOOK || null,
+    
+    // Cache TTL
+    IP_CACHE_TTL: (config.SECURITY?.IP_CACHE_TTL || 300) * 1000,
+    
+    // Trusted Proxies
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES 
         ? process.env.TRUSTED_PROXIES.split(',').map(p => p.trim())
         : ['127.0.0.1'],
     
-    EXEMPT_PATHS: ['/health', '/favicon.ico', '/robots.txt'],
+    // Exempt Paths
+    EXEMPT_PATHS: ['/health', '/favicon.ico', '/robots.txt', '/api/health'],
     STATIC_EXTENSIONS: /\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map)$/i,
     
-    WAF: { maxURLLength: 2048, maxBodySize: 1048576, blockThreshold: 10 },
-    DDOS: { globalRPS: 10000, ipRPS: 50, burstLimit: 100 },
-    BRUTE_FORCE: { maxAttempts: 5, lockoutTime: 900000, escalationMultiplier: 2, maxLockoutTime: 86400000 }
+    // WAF Settings
+    WAF: { 
+        maxURLLength: config.SECURITY?.WAF?.MAX_URL_LENGTH || 2048, 
+        maxBodySize: config.SECURITY?.WAF?.MAX_BODY_SIZE || 1048576, 
+        blockThreshold: config.SECURITY?.WAF?.BLOCK_THRESHOLD || 10 
+    },
+    
+    // DDoS Settings
+    DDOS: { 
+        globalRPS: config.SECURITY?.DDOS?.GLOBAL_RPS || 10000, 
+        ipRPS: config.SECURITY?.DDOS?.IP_RPS || 50, 
+        burstLimit: config.SECURITY?.DDOS?.BURST_LIMIT || 100 
+    },
+    
+    // Brute Force Settings
+    BRUTE_FORCE: { 
+        maxAttempts: config.SECURITY?.BRUTE_FORCE?.MAX_ATTEMPTS || 5, 
+        lockoutTime: config.SECURITY?.BRUTE_FORCE?.LOCKOUT_TIME || 900000, 
+        escalationMultiplier: config.SECURITY?.BRUTE_FORCE?.ESCALATION_MULTIPLIER || 2, 
+        maxLockoutTime: config.SECURITY?.BRUTE_FORCE?.MAX_LOCKOUT_TIME || 86400000 
+    }
 };
 
 // ============================================
