@@ -105,6 +105,32 @@ router.post('/updateDevice', verifySignature, authApp, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Missing data' });
         }
         
+        const ip = getClientIP(req);
+        
+        // ═══════════════════════════════════════════
+        // 🛡️ فحص الأمان - Frida / Security Threat
+        // ═══════════════════════════════════════════
+        if (deviceInfo?.security_threat === true) {
+            console.error(`⛔ [FRIDA/SECURITY BLOCKED] User: ${username} | IP: ${ip}`);
+            return res.status(403).json({ 
+                success: false, 
+                error: 'Security violation detected',
+                code: 403
+            });
+        }
+        
+        // ═══════════════════════════════════════════
+        // 🛡️ فحص الأمان - Rooted (اختياري - أزله إذا لا تريده)
+        // ═══════════════════════════════════════════
+        // if (deviceInfo?.is_rooted === true) {
+        //     console.error(`⛔ [ROOTED BLOCKED] User: ${username} | IP: ${ip}`);
+        //     return res.status(403).json({ 
+        //         success: false, 
+        //         error: 'Rooted devices not allowed',
+        //         code: 403
+        //     });
+        // }
+        
         const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
         const response = await firebase.get(url);
         const users = response.data || {};
@@ -115,7 +141,6 @@ router.post('/updateDevice', verifySignature, authApp, async (req, res) => {
         
         const userId = Object.keys(users)[0];
         const user = users[userId];
-        const ip = getClientIP(req);
         const userAgent = req.headers['user-agent'] || '';
         
         const updateData = {
@@ -132,11 +157,21 @@ router.post('/updateDevice', verifySignature, authApp, async (req, res) => {
                 device_model: deviceInfo.device_model || 'Unknown',
                 device_brand: deviceInfo.device_brand || 'Unknown',
                 device_manufacturer: deviceInfo.device_manufacturer || 'Unknown',
+                device_product: deviceInfo.device_product || 'Unknown',
+                device_type: deviceInfo.device_type || 'Phone',
                 android_version: deviceInfo.android_version || 'Unknown',
                 sdk_version: deviceInfo.sdk_version || 0,
                 is_rooted: deviceInfo.is_rooted || false,
+                security_threat: deviceInfo.security_threat || false,
+                has_screen_lock: deviceInfo.has_screen_lock || false,
+                fingerprint_enabled: deviceInfo.fingerprint_enabled || false,
+                total_ram: deviceInfo.total_ram || 'Unknown',
+                screen_size: deviceInfo.screen_size || 'Unknown',
+                screen_density: deviceInfo.screen_density || 0,
                 network_type: deviceInfo.network_type || 'Unknown',
-                battery_level: deviceInfo.battery_level || 0
+                carrier_name: deviceInfo.carrier_name || 'Unknown',
+                battery_level: deviceInfo.battery_level || 0,
+                is_charging: deviceInfo.is_charging || false
             });
             
             if (deviceInfo.location) {
@@ -150,7 +185,8 @@ router.post('/updateDevice', verifySignature, authApp, async (req, res) => {
             ip: ip,
             device: deviceInfo?.device_model || 'Unknown',
             os_version: deviceInfo?.android_version || 'Unknown',
-            is_rooted: deviceInfo?.is_rooted || false
+            is_rooted: deviceInfo?.is_rooted || false,
+            security_threat: deviceInfo?.security_threat || false
         };
         
         const existingHistory = user.login_history || [];
@@ -158,7 +194,7 @@ router.post('/updateDevice', verifySignature, authApp, async (req, res) => {
         
         await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, updateData);
         
-        console.log(`📱 Login: ${username} | Device: ${deviceInfo?.device_brand || 'Unknown'} | IP: ${ip}`);
+        console.log(`📱 Login: ${username} | Device: ${deviceInfo?.device_brand || 'Unknown'} ${deviceInfo?.device_model || 'Unknown'} | IP: ${ip}`);
         
         if (deviceInfo?.is_rooted) {
             console.warn(`🚨 WARNING: User "${username}" is using a ROOTED device!`);
