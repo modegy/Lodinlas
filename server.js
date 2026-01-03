@@ -1,5 +1,5 @@
 // index.js - Hardened for Render (Admin UNTOUCHED)
-
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -14,7 +14,7 @@ const IS_PROD = NODE_ENV === 'production';
 
 // ───────────────────────────────────────────
 // LOAD SECURITY MODULE (MANDATORY IN PROD)
-// ───────────────────────────────────────────
+// ──────────────────────────────────────────
 let securityMiddleware, bruteForceProtection, getClientIP, securityAdmin;
 
 try {
