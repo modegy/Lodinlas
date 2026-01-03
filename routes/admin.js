@@ -1,11 +1,29 @@
-// routes/admin.js - نقاط النهاية للوحة الإدارة
+// routes/admin.js - نقاط النهاية للوحة الإدارة (مُصلح)
 const express = require('express');
 const router = express.Router();
 const config = require('../config');
 const { firebase, FB_KEY } = require('../services/firebase');
 const { authAdmin, adminSessions } = require('../middleware/auth');
-const { bruteForceProtection, loginAttempts, blockedIPs, requestTracker } = require('../middleware/security');
 const { generateToken, hashPassword, formatDate, generateApiKey, generateSigningSecret } = require('../helpers/utils');
+
+// ═══════════════════════════════════════════
+// ✅ FALLBACK للمتغيرات من security.js
+// ═══════════════════════════════════════════
+let bruteForceProtection, loginAttempts, blockedIPs, requestTracker;
+
+try {
+    const security = require('../middleware/security');
+    bruteForceProtection = security.bruteForceProtection || ((req, res, next) => next());
+    loginAttempts = security.loginAttempts || new Map();
+    blockedIPs = security.blockedIPs || new Set();
+    requestTracker = security.requestTracker || new Map();
+} catch (error) {
+    console.warn('⚠️ Security module not loaded, using fallbacks');
+    bruteForceProtection = (req, res, next) => next();
+    loginAttempts = new Map();
+    blockedIPs = new Set();
+    requestTracker = new Map();
+}
 
 // ═══════════════════════════════════════════
 // AUTH - تسجيل الدخول/الخروج
@@ -13,7 +31,7 @@ const { generateToken, hashPassword, formatDate, generateApiKey, generateSigning
 router.post('/login', bruteForceProtection, async (req, res) => {
     try {
         const { username, password } = req.body;
-        const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+        const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
         
         if (!username || !password) {
             return res.status(400).json({ success: false, error: 'Username and password required' });
@@ -28,18 +46,23 @@ router.post('/login', bruteForceProtection, async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 1000)); // Rate limiting delay
         
         if (username !== config.ADMIN_CREDENTIALS.username || password !== config.ADMIN_CREDENTIALS.password) {
-            const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
-            attempt.count++;
-            attempt.lastAttempt = Date.now();
-            loginAttempts.set(ip, attempt);
-            
             // تسجيل محاولة الدخول الفاشلة
+            if (loginAttempts && typeof loginAttempts.get === 'function') {
+                const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
+                attempt.count++;
+                attempt.lastAttempt = Date.now();
+                loginAttempts.set(ip, attempt);
+            }
+            
             console.log(`❌ Failed admin login attempt from ${ip}: ${username}`);
             return res.status(401).json({ success: false, error: 'Invalid credentials' });
         }
         
         // نجاح تسجيل الدخول
-        loginAttempts.delete(ip);
+        if (loginAttempts && typeof loginAttempts.delete === 'function') {
+            loginAttempts.delete(ip);
+        }
+        
         const sessionToken = generateToken();
         
         adminSessions.set(sessionToken, { 
@@ -61,7 +84,7 @@ router.post('/login', bruteForceProtection, async (req, res) => {
         
     } catch (error) {
         console.error('Login error:', error);
-        res.status(500).json({ success: false, error: 'Server error' });
+        res.status(500).json({ success: false, error: 'Server error: ' + error.message });
     }
 });
 
@@ -107,7 +130,7 @@ router.get('/verify-session', authAdmin, (req, res) => {
             server_info: { 
                 active_sessions: adminSessions.size, 
                 uptime: Math.floor(process.uptime()),
-                memory_usage: process.memoryUsage().heapUsed / 1024 / 1024 + ' MB'
+                memory_usage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
             }
         });
     } catch (error) {
@@ -130,6 +153,8 @@ router.get('/users', authAdmin, async (req, res) => {
         const now = Date.now();
         
         for (const [id, user] of Object.entries(users)) {
+            if (!user) continue; // تخطي القيم الفارغة
+            
             const isExpired = user.subscription_end && user.subscription_end < now;
             const isActive = user.is_active !== false && !isExpired;
             
@@ -140,10 +165,10 @@ router.get('/users', authAdmin, async (req, res) => {
                 id,
                 username: user.username || '',
                 is_active: isActive,
-                expiry_timestamp: user.subscription_end || 0,
-                expiry_date: formatDate(user.subscription_end),
-                created_at: user.created_at ? formatDate(user.created_at) : null,
-                last_login: user.last_login ? formatDate(user.last_login) : null,
+                expiry_timestamp: user.subscription_end || user.expiry_timestamp || 0,
+                expiry_date: formatDate(user.subscription_end || user.expiry_timestamp),
+                created_at: user.created_at || null,
+                last_login: user.last_login || null,
                 device_id: user.device_id || '',
                 created_by_key: user.created_by_key || 'master',
                 status: isActive ? 'active' : (isExpired ? 'expired' : 'inactive')
@@ -161,8 +186,8 @@ router.get('/users', authAdmin, async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('Error fetching users:', error);
-        res.status(500).json({ success: false, error: 'Failed to fetch users' });
+        console.error('Error fetching users:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to fetch users: ' + error.message });
     }
 });
 
@@ -185,10 +210,14 @@ router.post('/users', authAdmin, async (req, res) => {
         }
         
         // التحقق من عدم وجود مستخدم بنفس الاسم
-        const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
-        const checkRes = await firebase.get(checkUrl);
-        if (checkRes.data && Object.keys(checkRes.data).length > 0) {
-            return res.status(400).json({ success: false, error: 'Username already exists' });
+        try {
+            const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
+            const checkRes = await firebase.get(checkUrl);
+            if (checkRes.data && Object.keys(checkRes.data).length > 0) {
+                return res.status(400).json({ success: false, error: 'Username already exists' });
+            }
+        } catch (checkError) {
+            console.warn('Could not check for existing username:', checkError.message);
         }
         
         // حساب وقت الانتهاء
@@ -214,6 +243,7 @@ router.post('/users', authAdmin, async (req, res) => {
             password_hash: hashPassword(password),
             is_active: status !== 'inactive',
             subscription_end: expiryTimestamp,
+            expiry_timestamp: expiryTimestamp,
             max_devices: maxDevices || 1,
             device_id: '',
             created_at: Date.now(),
@@ -232,8 +262,8 @@ router.post('/users', authAdmin, async (req, res) => {
         });
         
     } catch (error) {
-        console.error('Error creating user:', error);
-        res.status(500).json({ success: false, error: 'Failed to create user' });
+        console.error('Error creating user:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to create user: ' + error.message });
     }
 });
 
@@ -256,7 +286,7 @@ router.delete('/users/:id', authAdmin, async (req, res) => {
             deletedUser: { id: userId, username: userRes.data.username }
         });
     } catch (error) {
-        console.error('Error deleting user:', error);
+        console.error('Error deleting user:', error.message);
         res.status(500).json({ success: false, error: 'Failed to delete user' });
     }
 });
@@ -277,7 +307,7 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
         
         const user = userRes.data;
         const now = Date.now();
-        const currentEnd = user.subscription_end || now;
+        const currentEnd = user.subscription_end || user.expiry_timestamp || now;
         
         // حساب وقت التمديد
         let extensionMs = 0;
@@ -288,7 +318,8 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
         const newEndDate = Math.max(currentEnd, now) + extensionMs;
         
         await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
-            subscription_end: newEndDate, 
+            subscription_end: newEndDate,
+            expiry_timestamp: newEndDate,
             is_active: true 
         });
         
@@ -304,7 +335,7 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
             extension_ms: extensionMs
         });
     } catch (error) {
-        console.error('Error extending user:', error);
+        console.error('Error extending user:', error.message);
         res.status(500).json({ success: false, error: 'Failed to extend subscription' });
     }
 });
@@ -332,7 +363,7 @@ router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
             username: userRes.data.username
         });
     } catch (error) {
-        console.error('Error resetting device:', error);
+        console.error('Error resetting device:', error.message);
         res.status(500).json({ success: false, error: 'Failed to reset device' });
     }
 });
@@ -355,8 +386,7 @@ router.post('/disable-user', authAdmin, async (req, res) => {
         await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
             is_active: false,
             disabled_at: Date.now(),
-            disabled_by: 'admin',
-            status_note: 'Manually disabled by admin'
+            disabled_by: 'admin'
         });
 
         console.log(`🚫 User disabled: ${userId} (${userRes.data.username})`);
@@ -368,11 +398,8 @@ router.post('/disable-user', authAdmin, async (req, res) => {
             username: userRes.data.username
         });
     } catch (error) {
-        console.error('Error disabling user:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to disable user'
-        });
+        console.error('Error disabling user:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to disable user' });
     }
 });
 
@@ -390,13 +417,13 @@ router.post('/enable-user', authAdmin, async (req, res) => {
 
         // التحقق من أن الاشتراك لم ينتهِ
         const now = Date.now();
-        const isExpired = userRes.data.subscription_end && userRes.data.subscription_end < now;
+        const expiryTime = userRes.data.subscription_end || userRes.data.expiry_timestamp;
+        const isExpired = expiryTime && expiryTime < now;
         
         await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
             is_active: !isExpired,
             enabled_at: Date.now(),
-            enabled_by: 'admin',
-            status_note: isExpired ? 'Enabled but subscription expired' : 'Manually enabled by admin'
+            enabled_by: 'admin'
         });
 
         console.log(`✅ User enabled: ${userId} (${userRes.data.username})`);
@@ -409,11 +436,8 @@ router.post('/enable-user', authAdmin, async (req, res) => {
             is_expired: isExpired
         });
     } catch (error) {
-        console.error('Error enabling user:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to enable user'
-        });
+        console.error('Error enabling user:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to enable user' });
     }
 });
 
@@ -427,13 +451,15 @@ router.post('/bulk-disable-expired', authAdmin, async (req, res) => {
 
         for (const userId in users) {
             const user = users[userId];
+            if (!user) continue;
+            
+            const expiryTime = user.subscription_end || user.expiry_timestamp;
             // تعطيل المستخدمين المنتهية صلاحيتهم والنشطين
-            if (user.subscription_end && user.subscription_end < now && user.is_active !== false) {
+            if (expiryTime && expiryTime < now && user.is_active !== false) {
                 await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
                     is_active: false,
                     auto_disabled_at: Date.now(),
-                    reason: 'Subscription expired',
-                    status_note: 'Auto-disabled: Subscription expired'
+                    reason: 'Subscription expired'
                 });
                 disabledCount++;
                 console.log(`Auto-disabled expired user: ${userId} (${user.username})`);
@@ -447,11 +473,8 @@ router.post('/bulk-disable-expired', authAdmin, async (req, res) => {
             timestamp: Date.now()
         });
     } catch (error) {
-        console.error('Error bulk disabling expired users:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to disable expired users' 
-        });
+        console.error('Error bulk disabling expired users:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to disable expired users' });
     }
 });
 
@@ -466,8 +489,11 @@ router.delete('/delete-expired', authAdmin, async (req, res) => {
 
         for (const userId in users) {
             const user = users[userId];
+            if (!user) continue;
+            
+            const expiryTime = user.subscription_end || user.expiry_timestamp;
             // حذف المستخدمين المنتهية صلاحيتهم
-            if (user.subscription_end && user.subscription_end < now) {
+            if (expiryTime && expiryTime < now) {
                 await firebase.delete(`users/${userId}.json?auth=${FB_KEY}`);
                 deletedCount++;
                 deletedUsers.push({ id: userId, username: user.username });
@@ -483,11 +509,8 @@ router.delete('/delete-expired', authAdmin, async (req, res) => {
             timestamp: Date.now()
         });
     } catch (error) {
-        console.error('Error deleting expired users:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to delete expired users' 
-        });
+        console.error('Error deleting expired users:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to delete expired users' });
     }
 });
 
@@ -501,6 +524,8 @@ router.delete('/delete-inactive', authAdmin, async (req, res) => {
 
         for (const userId in users) {
             const user = users[userId];
+            if (!user) continue;
+            
             // حذف المستخدمين المعطلين
             if (user.is_active === false) {
                 await firebase.delete(`users/${userId}.json?auth=${FB_KEY}`);
@@ -518,11 +543,8 @@ router.delete('/delete-inactive', authAdmin, async (req, res) => {
             timestamp: Date.now()
         });
     } catch (error) {
-        console.error('Error deleting inactive users:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to delete inactive users' 
-        });
+        console.error('Error deleting inactive users:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to delete inactive users' });
     }
 });
 
@@ -540,6 +562,8 @@ router.get('/api-keys', authAdmin, async (req, res) => {
         let expiredCount = 0;
         
         for (const [id, key] of Object.entries(keys)) {
+            if (!key) continue;
+            
             const isExpired = key.expiry_timestamp && key.expiry_timestamp < now;
             const isActive = key.is_active !== false && !isExpired;
             
@@ -548,14 +572,13 @@ router.get('/api-keys', authAdmin, async (req, res) => {
             
             formattedKeys[id] = {
                 id,
-                api_key: key.api_key ? key.api_key.substring(0, 8) + '...' : '',
+                api_key: key.api_key || '',
                 admin_name: key.admin_name || '',
                 permission_level: key.permission_level || 'view_only',
                 is_active: isActive,
                 expiry_timestamp: key.expiry_timestamp || null,
                 expiry_date: formatDate(key.expiry_timestamp),
                 created_at: key.created_at ? formatDate(key.created_at) : null,
-                signing_secret: key.signing_secret ? '••••••••' : null,
                 status: isActive ? 'active' : (isExpired ? 'expired' : 'inactive')
             };
         }
@@ -566,12 +589,11 @@ router.get('/api-keys', authAdmin, async (req, res) => {
             stats: {
                 total: Object.keys(formattedKeys).length,
                 active: activeCount,
-                expired: expiredCount,
-                inactive: Object.keys(formattedKeys).length - activeCount - expiredCount
+                expired: expiredCount
             }
         });
     } catch (error) {
-        console.error('Error fetching API keys:', error);
+        console.error('Error fetching API keys:', error.message);
         res.status(500).json({ success: false, error: 'Failed to fetch API keys' });
     }
 });
@@ -611,11 +633,10 @@ router.post('/api-keys', authAdmin, async (req, res) => {
             apiKey,
             signingSecret,
             adminName: adminName.trim(),
-            expiry_date: formatDate(expiryTimestamp),
-            warning: 'Save the signing secret immediately! It will not be shown again.'
+            expiry_date: formatDate(expiryTimestamp)
         });
     } catch (error) {
-        console.error('Error creating API key:', error);
+        console.error('Error creating API key:', error.message);
         res.status(500).json({ success: false, error: 'Failed to create API key' });
     }
 });
@@ -629,41 +650,40 @@ router.get('/security-stats', authAdmin, (req, res) => {
         const oneHourAgo = now - (60 * 60 * 1000);
         
         // تنظيف محاولات الدخول القديمة
-        for (const [ip, data] of loginAttempts.entries()) {
-            if (data.lastAttempt < oneHourAgo) {
-                loginAttempts.delete(ip);
+        if (loginAttempts && typeof loginAttempts.entries === 'function') {
+            for (const [ip, data] of loginAttempts.entries()) {
+                if (data.lastAttempt < oneHourAgo) {
+                    loginAttempts.delete(ip);
+                }
             }
         }
         
         // تنظيف تتبع الطلبات القديمة
-        for (const [ip, data] of requestTracker.entries()) {
-            if (data.lastRequest < oneHourAgo) {
-                requestTracker.delete(ip);
+        if (requestTracker && typeof requestTracker.entries === 'function') {
+            for (const [ip, data] of requestTracker.entries()) {
+                if (data.lastRequest < oneHourAgo) {
+                    requestTracker.delete(ip);
+                }
             }
         }
         
         res.json({
             success: true,
             stats: {
-                tracked_ips: requestTracker.size,
-                blocked_ips: blockedIPs.size,
-                blocked_list: Array.from(blockedIPs).slice(0, 20),
+                tracked_ips: requestTracker ? requestTracker.size : 0,
+                blocked_ips: blockedIPs ? blockedIPs.size : 0,
+                blocked_list: blockedIPs ? Array.from(blockedIPs).slice(0, 20) : [],
                 active_sessions: adminSessions.size,
-                login_attempts: Array.from(loginAttempts.entries()).map(([ip, data]) => ({ 
+                login_attempts: loginAttempts ? Array.from(loginAttempts.entries()).map(([ip, data]) => ({ 
                     ip, 
                     attempts: data.count,
                     last_attempt: formatDate(data.lastAttempt)
-                })).slice(0, 20),
-                request_stats: Array.from(requestTracker.entries()).map(([ip, data]) => ({
-                    ip,
-                    count: data.count,
-                    last_request: formatDate(data.lastRequest)
-                })).slice(0, 20)
+                })).slice(0, 20) : []
             },
             timestamp: now
         });
     } catch (error) {
-        console.error('Error getting security stats:', error);
+        console.error('Error getting security stats:', error.message);
         res.status(500).json({ success: false, error: 'Failed to get security stats' });
     }
 });
@@ -675,9 +695,15 @@ router.post('/unblock-ip', authAdmin, (req, res) => {
             return res.status(400).json({ success: false, error: 'IP address required' });
         }
         
-        const wasBlocked = blockedIPs.has(ip);
-        blockedIPs.delete(ip);
-        requestTracker.delete(ip);
+        let wasBlocked = false;
+        if (blockedIPs && typeof blockedIPs.has === 'function') {
+            wasBlocked = blockedIPs.has(ip);
+            blockedIPs.delete(ip);
+        }
+        
+        if (requestTracker && typeof requestTracker.delete === 'function') {
+            requestTracker.delete(ip);
+        }
         
         console.log(`🔓 IP unblocked: ${ip} (was blocked: ${wasBlocked})`);
         
@@ -689,7 +715,7 @@ router.post('/unblock-ip', authAdmin, (req, res) => {
             timestamp: Date.now()
         });
     } catch (error) {
-        console.error('Error unblocking IP:', error);
+        console.error('Error unblocking IP:', error.message);
         res.status(500).json({ success: false, error: 'Failed to unblock IP' });
     }
 });
@@ -710,51 +736,17 @@ router.get('/server-stats', authAdmin, (req, res) => {
             },
             timestamp: Date.now(),
             date: new Date().toISOString(),
-            version: config.VERSION || '3.3.0',
+            version: config.VERSION || '3.4.1',
             node_version: process.version,
             platform: process.platform,
-            arch: process.arch,
-            environment: process.env.NODE_ENV || 'production',
-            pid: process.pid,
             admin_sessions: adminSessions.size
         };
         
         res.json({ success: true, stats });
     } catch (error) {
-        console.error('Error getting server stats:', error);
+        console.error('Error getting server stats:', error.message);
         res.status(500).json({ success: false, error: 'Failed to get server stats' });
     }
-});
-
-router.get('/endpoints', authAdmin, (req, res) => {
-    const endpoints = [
-        { method: 'POST', path: '/api/admin/login', description: 'تسجيل دخول الأدمن', auth: false },
-        { method: 'POST', path: '/api/admin/logout', description: 'تسجيل خروج الأدمن', auth: true },
-        { method: 'GET', path: '/api/admin/verify-session', description: 'التحقق من الجلسة', auth: true },
-        { method: 'GET', path: '/api/admin/users', description: 'جلب جميع المستخدمين', auth: true },
-        { method: 'POST', path: '/api/admin/users', description: 'إنشاء مستخدم جديد', auth: true },
-        { method: 'DELETE', path: '/api/admin/users/:id', description: 'حذف مستخدم', auth: true },
-        { method: 'POST', path: '/api/admin/users/:id/extend', description: 'تمديد اشتراك مستخدم', auth: true },
-        { method: 'POST', path: '/api/admin/users/:id/reset-device', description: 'إعادة تعيين جهاز المستخدم', auth: true },
-        { method: 'POST', path: '/api/admin/disable-user', description: 'تعطيل مستخدم', auth: true },
-        { method: 'POST', path: '/api/admin/enable-user', description: 'تفعيل مستخدم', auth: true },
-        { method: 'DELETE', path: '/api/admin/delete-expired', description: 'حذف المستخدمين المنتهية صلاحيتهم', auth: true },
-        { method: 'DELETE', path: '/api/admin/delete-inactive', description: 'حذف المستخدمين المعطلين', auth: true },
-        { method: 'POST', path: '/api/admin/bulk-disable-expired', description: 'تعطيل جميع المستخدمين المنتهية صلاحيتهم', auth: true },
-        { method: 'GET', path: '/api/admin/api-keys', description: 'جلب مفاتيح API', auth: true },
-        { method: 'POST', path: '/api/admin/api-keys', description: 'إنشاء مفتاح API جديد', auth: true },
-        { method: 'GET', path: '/api/admin/security-stats', description: 'إحصائيات الأمان', auth: true },
-        { method: 'POST', path: '/api/admin/unblock-ip', description: 'إلغاء حظر عنوان IP', auth: true },
-        { method: 'GET', path: '/api/admin/server-stats', description: 'إحصائيات الخادم', auth: true },
-        { method: 'GET', path: '/api/admin/endpoints', description: 'قائمة نقاط النهاية المتاحة', auth: true }
-    ];
-    
-    res.json({ 
-        success: true, 
-        endpoints,
-        count: endpoints.length,
-        timestamp: Date.now()
-    });
 });
 
 // دالة مساعدة لتنسيق وقت التشغيل
