@@ -1,9 +1,11 @@
+
 // routes/admin.js - نقاط النهاية للوحة الإدارة (مُصلح)
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const config = require('../config');
 const { firebase, FB_KEY } = require('../services/firebase');
-const { authAdmin, adminSessions } = require('../middleware/auth');
+const { authAdmin, createAdminSession, invalidateAdminSession } = require('../middleware/auth');
 const { generateToken, hashPassword, formatDate, generateApiKey, generateSigningSecret } = require('../helpers/utils');
 
 // ═══════════════════════════════════════════
@@ -13,10 +15,11 @@ let bruteForceProtection, loginAttempts, blockedIPs, requestTracker;
 
 try {
     const security = require('../middleware/security');
-    bruteForceProtection = security.bruteForceProtection || ((req, res, next) => next());
-    loginAttempts = security.loginAttempts || new Map();
-    blockedIPs = security.blockedIPs || new Set();
-    requestTracker = security.requestTracker || new Map();
+    const securityInstance = security.getInstance();
+    bruteForceProtection = (req, res, next) => next();
+    loginAttempts = new Map();
+    blockedIPs = securityInstance?.blockedIPs || new Set();
+    requestTracker = new Map();
 } catch (error) {
     console.warn('⚠️ Security module not loaded, using fallbacks');
     bruteForceProtection = (req, res, next) => next();
@@ -28,75 +31,110 @@ try {
 // ═══════════════════════════════════════════
 // AUTH - تسجيل الدخول/الخروج
 // ═══════════════════════════════════════════
-router.post('/login', bruteForceProtection, async (req, res) => {
+router.post('/login', async (req, res) => {
     try {
         const { username, password } = req.body;
-        const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
+        const ip = req.clientIP || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
+        const userAgent = req.headers['user-agent'] || 'Unknown';
         
+        // التحقق من البيانات المطلوبة
         if (!username || !password) {
-            return res.status(400).json({ success: false, error: 'Username and password required' });
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Username and password required',
+                code: 'MISSING_CREDENTIALS'
+            });
         }
         
-        // تحقق من أن بيانات الاعتماد موجودة
-        if (!config.ADMIN_CREDENTIALS || !config.ADMIN_CREDENTIALS.username || !config.ADMIN_CREDENTIALS.password) {
-            console.error('❌ Admin credentials not configured');
-            return res.status(500).json({ success: false, error: 'Admin system not configured' });
+        // التحقق من إعدادات الأدمن
+        if (!config.ADMIN_CREDENTIALS?.username || !config.ADMIN_CREDENTIALS?.password) {
+            console.error('❌ Admin credentials not configured in environment');
+            return res.status(500).json({ 
+                success: false, 
+                error: 'Admin system not configured',
+                code: 'CONFIG_ERROR'
+            });
         }
         
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Rate limiting delay
+        // Rate limiting delay
+        await new Promise(resolve => setTimeout(resolve, 500));
         
-        if (username !== config.ADMIN_CREDENTIALS.username || password !== config.ADMIN_CREDENTIALS.password) {
-            // تسجيل محاولة الدخول الفاشلة
-            if (loginAttempts && typeof loginAttempts.get === 'function') {
-                const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
-                attempt.count++;
-                attempt.lastAttempt = Date.now();
-                loginAttempts.set(ip, attempt);
-            }
+        // التحقق من بيانات الدخول
+        const isValidUsername = username === config.ADMIN_CREDENTIALS.username;
+        const isValidPassword = password === config.ADMIN_CREDENTIALS.password;
+        
+        if (!isValidUsername || !isValidPassword) {
+            // تسجيل المحاولة الفاشلة
+            const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
+            attempt.count++;
+            attempt.lastAttempt = Date.now();
+            loginAttempts.set(ip, attempt);
             
             console.log(`❌ Failed admin login attempt from ${ip}: ${username}`);
-            return res.status(401).json({ success: false, error: 'Invalid credentials' });
+            
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Invalid username or password',
+                code: 'INVALID_CREDENTIALS'
+            });
         }
         
-        // نجاح تسجيل الدخول
-        if (loginAttempts && typeof loginAttempts.delete === 'function') {
-            loginAttempts.delete(ip);
+        // نجاح تسجيل الدخول - مسح محاولات الفشل
+        loginAttempts.delete(ip);
+        
+        // إنشاء جلسة باستخدام createAdminSession من auth.js
+        let sessionData;
+        
+        if (typeof createAdminSession === 'function') {
+            // استخدام الدالة من auth.js
+            sessionData = createAdminSession(username, ip, userAgent);
+        } else {
+            // Fallback - إنشاء جلسة يدوياً
+            const sessionToken = crypto.randomBytes(32).toString('hex');
+            sessionData = {
+                token: sessionToken,
+                sessionToken: sessionToken,
+                expiresIn: config.SESSION?.EXPIRY || 86400000,
+                createdAt: Date.now()
+            };
         }
-        
-        const sessionToken = generateToken();
-        
-        adminSessions.set(sessionToken, { 
-            username, 
-            ip, 
-            createdAt: Date.now(), 
-            userAgent: req.headers['user-agent'],
-            lastActive: Date.now()
-        });
         
         console.log(`✅ Admin login successful: ${username} from ${ip}`);
+        
         res.json({ 
-            success: true, 
-            sessionToken, 
-            expiresIn: config.SESSION?.EXPIRY || 86400000,
+            success: true,
+            message: 'Login successful',
+            sessionToken: sessionData.token || sessionData.sessionToken,
+            expiresIn: sessionData.expiresIn || config.SESSION?.EXPIRY || 86400000,
             username,
             timestamp: Date.now()
         });
         
     } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({ success: false, error: 'Server error: ' + error.message });
+        console.error('❌ Login error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Server error during login',
+            code: 'SERVER_ERROR'
+        });
     }
 });
 
 router.post('/logout', authAdmin, (req, res) => {
     try {
         const sessionToken = req.headers['x-session-token'];
-        if (sessionToken && adminSessions.has(sessionToken)) {
-            const session = adminSessions.get(sessionToken);
-            console.log(`👋 Admin logout: ${session.username} from ${session.ip}`);
-            adminSessions.delete(sessionToken);
+        
+        if (sessionToken) {
+            if (typeof invalidateAdminSession === 'function') {
+                invalidateAdminSession(sessionToken);
+            }
+            console.log(`👋 Admin logout: ${req.adminUser} from ${req.ip}`);
         }
-        res.json({ success: true, message: 'Logged out successfully' });
+        
+        res.json({ 
+            success: true, 
+            message: 'Logged out successfully' 
+        });
     } catch (error) {
         console.error('Logout error:', error);
         res.status(500).json({ success: false, error: 'Logout failed' });
@@ -105,30 +143,14 @@ router.post('/logout', authAdmin, (req, res) => {
 
 router.get('/verify-session', authAdmin, (req, res) => {
     try {
-        const sessionToken = req.headers['x-session-token'];
-        const session = adminSessions.get(sessionToken);
-        
-        if (!session) {
-            return res.status(401).json({ success: false, error: 'Session expired or invalid' });
-        }
-        
-        // تحديث وقت النشاط الأخير
-        session.lastActive = Date.now();
-        adminSessions.set(sessionToken, session);
-        
-        const expiresIn = (config.SESSION?.EXPIRY || 86400000) - (Date.now() - session.createdAt);
-        const minutesLeft = Math.max(0, Math.floor(expiresIn / 1000 / 60));
-        
         res.json({
             success: true,
             session: { 
-                username: session.username, 
-                expires_in: minutesLeft + ' minutes',
-                ip: session.ip,
-                created_at: session.createdAt
+                username: req.adminUser,
+                role: req.adminRole || 'admin',
+                ip: req.ip
             },
             server_info: { 
-                active_sessions: adminSessions.size, 
                 uptime: Math.floor(process.uptime()),
                 memory_usage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
             }
@@ -153,7 +175,7 @@ router.get('/users', authAdmin, async (req, res) => {
         const now = Date.now();
         
         for (const [id, user] of Object.entries(users)) {
-            if (!user) continue; // تخطي القيم الفارغة
+            if (!user) continue;
             
             const isExpired = user.subscription_end && user.subscription_end < now;
             const isActive = user.is_active !== false && !isExpired;
@@ -179,11 +201,7 @@ router.get('/users', authAdmin, async (req, res) => {
             success: true, 
             data: formattedUsers, 
             count: Object.keys(formattedUsers).length,
-            stats: {
-                active: activeCount,
-                expired: expiredCount,
-                inactive: Object.keys(formattedUsers).length - activeCount - expiredCount
-            }
+            stats: { active: activeCount, expired: expiredCount, inactive: Object.keys(formattedUsers).length - activeCount - expiredCount }
         });
     } catch (error) {
         console.error('Error fetching users:', error.message);
@@ -199,41 +217,32 @@ router.post('/users', authAdmin, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Username and password required' });
         }
         
-        // التحقق من صحة اسم المستخدم
         if (username.length < 3 || username.length > 20) {
             return res.status(400).json({ success: false, error: 'Username must be between 3-20 characters' });
         }
         
-        // التحقق من صحة كلمة المرور
         if (password.length < 4) {
             return res.status(400).json({ success: false, error: 'Password must be at least 4 characters' });
         }
         
         // التحقق من عدم وجود مستخدم بنفس الاسم
         try {
-            const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
-            const checkRes = await firebase.get(checkUrl);
+            const checkRes = await firebase.get(`users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`);
             if (checkRes.data && Object.keys(checkRes.data).length > 0) {
                 return res.status(400).json({ success: false, error: 'Username already exists' });
             }
-        } catch (checkError) {
-            console.warn('Could not check for existing username:', checkError.message);
-        }
+        } catch (e) { /* ignore */ }
         
         // حساب وقت الانتهاء
         let expiryTimestamp;
         if (customExpiryDate) {
             expiryTimestamp = new Date(customExpiryDate).getTime();
-            if (isNaN(expiryTimestamp)) {
-                return res.status(400).json({ success: false, error: 'Invalid date format' });
-            }
         } else if (expiryMinutes) {
             expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
         } else {
             return res.status(400).json({ success: false, error: 'Expiry time required' });
         }
         
-        // التأكد من أن وقت الانتهاء في المستقبل
         if (expiryTimestamp <= Date.now()) {
             return res.status(400).json({ success: false, error: 'Expiry time must be in the future' });
         }
@@ -271,7 +280,6 @@ router.delete('/users/:id', authAdmin, async (req, res) => {
     try {
         const userId = req.params.id;
         
-        // التحقق من وجود المستخدم أولاً
         const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
         if (!userRes.data) {
             return res.status(404).json({ success: false, error: 'User not found' });
@@ -280,11 +288,7 @@ router.delete('/users/:id', authAdmin, async (req, res) => {
         await firebase.delete(`users/${userId}.json?auth=${FB_KEY}`);
         console.log(`🗑️ User deleted: ${userId} (${userRes.data.username})`);
         
-        res.json({ 
-            success: true, 
-            message: 'User deleted successfully',
-            deletedUser: { id: userId, username: userRes.data.username }
-        });
+        res.json({ success: true, message: 'User deleted successfully', deletedUser: { id: userId, username: userRes.data.username } });
     } catch (error) {
         console.error('Error deleting user:', error.message);
         res.status(500).json({ success: false, error: 'Failed to delete user' });
@@ -297,7 +301,7 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
         const userId = req.params.id;
         
         if (!minutes && !days && !hours) {
-            return res.status(400).json({ success: false, error: 'Extension time required (minutes, days, or hours)' });
+            return res.status(400).json({ success: false, error: 'Extension time required' });
         }
         
         const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
@@ -309,7 +313,6 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
         const now = Date.now();
         const currentEnd = user.subscription_end || user.expiry_timestamp || now;
         
-        // حساب وقت التمديد
         let extensionMs = 0;
         if (minutes) extensionMs = minutes * 60 * 1000;
         if (days) extensionMs += days * 24 * 60 * 60 * 1000;
@@ -331,8 +334,7 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
             userId,
             username: user.username,
             old_end_date: formatDate(currentEnd),
-            new_end_date: formatDate(newEndDate),
-            extension_ms: extensionMs
+            new_end_date: formatDate(newEndDate)
         });
     } catch (error) {
         console.error('Error extending user:', error.message);
@@ -349,19 +351,11 @@ router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
             return res.status(404).json({ success: false, error: 'User not found' });
         }
         
-        await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
-            device_id: '',
-            last_device_reset: Date.now()
-        });
+        await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { device_id: '', last_device_reset: Date.now() });
         
         console.log(`🔄 Device reset for user: ${userId} (${userRes.data.username})`);
         
-        res.json({ 
-            success: true, 
-            message: 'Device reset successfully',
-            userId,
-            username: userRes.data.username
-        });
+        res.json({ success: true, message: 'Device reset successfully', userId, username: userRes.data.username });
     } catch (error) {
         console.error('Error resetting device:', error.message);
         res.status(500).json({ success: false, error: 'Failed to reset device' });
@@ -369,34 +363,20 @@ router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-// USER STATUS MANAGEMENT - إدارة حالة المستخدمين
+// USER STATUS MANAGEMENT
 // ═══════════════════════════════════════════
 router.post('/disable-user', authAdmin, async (req, res) => {
     try {
         const { userId } = req.body;
-        if (!userId) {
-            return res.status(400).json({ success: false, error: 'User ID is required' });
-        }
+        if (!userId) return res.status(400).json({ success: false, error: 'User ID is required' });
 
         const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
-        if (!userRes.data) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
+        if (!userRes.data) return res.status(404).json({ success: false, error: 'User not found' });
 
-        await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
-            is_active: false,
-            disabled_at: Date.now(),
-            disabled_by: 'admin'
-        });
+        await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { is_active: false, disabled_at: Date.now() });
 
         console.log(`🚫 User disabled: ${userId} (${userRes.data.username})`);
-        
-        res.json({ 
-            success: true, 
-            message: 'User disabled successfully',
-            userId,
-            username: userRes.data.username
-        });
+        res.json({ success: true, message: 'User disabled successfully', userId, username: userRes.data.username });
     } catch (error) {
         console.error('Error disabling user:', error.message);
         res.status(500).json({ success: false, error: 'Failed to disable user' });
@@ -406,145 +386,18 @@ router.post('/disable-user', authAdmin, async (req, res) => {
 router.post('/enable-user', authAdmin, async (req, res) => {
     try {
         const { userId } = req.body;
-        if (!userId) {
-            return res.status(400).json({ success: false, error: 'User ID is required' });
-        }
+        if (!userId) return res.status(400).json({ success: false, error: 'User ID is required' });
 
         const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
-        if (!userRes.data) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
+        if (!userRes.data) return res.status(404).json({ success: false, error: 'User not found' });
 
-        // التحقق من أن الاشتراك لم ينتهِ
-        const now = Date.now();
-        const expiryTime = userRes.data.subscription_end || userRes.data.expiry_timestamp;
-        const isExpired = expiryTime && expiryTime < now;
-        
-        await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
-            is_active: !isExpired,
-            enabled_at: Date.now(),
-            enabled_by: 'admin'
-        });
+        await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { is_active: true, enabled_at: Date.now() });
 
         console.log(`✅ User enabled: ${userId} (${userRes.data.username})`);
-        
-        res.json({ 
-            success: true, 
-            message: isExpired ? 'User enabled but subscription has expired' : 'User enabled successfully',
-            userId,
-            username: userRes.data.username,
-            is_expired: isExpired
-        });
+        res.json({ success: true, message: 'User enabled successfully', userId, username: userRes.data.username });
     } catch (error) {
         console.error('Error enabling user:', error.message);
         res.status(500).json({ success: false, error: 'Failed to enable user' });
-    }
-});
-
-router.post('/bulk-disable-expired', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        const now = Date.now();
-        let disabledCount = 0;
-
-        for (const userId in users) {
-            const user = users[userId];
-            if (!user) continue;
-            
-            const expiryTime = user.subscription_end || user.expiry_timestamp;
-            // تعطيل المستخدمين المنتهية صلاحيتهم والنشطين
-            if (expiryTime && expiryTime < now && user.is_active !== false) {
-                await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { 
-                    is_active: false,
-                    auto_disabled_at: Date.now(),
-                    reason: 'Subscription expired'
-                });
-                disabledCount++;
-                console.log(`Auto-disabled expired user: ${userId} (${user.username})`);
-            }
-        }
-
-        res.json({ 
-            success: true, 
-            message: `Disabled ${disabledCount} expired users`,
-            count: disabledCount,
-            timestamp: Date.now()
-        });
-    } catch (error) {
-        console.error('Error bulk disabling expired users:', error.message);
-        res.status(500).json({ success: false, error: 'Failed to disable expired users' });
-    }
-});
-
-router.delete('/delete-expired', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        const now = Date.now();
-        let deletedCount = 0;
-        const deletedUsers = [];
-
-        for (const userId in users) {
-            const user = users[userId];
-            if (!user) continue;
-            
-            const expiryTime = user.subscription_end || user.expiry_timestamp;
-            // حذف المستخدمين المنتهية صلاحيتهم
-            if (expiryTime && expiryTime < now) {
-                await firebase.delete(`users/${userId}.json?auth=${FB_KEY}`);
-                deletedCount++;
-                deletedUsers.push({ id: userId, username: user.username });
-                console.log(`🗑️ Deleted expired user: ${userId} (${user.username})`);
-            }
-        }
-
-        res.json({ 
-            success: true, 
-            message: `Deleted ${deletedCount} expired users`,
-            count: deletedCount,
-            deleted_users: deletedUsers,
-            timestamp: Date.now()
-        });
-    } catch (error) {
-        console.error('Error deleting expired users:', error.message);
-        res.status(500).json({ success: false, error: 'Failed to delete expired users' });
-    }
-});
-
-router.delete('/delete-inactive', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        let deletedCount = 0;
-        const deletedUsers = [];
-
-        for (const userId in users) {
-            const user = users[userId];
-            if (!user) continue;
-            
-            // حذف المستخدمين المعطلين
-            if (user.is_active === false) {
-                await firebase.delete(`users/${userId}.json?auth=${FB_KEY}`);
-                deletedCount++;
-                deletedUsers.push({ id: userId, username: user.username });
-                console.log(`🗑️ Deleted inactive user: ${userId} (${user.username})`);
-            }
-        }
-
-        res.json({ 
-            success: true, 
-            message: `Deleted ${deletedCount} inactive users`,
-            count: deletedCount,
-            deleted_users: deletedUsers,
-            timestamp: Date.now()
-        });
-    } catch (error) {
-        console.error('Error deleting inactive users:', error.message);
-        res.status(500).json({ success: false, error: 'Failed to delete inactive users' });
     }
 });
 
@@ -558,8 +411,6 @@ router.get('/api-keys', authAdmin, async (req, res) => {
         
         const now = Date.now();
         const formattedKeys = {};
-        let activeCount = 0;
-        let expiredCount = 0;
         
         for (const [id, key] of Object.entries(keys)) {
             if (!key) continue;
@@ -567,31 +418,18 @@ router.get('/api-keys', authAdmin, async (req, res) => {
             const isExpired = key.expiry_timestamp && key.expiry_timestamp < now;
             const isActive = key.is_active !== false && !isExpired;
             
-            if (isActive) activeCount++;
-            if (isExpired) expiredCount++;
-            
             formattedKeys[id] = {
                 id,
                 api_key: key.api_key || '',
                 admin_name: key.admin_name || '',
                 permission_level: key.permission_level || 'view_only',
                 is_active: isActive,
-                expiry_timestamp: key.expiry_timestamp || null,
                 expiry_date: formatDate(key.expiry_timestamp),
-                created_at: key.created_at ? formatDate(key.created_at) : null,
                 status: isActive ? 'active' : (isExpired ? 'expired' : 'inactive')
             };
         }
         
-        res.json({ 
-            success: true, 
-            data: formattedKeys,
-            stats: {
-                total: Object.keys(formattedKeys).length,
-                active: activeCount,
-                expired: expiredCount
-            }
-        });
+        res.json({ success: true, data: formattedKeys });
     } catch (error) {
         console.error('Error fetching API keys:', error.message);
         res.status(500).json({ success: false, error: 'Failed to fetch API keys' });
@@ -603,7 +441,7 @@ router.post('/api-keys', authAdmin, async (req, res) => {
         const { adminName, permissionLevel, expiryDays } = req.body;
         
         if (!adminName || adminName.trim().length < 2) {
-            return res.status(400).json({ success: false, error: 'Admin name must be at least 2 characters' });
+            return res.status(400).json({ success: false, error: 'Admin name required' });
         }
         
         const apiKey = generateApiKey();
@@ -617,19 +455,16 @@ router.post('/api-keys', authAdmin, async (req, res) => {
             is_active: true,
             expiry_timestamp: expiryTimestamp,
             created_at: Date.now(),
-            signing_secret: signingSecret,
-            created_by: 'admin_panel'
+            signing_secret: signingSecret
         };
         
         const response = await firebase.post(`api_keys.json?auth=${FB_KEY}`, keyData);
-        const keyId = response.data.name;
         
-        console.log(`🔑 API Key created for: ${adminName} (ID: ${keyId})`);
+        console.log(`🔑 API Key created for: ${adminName}`);
         
         res.json({ 
             success: true, 
-            message: 'API Key created successfully',
-            keyId,
+            keyId: response.data.name,
             apiKey,
             signingSecret,
             adminName: adminName.trim(),
@@ -642,127 +477,40 @@ router.post('/api-keys', authAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-// SECURITY STATS
-// ═══════════════════════════════════════════
-router.get('/security-stats', authAdmin, (req, res) => {
-    try {
-        const now = Date.now();
-        const oneHourAgo = now - (60 * 60 * 1000);
-        
-        // تنظيف محاولات الدخول القديمة
-        if (loginAttempts && typeof loginAttempts.entries === 'function') {
-            for (const [ip, data] of loginAttempts.entries()) {
-                if (data.lastAttempt < oneHourAgo) {
-                    loginAttempts.delete(ip);
-                }
-            }
-        }
-        
-        // تنظيف تتبع الطلبات القديمة
-        if (requestTracker && typeof requestTracker.entries === 'function') {
-            for (const [ip, data] of requestTracker.entries()) {
-                if (data.lastRequest < oneHourAgo) {
-                    requestTracker.delete(ip);
-                }
-            }
-        }
-        
-        res.json({
-            success: true,
-            stats: {
-                tracked_ips: requestTracker ? requestTracker.size : 0,
-                blocked_ips: blockedIPs ? blockedIPs.size : 0,
-                blocked_list: blockedIPs ? Array.from(blockedIPs).slice(0, 20) : [],
-                active_sessions: adminSessions.size,
-                login_attempts: loginAttempts ? Array.from(loginAttempts.entries()).map(([ip, data]) => ({ 
-                    ip, 
-                    attempts: data.count,
-                    last_attempt: formatDate(data.lastAttempt)
-                })).slice(0, 20) : []
-            },
-            timestamp: now
-        });
-    } catch (error) {
-        console.error('Error getting security stats:', error.message);
-        res.status(500).json({ success: false, error: 'Failed to get security stats' });
-    }
-});
-
-router.post('/unblock-ip', authAdmin, (req, res) => {
-    try {
-        const { ip } = req.body;
-        if (!ip) {
-            return res.status(400).json({ success: false, error: 'IP address required' });
-        }
-        
-        let wasBlocked = false;
-        if (blockedIPs && typeof blockedIPs.has === 'function') {
-            wasBlocked = blockedIPs.has(ip);
-            blockedIPs.delete(ip);
-        }
-        
-        if (requestTracker && typeof requestTracker.delete === 'function') {
-            requestTracker.delete(ip);
-        }
-        
-        console.log(`🔓 IP unblocked: ${ip} (was blocked: ${wasBlocked})`);
-        
-        res.json({ 
-            success: true, 
-            message: `IP ${ip} has been unblocked`,
-            ip,
-            was_blocked: wasBlocked,
-            timestamp: Date.now()
-        });
-    } catch (error) {
-        console.error('Error unblocking IP:', error.message);
-        res.status(500).json({ success: false, error: 'Failed to unblock IP' });
-    }
-});
-
-// ═══════════════════════════════════════════
-// ADMIN UTILITIES
+// SERVER STATS
 // ═══════════════════════════════════════════
 router.get('/server-stats', authAdmin, (req, res) => {
     try {
         const memoryUsage = process.memoryUsage();
-        const stats = {
-            uptime: Math.floor(process.uptime()),
-            uptime_formatted: formatUptime(process.uptime()),
-            memory: {
-                heap_used: Math.round(memoryUsage.heapUsed / 1024 / 1024) + ' MB',
-                heap_total: Math.round(memoryUsage.heapTotal / 1024 / 1024) + ' MB',
-                rss: Math.round(memoryUsage.rss / 1024 / 1024) + ' MB'
-            },
-            timestamp: Date.now(),
-            date: new Date().toISOString(),
-            version: config.VERSION || '3.4.1',
-            node_version: process.version,
-            platform: process.platform,
-            admin_sessions: adminSessions.size
-        };
-        
-        res.json({ success: true, stats });
+        res.json({ 
+            success: true, 
+            stats: {
+                uptime: Math.floor(process.uptime()),
+                memory: {
+                    heap_used: Math.round(memoryUsage.heapUsed / 1024 / 1024) + ' MB',
+                    heap_total: Math.round(memoryUsage.heapTotal / 1024 / 1024) + ' MB'
+                },
+                timestamp: Date.now(),
+                node_version: process.version
+            }
+        });
     } catch (error) {
-        console.error('Error getting server stats:', error.message);
         res.status(500).json({ success: false, error: 'Failed to get server stats' });
     }
 });
 
-// دالة مساعدة لتنسيق وقت التشغيل
-function formatUptime(seconds) {
-    const days = Math.floor(seconds / 86400);
-    const hours = Math.floor((seconds % 86400) / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = Math.floor(seconds % 60);
-    
-    const parts = [];
-    if (days > 0) parts.push(`${days} يوم`);
-    if (hours > 0) parts.push(`${hours} ساعة`);
-    if (minutes > 0) parts.push(`${minutes} دقيقة`);
-    if (secs > 0) parts.push(`${secs} ثانية`);
-    
-    return parts.join(' و ') || '0 ثانية';
-}
+router.get('/security-stats', authAdmin, (req, res) => {
+    try {
+        res.json({
+            success: true,
+            stats: {
+                blocked_ips: blockedIPs.size,
+                login_attempts: loginAttempts.size
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: 'Failed to get security stats' });
+    }
+});
 
 module.exports = router;
