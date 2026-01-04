@@ -1,3 +1,6 @@
+// server.js - SecureArmor Main Server v14.1
+'use strict';
+
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
@@ -6,7 +9,7 @@ const config = require('./config');
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 1. SECURITY MIDDLEWARE - تحميل أولاً (اختياري)
+// 🛡️ 1. SECURITY MIDDLEWARE - تحميل أولاً
 // ═══════════════════════════════════════════════════════════════════
 let security = null;
 try {
@@ -16,7 +19,6 @@ try {
     console.log('✅ Security middleware loaded successfully');
 } catch (err) {
     console.warn('⚠️ Security middleware not found, continuing without it');
-    // سيعمل السيرفر بالحماية الأساسية فقط
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -26,10 +28,7 @@ const corsOptions = {
     origin: (origin, callback) => {
         const allowedOrigins = config.CORS?.ALLOWED_ORIGINS || [];
         
-        // للطلبات بدون origin (mobile apps, server-to-server)
-        if (!origin) {
-            return callback(null, true);
-        }
+        if (!origin) return callback(null, true);
         
         if (allowedOrigins.includes('*') && process.env.NODE_ENV !== 'production') {
             return callback(null, true);
@@ -58,7 +57,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 3. Security Headers
+// 🛡️ 3. Security Headers (Helmet)
 // ═══════════════════════════════════════════════════════════════════
 app.use(helmet({
     contentSecurityPolicy: {
@@ -92,7 +91,7 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: true, limit: '2mb', parameterLimit: 50 }));
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 5. Request Logger
+// 📝 5. Request Logger
 // ═══════════════════════════════════════════════════════════════════
 app.use((req, res, next) => {
     const ip = req.clientIP || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
@@ -106,6 +105,8 @@ app.use((req, res, next) => {
 // ═══════════════════════════════════════════════════════════════════
 app.get('/health', (req, res) => {
     const mem = process.memoryUsage();
+    const securityStats = security?.getStats() || {};
+    
     res.json({ 
         status: 'ok',
         timestamp: new Date().toISOString(),
@@ -113,6 +114,11 @@ app.get('/health', (req, res) => {
         memory: {
             used: Math.round(mem.heapUsed / 1024 / 1024) + 'MB',
             total: Math.round(mem.heapTotal / 1024 / 1024) + 'MB'
+        },
+        security: {
+            active: !!security,
+            blockedIPs: securityStats.blockedIPs || 0,
+            totalRequests: securityStats.totalRequests || 0
         },
         version: '14.1.0'
     });
@@ -131,9 +137,7 @@ app.get('/api/serverTime', (req, res) => {
 // 🛡️ 7. Content-Type Validation
 // ═══════════════════════════════════════════════════════════════════
 app.use('/api', (req, res, next) => {
-    if (req.path === '/serverTime' || req.method === 'GET') {
-        return next();
-    }
+    if (req.path === '/serverTime' || req.method === 'GET') return next();
     
     if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
         const contentType = req.headers['content-type'];
@@ -163,7 +167,7 @@ app.use('/api', (req, res, next) => {
             if (typeof val === 'string') {
                 for (let pattern of dangerousPatterns) {
                     if (pattern.test(val) || pattern.test(key)) {
-                        console.warn(`⚠️ Injection attempt from IP: ${req.ip}`);
+                        console.warn(`⚠️ Injection attempt from IP: ${req.clientIP || req.ip}`);
                         return false;
                     }
                 }
@@ -181,7 +185,7 @@ app.use('/api', (req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 9. Rate Limiting
+// ⏱️ 9. Rate Limiting (Express)
 // ═══════════════════════════════════════════════════════════════════
 const rateLimit = require('express-rate-limit');
 
@@ -212,11 +216,7 @@ try {
     console.log('✅ Auth middleware loaded successfully');
 } catch (err) {
     console.error('❌ Failed to load auth middleware:', err.message);
-    // Fallback - لن يعمل التوثيق!
-    const fallback = (req, res, next) => {
-        console.warn('⚠️ Auth middleware not available!');
-        next();
-    };
+    const fallback = (req, res, next) => next();
     authApp = fallback;
     authAdmin = fallback;
     authSubAdmin = fallback;
@@ -232,7 +232,7 @@ try {
 const appProtectedPaths = ['/api/verifyAccount', '/api/getUser', '/api/updateDevice'];
 app.use(appProtectedPaths, authApp);
 
-// مسارات الأدمن (Session Token)
+// مسارات الأدمن (Session Token / Master Token)
 app.use('/api/admin', authAdmin);
 
 // مسارات الـ Sub-Admin (API Key خاص)
@@ -258,7 +258,7 @@ loadRoute('./routes/admin', '/api/admin', 'Admin');
 loadRoute('./routes/subadmin', '/api/sub', 'SubAdmin');
 
 // ═══════════════════════════════════════════════════════════════════
-// 📡 13. Fallback Routes (إذا فشل تحميل routes/mobile)
+// 📡 13. Fallback Routes
 // ═══════════════════════════════════════════════════════════════════
 app.post('/api/getUser', async (req, res) => {
     try {
@@ -327,17 +327,10 @@ app.use((err, req, res, next) => {
     const errorId = `ERR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     console.error(`[${errorId}] Error:`, err.message);
     
-    let statusCode = 500;
-    let errorMessage = 'Internal server error';
-    
-    if (err.message.includes('CORS')) {
-        statusCode = 403;
-        errorMessage = 'Access forbidden';
-    }
-    
+    const statusCode = err.message.includes('CORS') ? 403 : 500;
     res.status(statusCode).json({
         success: false,
-        error: errorMessage,
+        error: statusCode === 403 ? 'Access forbidden' : 'Internal server error',
         reference: errorId
     });
 });
@@ -360,10 +353,13 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('═'.repeat(60) + '\n');
 });
 
-// Graceful Shutdown
+// ═══════════════════════════════════════════════════════════════════
+// 🔄 16. Graceful Shutdown
+// ═══════════════════════════════════════════════════════════════════
 ['SIGTERM', 'SIGINT'].forEach(signal => {
     process.on(signal, () => {
         console.log(`📴 ${signal} received, shutting down gracefully...`);
+        if (security) security.destroy();
         setTimeout(() => process.exit(0), 5000);
     });
 });
