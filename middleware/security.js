@@ -1,43 +1,56 @@
-// middleware/security.js - SecureArmor v14.1 Enhanced Edition
-// إصلاح جميع الثغرات المحتملة + تحسينات متقدمة
-// 🔧 FIX: Smart WAF exclusion for trusted app endpoints
+// middleware/security.js - SecureArmor v15.0 Advanced Edition
+// 🔥 تحسينات Layer 7 + CDN + DDoS Protection المحسنة
 'use strict';
 
 const crypto = require('crypto');
 const config = require('../config');
 
 // ============================================
-// SECURE UTILITIES - أدوات آمنة محسّنة
+// 🔥 ENHANCED SECURE UTILITIES
 // ============================================
 const SecureUtils = {
     generateSecureId: (length = 32) => crypto.randomBytes(length).toString('hex'),
     
-    secureHash: (data) => crypto.createHash('sha256').update(String(data)).digest('hex'),
+    secureHash: (data, algorithm = 'sha256') => 
+        crypto.createHash(algorithm).update(String(data)).digest('hex'),
     
-    secureCompare: (a, b) => {
-        if (typeof a !== 'string' || typeof b !== 'string') return false;
-        if (a.length !== b.length) return false;
-        try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } 
-        catch { return false; }
-    },
+    secureCompare: (a, b) => crypto.timingSafeEqual(
+        Buffer.from(String(a)), 
+        Buffer.from(String(b))
+    ),
     
     sanitizeString: (str, maxLength = 1000) => {
         if (typeof str !== 'string') return '';
-        return str.slice(0, maxLength).replace(/[\x00-\x1f\x7f]/g, '').trim();
+        return str
+            .normalize('NFKC') // ترميز Unicode موحد
+            .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+            .replace(/[\u200B-\u200D\uFEFF]/g, '') // حذف المسافات المخفية
+            .slice(0, maxLength)
+            .trim();
     },
     
     isValidIP: (ip) => {
         if (!ip || typeof ip !== 'string') return false;
-        const ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-        const ipv6 = /^(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|:(?::[0-9a-fA-F]{1,4}){1,7}|::)$/;
-        return ipv4.test(ip) || ipv6.test(ip);
+        
+        // IPv4 مع CIDR support
+        const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?:\/\d{1,2})?$/;
+        
+        // IPv6 مع CIDR support
+        const ipv6Regex = /^(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|:(?::[0-9a-fA-F]{1,4}){1,7}|::)(?:\/\d{1,3})?$/;
+        
+        return ipv4Regex.test(ip) || ipv6Regex.test(ip);
     },
     
     isIPv6: (ip) => ip && ip.includes(':'),
     
     ipToInt: (ip) => {
         if (!ip || ip.includes(':')) return 0;
-        return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet), 0) >>> 0;
+        const octets = ip.split('.');
+        if (octets.length !== 4) return 0;
+        return ((parseInt(octets[0]) << 24) >>> 0) +
+               ((parseInt(octets[1]) << 16) >>> 0) +
+               ((parseInt(octets[2]) << 8) >>> 0) +
+               (parseInt(octets[3]) >>> 0);
     },
     
     isIPInRange: (ip, cidr) => {
@@ -47,7 +60,7 @@ const SecureUtils = {
         
         try {
             const [range, bits] = cidr.split('/');
-            const mask = ~(2 ** (32 - parseInt(bits)) - 1);
+            const mask = ~((1 << (32 - parseInt(bits))) - 1) >>> 0;
             return (SecureUtils.ipToInt(ip) & mask) === (SecureUtils.ipToInt(range) & mask);
         } catch { return false; }
     },
@@ -55,9 +68,19 @@ const SecureUtils = {
     isPrivateIP: (ip) => {
         if (!ip) return false;
         if (SecureUtils.isIPv6(ip)) {
-            return ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fc00:') || ip.startsWith('fd');
+            return ip === '::1' || 
+                   ip.startsWith('fe80:') || 
+                   ip.startsWith('fc00:') || 
+                   ip.startsWith('fd') ||
+                   ip === '::ffff:127.0.0.1';
         }
-        const privateRanges = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8'];
+        const privateRanges = [
+            '10.0.0.0/8', 
+            '172.16.0.0/12', 
+            '192.168.0.0/16', 
+            '127.0.0.0/8',
+            '169.254.0.0/16'
+        ];
         return privateRanges.some(range => SecureUtils.isIPInRange(ip, range));
     },
     
@@ -66,990 +89,817 @@ const SecureUtils = {
             req.headers?.['user-agent'] || '',
             req.headers?.['accept-language'] || '',
             req.headers?.['accept-encoding'] || '',
-            req.headers?.['accept'] || ''
+            req.headers?.['accept'] || '',
+            req.headers?.['sec-ch-ua'] || '',
+            req.headers?.['sec-ch-ua-platform'] || ''
         ];
         return SecureUtils.secureHash(components.join('|')).slice(0, 16);
+    },
+    
+    // 🔥 NEW: تقييم تعقيد الطلب
+    computeRequestComplexity: (req) => {
+        let complexity = 0;
+        
+        // حجم الـ Body
+        if (req.body) {
+            const bodySize = JSON.stringify(req.body).length;
+            if (bodySize > 10000) complexity += 2;
+            if (bodySize > 50000) complexity += 3;
+            if (bodySize > 100000) complexity += 5;
+        }
+        
+        // عدد الـ Headers
+        const headerCount = Object.keys(req.headers || {}).length;
+        if (headerCount > 20) complexity += 1;
+        if (headerCount > 30) complexity += 2;
+        
+        // طول الـ URL
+        const urlLength = req.url?.length || 0;
+        if (urlLength > 500) complexity += 2;
+        if (urlLength > 1000) complexity += 5;
+        
+        return complexity;
     }
 };
 
 // ============================================
-// 🔧 TRUSTED APP ENDPOINTS - المسارات الموثوقة
+// 🚀 ENHANCED DDOS PROTECTION
 // ============================================
-// هذه المسارات تُستخدم من التطبيق وتحتوي على بيانات جهاز قد تُفسَّر خطأً
-const TRUSTED_APP_ENDPOINTS = {
-    // المسارات المستثناة من فحص SQL Injection في Body فقط
-    // (لا تزال تُفحص ضد XSS و Path Traversal و Command Injection)
-    bodyExemptPaths: [
-        '/api/updateDevice',
-        '/api/updatedevice',
-        '/api/getUser',
-        '/api/getuser',
-        '/api/verifyAccount',
-        '/api/verifyaccount'
-    ],
-    
-    // الحقول المسموحة في deviceInfo (whitelist)
-    allowedDeviceFields: [
-        'device_model', 'device_brand', 'device_manufacturer', 'device_product',
-        'device_type', 'android_version', 'sdk_version', 'is_rooted', 
-        'has_screen_lock', 'fingerprint_enabled', 'total_ram', 'screen_size',
-        'screen_density', 'network_type', 'carrier_name', 'battery_level',
-        'is_charging', 'security_threat', 'location'
-    ],
-    
-    // التحقق من أن الطلب من التطبيق الشرعي
-    isFromTrustedApp: (req) => {
-        const apiKey = req.headers['x-api-key'] || req.headers['x-client-id'];
-        const signature = req.headers['x-api-signature'];
-        const userAgent = req.headers['user-agent'] || '';
+class DDoSProtection {
+    constructor() {
+        this.connections = new Map(); // per IP
+        this.globalCount = 0;
+        this.burstConnections = new Map(); // للـ Burst Detection
         
-        // يجب أن يكون لديه API Key
-        if (!apiKey) return false;
+        // 🔥 Dynamic thresholds based on traffic
+        this.GLOBAL_RPS = process.env.GLOBAL_RPS || 1000;
+        this.IP_RPS = process.env.IP_RPS || 20;
+        this.BURST_LIMIT = process.env.BURST_LIMIT || 50;
         
-        // التحقق من User-Agent (التطبيق يستخدم okhttp)
-        const trustedAgents = ['okhttp', 'android', 'mobile'];
-        const hasValidUA = trustedAgents.some(ua => userAgent.toLowerCase().includes(ua));
+        // Auto-adjust thresholds based on server load
+        this.autoAdjustThresholds();
         
-        // يجب أن يكون لديه توقيع أو UA صحيح
-        return signature || hasValidUA;
-    },
+        // تنظيف أسرع (كل 100ms بدلاً من 1000ms)
+        setInterval(() => {
+            this.globalCount = Math.max(0, this.globalCount - 100);
+            this.cleanConnections();
+            this.cleanBurstConnections();
+        }, 100);
+        
+        // تعديل الـ thresholds تلقائياً كل 5 ثوان
+        setInterval(() => this.autoAdjustThresholds(), 5000);
+    }
     
-    // التحقق من أن المسار مستثنى
-    isBodyExemptPath: (path) => {
-        if (!path) return false;
-        const cleanPath = path.split('?')[0].toLowerCase();
-        return TRUSTED_APP_ENDPOINTS.bodyExemptPaths.some(p => 
-            cleanPath === p || cleanPath.endsWith(p)
-        );
-    },
-    
-    // تنظيف deviceInfo من أي محتوى ضار
-    sanitizeDeviceInfo: (deviceInfo) => {
-        if (!deviceInfo || typeof deviceInfo !== 'object') return {};
+    autoAdjustThresholds() {
+        // تقليل الـ thresholds إذا كان الحمل مرتفعاً
+        const memUsage = process.memoryUsage().heapUsed / process.memoryUsage().heapTotal;
+        const loadFactor = memUsage > 0.8 ? 0.5 : memUsage > 0.6 ? 0.7 : 1;
         
-        const sanitized = {};
-        for (const [key, value] of Object.entries(deviceInfo)) {
-            // فقط الحقول المسموحة
-            if (!TRUSTED_APP_ENDPOINTS.allowedDeviceFields.includes(key)) continue;
-            
-            // تنظيف القيم
-            if (typeof value === 'string') {
-                // إزالة أي محتوى XSS محتمل
-                sanitized[key] = value
-                    .replace(/<[^>]*>/g, '')
-                    .replace(/javascript:/gi, '')
-                    .replace(/on\w+=/gi, '')
-                    .slice(0, 200);
-            } else if (typeof value === 'number' || typeof value === 'boolean') {
-                sanitized[key] = value;
+        this.IP_RPS = Math.floor((process.env.IP_RPS || 20) * loadFactor);
+        this.BURST_LIMIT = Math.floor((process.env.BURST_LIMIT || 50) * loadFactor);
+    }
+    
+    cleanConnections() {
+        const now = Date.now();
+        for (const [ip, data] of this.connections.entries()) {
+            // الاحتفاظ بـ timestamps للثانية الأخيرة فقط
+            data.timestamps = data.timestamps.filter(t => now - t < 1000);
+            if (data.timestamps.length === 0) {
+                this.connections.delete(ip);
             }
         }
-        return sanitized;
     }
-};
-
-// ============================================
-// CONFIGURATION - الإعدادات المحسّنة
-// ============================================
-const SECURITY_CONFIG = {
-    // Rate Limits
-    RATE_LIMITS: {
-        global: { 
-            capacity: config.SECURITY?.RATE_LIMITS?.GLOBAL?.capacity || 100, 
-            refillRate: config.SECURITY?.RATE_LIMITS?.GLOBAL?.refill || 10 
-        },
-        auth: { 
-            capacity: config.SECURITY?.RATE_LIMITS?.AUTH?.capacity || 5, 
-            refillRate: config.SECURITY?.RATE_LIMITS?.AUTH?.refill || 0.5 
-        },
-        api: { 
-            capacity: config.SECURITY?.RATE_LIMITS?.API?.capacity || 50, 
-            refillRate: config.SECURITY?.RATE_LIMITS?.API?.refill || 5 
-        },
-        admin: { 
-            capacity: config.SECURITY?.RATE_LIMITS?.ADMIN?.capacity || 20, 
-            refillRate: config.SECURITY?.RATE_LIMITS?.ADMIN?.refill || 2 
+    
+    cleanBurstConnections() {
+        const now = Date.now();
+        for (const [ip, timestamps] of this.burstConnections.entries()) {
+            const recent = timestamps.filter(t => now - t < 100); // 100ms للنافذة
+            if (recent.length === 0) {
+                this.burstConnections.delete(ip);
+            } else {
+                this.burstConnections.set(ip, recent);
+            }
         }
-    },
-    
-    // Protection Settings
-    PROTECTION_LEVEL: config.SECURITY?.PROTECTION_LEVEL || 'balanced',
-    ENABLE_WAF: config.SECURITY?.ENABLE_WAF !== false,
-    ENABLE_RATE_LIMIT: config.SECURITY?.ENABLE_RATE_LIMIT !== false,
-    ENABLE_BOT_DETECTION: config.SECURITY?.ENABLE_BOT_DETECTION !== false,
-    ENABLE_HONEYPOT: config.SECURITY?.ENABLE_HONEYPOT !== false,
-    
-    // Thresholds
-    ANOMALY_THRESHOLD: config.SECURITY?.ANOMALY_THRESHOLD || 70,
-    SOFT_BLOCK_VIOLATIONS: config.SECURITY?.SOFT_BLOCK_VIOLATIONS || 3,
-    
-    // Contact & Alerts
-    APPEAL_CONTACT: config.SECURITY?.APPEAL_CONTACT || 'security@yourdomain.com',
-    ALERT_WEBHOOK: config.SECURITY?.ALERT_WEBHOOK || null,
-    
-    // Cache TTL
-    IP_CACHE_TTL: (config.SECURITY?.IP_CACHE_TTL || 300) * 1000,
-    
-    // Trusted Proxies
-    TRUSTED_PROXIES: process.env.TRUSTED_PROXIES 
-        ? process.env.TRUSTED_PROXIES.split(',').map(p => p.trim())
-        : ['127.0.0.1', '::1'],
-    
-    // Exempt Paths
-    EXEMPT_PATHS: ['/health', '/favicon.ico', '/robots.txt', '/api/health', '/', '/api/serverTime'],
-    STATIC_EXTENSIONS: /\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map)$/i,
-    
-    // IPs المستثناة
-    EXEMPT_IPS: ['127.0.0.1', '::1', '::ffff:127.0.0.1'],
-    
-    // WAF Settings
-    WAF: { 
-        maxURLLength: config.SECURITY?.WAF?.MAX_URL_LENGTH || 2048, 
-        maxBodySize: config.SECURITY?.WAF?.MAX_BODY_SIZE || 1048576, 
-        blockThreshold: config.SECURITY?.WAF?.BLOCK_THRESHOLD || 10 
-    },
-    
-    // DDoS Settings
-    DDOS: { 
-        globalRPS: config.SECURITY?.DDOS?.GLOBAL_RPS || 10000, 
-        ipRPS: config.SECURITY?.DDOS?.IP_RPS || 50, 
-        burstLimit: config.SECURITY?.DDOS?.BURST_LIMIT || 100 
-    },
-    
-    // Brute Force Settings
-    BRUTE_FORCE: { 
-        maxAttempts: config.SECURITY?.BRUTE_FORCE?.MAX_ATTEMPTS || 5, 
-        lockoutTime: config.SECURITY?.BRUTE_FORCE?.LOCKOUT_TIME || 900000, 
-        escalationMultiplier: config.SECURITY?.BRUTE_FORCE?.ESCALATION_MULTIPLIER || 2, 
-        maxLockoutTime: config.SECURITY?.BRUTE_FORCE?.MAX_LOCKOUT_TIME || 86400000 
     }
-};
+    
+    check(ip) {
+        this.globalCount++;
+        
+        // 🔥 Global rate check
+        if (this.globalCount > this.GLOBAL_RPS) {
+            return { 
+                allowed: false, 
+                reason: 'Server under high load', 
+                type: 'global_ddos',
+                retryAfter: 60 
+            };
+        }
+        
+        // 🔥 IP-specific rate checking
+        let ipData = this.connections.get(ip);
+        const now = Date.now();
+        
+        if (!ipData) {
+            ipData = { count: 0, timestamps: [] };
+        }
+        
+        // إضافة timestamp جديد
+        ipData.timestamps.push(now);
+        
+        // الاحتفاظ بـ 1 ثانية فقط
+        ipData.timestamps = ipData.timestamps.filter(t => now - t < 1000);
+        ipData.count = ipData.timestamps.length;
+        this.connections.set(ip, ipData);
+        
+        // 🔥 IP RPS check
+        if (ipData.count > this.IP_RPS) {
+            return { 
+                allowed: false, 
+                reason: 'Rate exceeded', 
+                type: 'ip_ddos',
+                retryAfter: 30 
+            };
+        }
+        
+        // 🔥 Burst detection (طلبات في آخر 100ms)
+        let burstData = this.burstConnections.get(ip) || [];
+        burstData.push(now);
+        burstData = burstData.filter(t => now - t < 100);
+        this.burstConnections.set(ip, burstData);
+        
+        if (burstData.length > this.BURST_LIMIT) {
+            return { 
+                allowed: false, 
+                reason: 'Burst limit exceeded', 
+                type: 'burst_ddos',
+                retryAfter: 15 
+            };
+        }
+        
+        return { allowed: true };
+    }
+    
+    getStats() {
+        return { 
+            globalRPS: this.globalCount, 
+            connections: this.connections.size,
+            burstConnections: this.burstConnections.size,
+            thresholds: {
+                ipRPS: this.IP_RPS,
+                burstLimit: this.BURST_LIMIT,
+                globalRPS: this.GLOBAL_RPS
+            }
+        };
+    }
+}
 
 // ============================================
-// REDIS CONNECTION
+// 🛡️ DYNAMIC BLACKLIST MANAGER
+// ============================================
+class DynamicBlacklist {
+    constructor() {
+        this.blacklist = new Map(); // IP => { blockedUntil, reason, violations }
+        this.violationTracker = new Map(); // IP => violation count
+        this.autoUnblockInterval = setInterval(() => this.cleanup(), 30000);
+    }
+    
+    isBlocked(ip) {
+        const record = this.blacklist.get(ip);
+        if (!record) return false;
+        
+        if (Date.now() > record.blockedUntil) {
+            this.blacklist.delete(ip);
+            return false;
+        }
+        
+        return {
+            blocked: true,
+            reason: record.reason,
+            remaining: Math.ceil((record.blockedUntil - Date.now()) / 1000),
+            blockedAt: record.blockedAt
+        };
+    }
+    
+    addViolation(ip, severity = 1, reason = 'unknown') {
+        const current = this.violationTracker.get(ip) || { count: 0, lastViolation: 0 };
+        current.count += severity;
+        current.lastViolation = Date.now();
+        this.violationTracker.set(ip, current);
+        
+        // 🔥 Dynamic blocking based on violation count
+        let blockDuration = 0;
+        
+        if (current.count >= 10) {
+            blockDuration = 3600000; // 1 hour
+        } else if (current.count >= 5) {
+            blockDuration = 900000; // 15 minutes
+        } else if (current.count >= 3) {
+            blockDuration = 300000; // 5 minutes
+        } else if (current.count >= 2) {
+            blockDuration = 60000; // 1 minute
+        }
+        
+        if (blockDuration > 0) {
+            this.block(ip, blockDuration, `${reason} (violations: ${current.count})`);
+        }
+        
+        return current.count;
+    }
+    
+    block(ip, duration = 60000, reason = 'Multiple violations') {
+        this.blacklist.set(ip, {
+            blockedUntil: Date.now() + duration,
+            blockedAt: Date.now(),
+            reason: reason,
+            violations: this.violationTracker.get(ip)?.count || 1
+        });
+        
+        logSecurityEvent('ip_blacklisted', ip, { 
+            reason, 
+            duration: `${duration/1000}s`,
+            violations: this.violationTracker.get(ip)?.count || 1 
+        });
+        
+        return true;
+    }
+    
+    unblock(ip) {
+        this.blacklist.delete(ip);
+        this.violationTracker.delete(ip);
+        logSecurityEvent('ip_unblacklisted', ip, { manual: true });
+        return true;
+    }
+    
+    cleanup() {
+        const now = Date.now();
+        let cleaned = 0;
+        
+        // تنظيف الـ blacklist
+        for (const [ip, record] of this.blacklist.entries()) {
+            if (now > record.blockedUntil) {
+                this.blacklist.delete(ip);
+                cleaned++;
+            }
+        }
+        
+        // تنظيف violation tracker (أقدم من 24 ساعة)
+        for (const [ip, record] of this.violationTracker.entries()) {
+            if (now - record.lastViolation > 86400000) {
+                this.violationTracker.delete(ip);
+            }
+        }
+        
+        return cleaned;
+    }
+    
+    getStats() {
+        return {
+            blacklisted: this.blacklist.size,
+            trackedIPs: this.violationTracker.size,
+            violations: Array.from(this.violationTracker.values())
+                .reduce((sum, v) => sum + v.count, 0)
+        };
+    }
+}
+
+// ============================================
+// 🔄 REDIS INTEGRATION - Enhanced
 // ============================================
 let redisClient = null;
 let redisAvailable = false;
 
 const initRedis = async () => {
     const redisUrl = config.SECURITY?.REDIS_URL || process.env.REDIS_URL;
-    if (!redisUrl) return;
+    if (!redisUrl) {
+        console.log('ℹ️ Redis not configured, using in-memory storage');
+        return;
+    }
     
     try {
         const Redis = require('ioredis');
         redisClient = new Redis(redisUrl, {
             maxRetriesPerRequest: 3,
-            retryStrategy: (times) => times > 10 ? null : Math.min(times * 100, 3000),
-            lazyConnect: true,
+            retryStrategy: (times) => {
+                const delay = Math.min(times * 100, 3000);
+                return delay;
+            },
+            reconnectOnError: (err) => {
+                const targetError = 'READONLY';
+                if (err.message.includes(targetError)) return true;
+                return false;
+            },
+            enableOfflineQueue: false,
             password: process.env.REDIS_PASSWORD || undefined,
             tls: process.env.REDIS_TLS === 'true' ? {} : undefined
         });
         
-        redisClient.on('connect', () => { redisAvailable = true; console.log('✅ Redis connected'); });
-        redisClient.on('error', () => { redisAvailable = false; });
-        redisClient.on('close', () => { redisAvailable = false; });
+        redisClient.on('connect', () => {
+            redisAvailable = true;
+            console.log('✅ Redis connected for distributed protection');
+        });
+        
+        redisClient.on('error', (err) => {
+            redisAvailable = false;
+            console.warn('⚠️ Redis error:', err.message);
+        });
         
         await redisClient.connect();
-    } catch (e) { console.warn('⚠️ Redis not available:', e.message); }
+        
+        // 🔥 اختبار Redis
+        await redisClient.ping();
+        console.log('✅ Redis ping successful');
+        
+    } catch (e) { 
+        console.warn('⚠️ Redis not available:', e.message);
+        redisAvailable = false;
+    }
 };
 
-initRedis();
-
-// ============================================
-// SECURE STORAGE
-// ============================================
-class SecureStorage {
-    constructor() {
-        this.stores = new Map();
-        this.MAX_ENTRIES = 50000;
-        ['blockedIPs', 'rateLimits', 'loginAttempts', 'ipReputation', 'behaviorPatterns', 
-         'challenges', 'fingerprints', 'threatLog', 'rateViolations', 'blockHistory',
-         'userAttempts', 'dynamicHoneypots'].forEach(name => this.stores.set(name, new Map()));
-        setInterval(() => this.cleanup(), 300000);
+// 🔥 Redis-based Rate Limiter
+class RedisRateLimiter {
+    constructor(limit, windowMs = 60000) {
+        this.limit = limit;
+        this.windowMs = windowMs;
     }
     
-    getStore(name) {
-        if (!this.stores.has(name)) this.stores.set(name, new Map());
-        return this.stores.get(name);
-    }
-    
-    set(storeName, key, value, ttlMs = 3600000) {
-        const store = this.getStore(storeName);
-        if (store.size >= this.MAX_ENTRIES) this.evictOldest(store, Math.floor(this.MAX_ENTRIES * 0.1));
-        store.set(SecureUtils.secureHash(String(key)), { value, createdAt: Date.now(), expiresAt: Date.now() + ttlMs });
-    }
-    
-    get(storeName, key) {
-        const store = this.getStore(storeName);
-        const item = store.get(SecureUtils.secureHash(String(key)));
-        if (!item) return null;
-        if (Date.now() > item.expiresAt) { store.delete(SecureUtils.secureHash(String(key))); return null; }
-        return item.value;
-    }
-    
-    getWithMeta(storeName, key) {
-        const store = this.getStore(storeName);
-        const hashedKey = SecureUtils.secureHash(String(key));
-        const item = store.get(hashedKey);
-        if (!item || Date.now() > item.expiresAt) { if (item) store.delete(hashedKey); return null; }
-        return { ...item };
-    }
-    
-    delete(storeName, key) { return this.getStore(storeName).delete(SecureUtils.secureHash(String(key))); }
-    has(storeName, key) { return this.get(storeName, key) !== null; }
-    increment(storeName, key, ttlMs = 3600000) { const c = this.get(storeName, key) || 0; this.set(storeName, key, c + 1, ttlMs); return c + 1; }
-    
-    evictOldest(store, count = 1) {
-        const entries = [...store.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt);
-        for (let i = 0; i < Math.min(count, entries.length); i++) store.delete(entries[i][0]);
-    }
-    
-    cleanup() {
+    async check(ip, endpoint = 'global') {
+        if (!redisAvailable || !redisClient) {
+            return { allowed: true, remaining: this.limit }; // Fallback
+        }
+        
+        const key = `ratelimit:${endpoint}:${ip}`;
         const now = Date.now();
-        let cleaned = 0;
-        for (const store of this.stores.values()) {
-            for (const [key, item] of store.entries()) {
-                if (now > item.expiresAt) { store.delete(key); cleaned++; }
-            }
-        }
-        return cleaned;
-    }
-    
-    getStats() {
-        const stats = { totalEntries: 0, stores: {} };
-        for (const [name, store] of this.stores.entries()) { stats.stores[name] = store.size; stats.totalEntries += store.size; }
-        return stats;
-    }
-}
-
-const storage = new SecureStorage();
-
-// ============================================
-// RATE LIMITER
-// ============================================
-class RateLimiter {
-    constructor(capacity, refillRate) {
-        this.capacity = capacity;
-        this.refillRate = refillRate;
-        this.buckets = new Map();
-    }
-    
-    async consume(identifier, tokens = 1) {
-        if (redisAvailable) return this.consumeRedis(identifier, tokens);
-        return this.consumeMemory(identifier, tokens);
-    }
-    
-    async consumeRedis(identifier, tokens) {
-        const key = `rl:${SecureUtils.secureHash(identifier)}`;
-        try {
-            const lua = `
-                local key, cap, rate, tokens, now = KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
-                local b = redis.call('HMGET', key, 'tokens', 'lastRefill')
-                local t, lr = tonumber(b[1]) or cap, tonumber(b[2]) or now
-                local elapsed = (now - lr) / 1000
-                local refill = elapsed * rate
-                t = math.min(cap, t + refill)
-                if t >= tokens then
-                    redis.call('HMSET', key, 'tokens', t - tokens, 'lastRefill', now)
-                    redis.call('EXPIRE', key, 3600)
-                    return cjson.encode({allowed = true, remaining = math.floor(t - tokens)})
-                end
-                local waitTime = math.ceil((tokens - t) / rate * 1000)
-                return cjson.encode({allowed = false, remaining = math.floor(t), resetIn = waitTime})
-            `;
-            const result = await redisClient.eval(lua, 1, key, this.capacity, this.refillRate, tokens, Date.now());
-            return JSON.parse(result);
-        } catch { return this.consumeMemory(identifier, tokens); }
-    }
-    
-    consumeMemory(identifier, tokens) {
-        const key = SecureUtils.secureHash(identifier);
-        const now = Date.now();
-        let bucket = this.buckets.get(key) || { tokens: this.capacity, lastRefill: now };
-        
-        const elapsed = (now - bucket.lastRefill) / 1000;
-        bucket.tokens = Math.min(this.capacity, bucket.tokens + (elapsed * this.refillRate));
-        bucket.lastRefill = now;
-        this.buckets.set(key, bucket);
-        
-        if (bucket.tokens >= tokens) {
-            bucket.tokens -= tokens;
-            return { allowed: true, remaining: Math.floor(bucket.tokens) };
-        }
-        return { allowed: false, remaining: Math.floor(bucket.tokens), resetIn: Math.ceil((tokens - bucket.tokens) / this.refillRate * 1000) };
-    }
-}
-
-const rateLimiters = {};
-for (const [name, cfg] of Object.entries(SECURITY_CONFIG.RATE_LIMITS)) {
-    rateLimiters[name] = new RateLimiter(cfg.capacity, cfg.refillRate);
-}
-
-// ============================================
-// DDOS PROTECTION
-// ============================================
-class DDoSProtection {
-    constructor() {
-        this.globalCount = 0;
-        this.connections = new Map();
-        setInterval(() => { this.globalCount = 0; this.cleanConnections(); }, 1000);
-    }
-    
-    cleanConnections() {
-        const now = Date.now();
-        for (const [ip, data] of this.connections.entries()) {
-            if (now - data.lastSeen > 60000) this.connections.delete(ip);
-            else data.burst = Math.max(0, data.burst - 10);
-        }
-    }
-    
-    check(ip) {
-        this.globalCount++;
-        if (this.globalCount > SECURITY_CONFIG.DDOS.globalRPS) {
-            return { allowed: false, reason: 'Server under high load', type: 'global_ddos' };
-        }
-        
-        let data = this.connections.get(ip) || { count: 0, burst: 0, lastSeen: Date.now() };
-        data.count++;
-        data.burst++;
-        data.lastSeen = Date.now();
-        this.connections.set(ip, data);
-        
-        if (data.count > SECURITY_CONFIG.DDOS.ipRPS) {
-            return { allowed: false, reason: 'Rate exceeded', type: 'ip_ddos' };
-        }
-        if (data.burst > SECURITY_CONFIG.DDOS.burstLimit) {
-            return { allowed: false, reason: 'Burst limit', type: 'burst_ddos' };
-        }
-        return { allowed: true };
-    }
-    
-    getStats() { return { globalRPS: this.globalCount, connections: this.connections.size }; }
-}
-
-const ddosProtection = new DDoSProtection();
-
-// ============================================
-// IP ANALYZER
-// ============================================
-class IPAnalyzer {
-    constructor() {
-        this.torNodes = new Set();
-        this.lastUpdate = 0;
-        this.isUpdating = false;
-        this.updateLists();
-        setInterval(() => this.updateLists(), SECURITY_CONFIG.IP_CACHE_TTL || 3600000);
-    }
-    
-    async updateLists() {
-        if (this.isUpdating || Date.now() - this.lastUpdate < 3600000) return;
-        this.isUpdating = true;
+        const windowStart = now - this.windowMs;
         
         try {
-            const fetch = (await import('node-fetch')).default;
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 15000);
+            // استخدام Redis Sorted Set للتتبع
+            await redisClient.zremrangebyscore(key, 0, windowStart);
             
-            const res = await fetch('https://check.torproject.org/torbulkexitlist', { signal: controller.signal });
-            const text = await res.text();
-            this.torNodes = new Set(text.split('\n').map(ip => ip.trim()).filter(ip => SecureUtils.isValidIP(ip)));
+            const currentCount = await redisClient.zcard(key);
             
-            clearTimeout(timeout);
-            this.lastUpdate = Date.now();
-            console.log(`✅ Threat lists updated: ${this.torNodes.size} TOR nodes`);
-        } catch (e) { console.error('❌ Threat list update failed:', e.message); }
-        
-        this.isUpdating = false;
-    }
-    
-    async analyze(ip) {
-        if (!SecureUtils.isValidIP(ip)) return { valid: false, reputation: 0, threats: ['invalid_ip'] };
-        
-        const cached = storage.get('ipReputation', ip);
-        if (cached && Date.now() - cached.timestamp < SECURITY_CONFIG.IP_CACHE_TTL) return cached;
-        
-        const analysis = {
-            valid: true, ip, isPrivate: SecureUtils.isPrivateIP(ip), isTor: this.torNodes.has(ip),
-            isIPv6: SecureUtils.isIPv6(ip), threats: [], reputation: 100, timestamp: Date.now()
-        };
-        
-        if (analysis.isTor) { analysis.reputation -= 50; analysis.threats.push('tor_exit_node'); }
-        if (analysis.isPrivate) analysis.reputation -= 10;
-        
-        const previousBlocks = storage.get('blockHistory', ip) || 0;
-        if (previousBlocks > 0) { 
-            analysis.reputation -= Math.min(previousBlocks * 15, 50); 
-            analysis.threats.push('previous_violations'); 
+            if (currentCount >= this.limit) {
+                const oldest = await redisClient.zrange(key, 0, 0, 'WITHSCORES');
+                const waitMs = this.windowMs - (now - parseInt(oldest[1]));
+                return { 
+                    allowed: false, 
+                    remaining: 0,
+                    retryAfter: Math.ceil(waitMs / 1000)
+                };
+            }
+            
+            // إضافة الطلب الحالي
+            await redisClient.zadd(key, now, `${now}:${Math.random()}`);
+            await redisClient.expire(key, Math.ceil(this.windowMs / 1000) + 1);
+            
+            return { 
+                allowed: true, 
+                remaining: this.limit - currentCount - 1
+            };
+            
+        } catch (error) {
+            console.warn('Redis rate limiter failed:', error.message);
+            return { allowed: true, remaining: this.limit }; // Fallback to allow
         }
-        
-        analysis.reputation = Math.max(0, Math.min(100, analysis.reputation));
-        storage.set('ipReputation', ip, analysis, SECURITY_CONFIG.IP_CACHE_TTL);
-        
-        return analysis;
     }
 }
 
-const ipAnalyzer = new IPAnalyzer();
-
 // ============================================
-// WAF ENGINE - 🔧 محسّن مع استثناءات ذكية
+// 🌐 CDN & CLOUDFLARE INTEGRATION
 // ============================================
-class WAFEngine {
-    constructor() {
-        this.patterns = {
-            sqlInjection: [
-                /(?:union\s+(?:all\s+)?select)/i,
-                /(?:select\s+.*?\s+from\s+)/i,
-                /(?:insert\s+into\s+.*?\s+values)/i,
-                /(?:update\s+.*?\s+set\s+)/i,
-                /(?:delete\s+from\s+)/i,
-                /(?:drop\s+(?:table|database|column))/i,
-                /(?:truncate\s+table)/i,
-                /(?:\/\*.*?\*\/)/i,
-                /(?:--|#|\/\*).*$/i,
-                /(?:'\s*(?:or|and)\s*'?\d*'?\s*[=<>])/i,
-                /(?:'\s*;\s*(?:select|insert|update|delete))/i,
-                /(?:(?:0x|x')[0-9a-f]+)/i,
-                /(?:char\s*\(\s*\d+\s*\))/i,
-                /(?:concat\s*\()/i,
-                /(?:benchmark\s*\()/i,
-                /(?:sleep\s*\()/i,
-                /(?:waitfor\s+delay)/i,
-                /(?:pg_sleep)/i,
-                /(?:\$(?:where|gt|lt|ne|eq|regex|in|nin|or|and|not|exists))/i,
-                /(?:\{\s*["\']?\$)/i,
-            ],
-            xss: [
-                /<script[^>]*>[\s\S]*?<\/script>/gi,
-                /<script[^>]*>/gi,
-                /javascript\s*:/gi,
-                /on(?:load|error|click|mouse\w*|focus|blur|change|submit|key\w*|touch\w*|drag\w*|scroll)\s*=/gi,
-                /<(?:img|iframe|object|embed|svg|math|video|audio|source)[^>]*\s+on\w+\s*=/gi,
-                /data\s*:\s*text\/html/gi,
-                /expression\s*\(/gi,
-                /vbscript\s*:/gi,
-                /<(?:link|meta|base|object)[^>]*>/gi,
-                /document\s*\.\s*(?:cookie|domain|location|write)/gi,
-                /window\s*\.\s*(?:location|open)/gi,
-                /eval\s*\(/gi,
-                /(?:alert|confirm|prompt)\s*\(/gi,
-                /innerHTML\s*=/gi,
-                /outerHTML\s*=/gi,
-                /insertAdjacentHTML/gi,
-                /fromCharCode/gi
-            ],
-            pathTraversal: [
-                /(?:\.\.\/|\.\.\\){1,}/g,
-                /(?:\/etc\/(?:passwd|shadow|hosts|group))/i,
-                /(?:\/proc\/(?:self|version|cmdline))/i,
-                /(?:\/var\/log\/)/i,
-                /(?:c:\\windows\\)/i,
-                /(?:boot\.ini|win\.ini|system32)/i,
-                /(?:%2e%2e%2f|%2e%2e\/|\.\.%2f)/gi,
-                /(?:%252e%252e%252f)/gi,
-                /(?:\.\.%c0%af|\.\.%c1%9c)/gi
-            ],
-            commandInjection: [
-                /(?:[;&|`]\s*(?:cat|ls|dir|type|wget|curl|nc|bash|sh|cmd|powershell|python|perl|ruby|php))/gi,
-                /(?:\$\([^)]+\))/g,
-                /(?:`[^`]+`)/g,
-                /(?:\|\s*(?:cat|ls|dir|wget|curl|nc|bash|sh))/gi,
-                /(?:>\s*\/)/gi,
-                /(?:;\s*(?:rm|del|format)\s)/gi,
-                /(?:\$\{[^}]+\})/g
-            ],
-            xxe: [
-                /<!ENTITY/gi,
-                /<!DOCTYPE[^>]*\[/gi,
-                /SYSTEM\s+["'][^"']*["']/gi,
-                /PUBLIC\s+["'][^"']*["']/gi
-            ],
-            ssrf: [
-                /(?:(?:https?|ftp|gopher|dict|file|ldap):\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3}|::1|\[::1\]))/gi,
-                /(?:@(?:localhost|127\.0\.0\.1))/gi
-            ],
-            lfi: [
-                /(?:php:\/\/(?:filter|input|data))/gi,
-                /(?:expect:\/\/)/gi,
-                /(?:zip:\/\/)/gi,
-                /(?:phar:\/\/)/gi
-            ]
-        };
-        
-        this.badBots = [
-            /sqlmap/i, /nikto/i, /nmap/i, /masscan/i, /dirbuster/i, /gobuster/i, /wfuzz/i, /ffuf/i,
-            /burpsuite/i, /acunetix/i, /nessus/i, /openvas/i, /scrapy/i, /w3af/i, /arachni/i,
-            /skipfish/i, /havij/i, /pangolin/i, /httperf/i, /siege/i, /slowloris/i, /hulk/i,
-            /hydra/i, /medusa/i, /metasploit/i, /ncrack/i, /patator/i,
-            /^python-requests/i, /^python-urllib/i, /^java\//i, /^perl/i, /^ruby/i,
-            /^go-http-client/i, /^php\//i, /^wget\//i, /^curl\//i,
-            /phantom/i, /selenium/i, /puppeteer/i, /playwright/i, /headless/i, /chrome-lighthouse/i
-        ];
-    }
+const CDNIntegration = {
+    // 🔥 Cloudflare IP Ranges (المحدثة)
+    CLOUDFLARE_IP_RANGES: [
+        '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+        '104.16.0.0/13', '104.24.0.0/14', '108.162.192.0/18',
+        '131.0.72.0/22', '141.101.64.0/18', '162.158.0.0/15',
+        '172.64.0.0/13', '173.245.48.0/20', '188.114.96.0/20',
+        '190.93.240.0/20', '197.234.240.0/22', '198.41.128.0/17'
+    ],
     
-    // 🔧 الفحص الرئيسي مع استثناءات ذكية
-    scan(req) {
-        const results = { blocked: false, score: 0, threats: [] };
-        const cfg = SECURITY_CONFIG.WAF;
-        const path = req.path || req.url?.split('?')[0] || '';
-        
-        // التحقق من طول URL
-        if (req.url && req.url.length > cfg.maxURLLength) {
-            results.threats.push({ type: 'oversized_url', severity: 5 });
-            results.score += 5;
-        }
-        
-        // فحص URL (دائماً)
-        let urlToScan = req.url || '';
-        try {
-            urlToScan = decodeURIComponent(urlToScan);
-            urlToScan = decodeURIComponent(urlToScan);
-        } catch {}
-        urlToScan = SecureUtils.sanitizeString(urlToScan.toLowerCase(), cfg.maxURLLength);
-        
-        for (const [category, patterns] of Object.entries(this.patterns)) {
-            for (const pattern of patterns) {
-                if (pattern.test(urlToScan)) {
-                    const severity = this.getSeverity(category);
-                    results.threats.push({ type: category, severity, location: 'url' });
-                    results.score += severity;
-                    break;
-                }
-            }
-        }
-        
-        // 🔧 فحص Body مع استثناءات ذكية للتطبيق الموثوق
-        if (req.body) {
-            const isTrustedEndpoint = TRUSTED_APP_ENDPOINTS.isBodyExemptPath(path);
-            const isFromApp = TRUSTED_APP_ENDPOINTS.isFromTrustedApp(req);
-            
-            // إذا كان من التطبيق الموثوق لمسار موثوق
-            if (isTrustedEndpoint && isFromApp) {
-                // فحص XSS فقط (الأهم للأمان) - تخطي SQL Injection
-                const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-                const bodyToScan = bodyStr.slice(0, cfg.maxBodySize).toLowerCase();
-                
-                // فحص XSS و Command Injection فقط
-                const criticalCategories = ['xss', 'commandInjection', 'xxe', 'lfi'];
-                for (const category of criticalCategories) {
-                    for (const pattern of this.patterns[category]) {
-                        if (pattern.test(bodyToScan)) {
-                            const severity = this.getSeverity(category);
-                            results.threats.push({ type: `body_${category}`, severity, location: 'body' });
-                            results.score += severity;
-                            break;
-                        }
-                    }
-                }
-                
-                // 🔧 تنظيف deviceInfo إذا موجود
-                if (req.body.deviceInfo) {
-                    req.body.deviceInfo = TRUSTED_APP_ENDPOINTS.sanitizeDeviceInfo(req.body.deviceInfo);
-                }
-                
-            } else {
-                // فحص كامل للمسارات غير الموثوقة
-                const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-                const bodyToScan = bodyStr.slice(0, cfg.maxBodySize).toLowerCase();
-                
-                for (const [category, patterns] of Object.entries(this.patterns)) {
-                    for (const pattern of patterns) {
-                        if (pattern.test(bodyToScan)) {
-                            const severity = this.getSeverity(category);
-                            results.threats.push({ type: `body_${category}`, severity, location: 'body' });
-                            results.score += severity;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // فحص Headers (دائماً)
-        const headers = req.headers || {};
-        const headersToCheck = ['referer', 'x-forwarded-host'];
-        for (const header of headersToCheck) {
-            if (headers[header]) {
-                const headerValue = String(headers[header]).toLowerCase();
-                for (const pattern of this.patterns.xss) {
-                    if (pattern.test(headerValue)) {
-                        results.threats.push({ type: 'header_xss', severity: 8, location: header });
-                        results.score += 8;
-                        break;
-                    }
-                }
-            }
-        }
-        
-        // فحص Bot (دائماً)
-        const ua = headers['user-agent'] || '';
-        if (this.badBots.some(p => p.test(ua))) {
-            results.threats.push({ type: 'malicious_bot', severity: 10 });
-            results.score += 10;
-        }
-        
-        results.blocked = results.score >= cfg.blockThreshold;
-        return results;
-    }
+    // 🔥 AWS CloudFront IP Ranges
+    CLOUDFRONT_IP_RANGES: [
+        '13.32.0.0/15', '13.35.0.0/16', '13.224.0.0/14',
+        '52.46.0.0/18', '52.84.0.0/15', '52.124.128.0/17',
+        '52.222.128.0/17', '54.182.0.0/16', '54.192.0.0/16',
+        '54.230.0.0/16', '54.239.128.0/18', '54.240.128.0/18'
+    ],
     
-    getSeverity(category) {
-        const severities = { sqlInjection: 10, xss: 8, pathTraversal: 9, commandInjection: 10, xxe: 10, ssrf: 9, lfi: 9 };
-        return severities[category] || 5;
-    }
-}
-
-const waf = new WAFEngine();
-
-// ============================================
-// BEHAVIOR ANALYZER
-// ============================================
-class BehaviorAnalyzer {
-    constructor() {
-        this.baselineRPS = 10;
-        this.learningRate = 0.1;
-    }
+    // 🔥 Fastly IP Ranges
+    FASTLY_IP_RANGES: [
+        '23.235.32.0/20', '43.249.72.0/22', '103.244.50.0/24',
+        '103.245.222.0/23', '103.245.224.0/24', '104.156.80.0/20',
+        '140.248.64.0/18', '140.248.128.0/17', '146.75.0.0/17',
+        '151.101.0.0/16', '157.52.64.0/18', '167.82.0.0/17',
+        '167.82.128.0/20', '167.82.160.0/20', '167.82.224.0/20',
+        '172.111.64.0/18', '185.31.16.0/22', '199.27.72.0/21',
+        '199.232.0.0/16'
+    ],
     
-    analyze(ip, req) {
-        let behavior = storage.get('behaviorPatterns', ip) || { 
-            requests: [], endpoints: [], authFailures: 0, 
-            firstSeen: Date.now(), avgRPS: this.baselineRPS, 
-            errorCount: 0, methods: {}
-        };
+    isCDNIP: (ip) => {
+        if (!SecureUtils.isValidIP(ip)) return false;
         
-        const now = Date.now();
-        const oneMinuteAgo = now - 60000;
-        
-        behavior.requests = (behavior.requests || []).filter(r => r.timestamp > oneMinuteAgo);
-        behavior.requests.push({ timestamp: now, path: req.path, method: req.method, status: 200 });
-        
-        if (!behavior.endpoints) behavior.endpoints = [];
-        if (!behavior.endpoints.includes(req.path)) behavior.endpoints.push(req.path);
-        if (behavior.endpoints.length > 100) behavior.endpoints = behavior.endpoints.slice(-100);
-        
-        behavior.methods = behavior.methods || {};
-        behavior.methods[req.method] = (behavior.methods[req.method] || 0) + 1;
-        
-        const currentRPS = behavior.requests.length;
-        behavior.avgRPS = behavior.avgRPS * (1 - this.learningRate) + currentRPS * this.learningRate;
-        
-        let anomalyScore = 0;
-        
-        if (currentRPS > behavior.avgRPS * 3) anomalyScore += 30;
-        else if (currentRPS > behavior.avgRPS * 2) anomalyScore += 15;
-        
-        if (behavior.endpoints.length > 50) anomalyScore += 20;
-        if (behavior.authFailures > 3) anomalyScore += Math.min(behavior.authFailures * 5, 30);
-        
-        const errorRatio = behavior.errorCount / Math.max(behavior.requests.length, 1);
-        if (errorRatio > 0.5) anomalyScore += 20;
-        
-        const totalReqs = Object.values(behavior.methods).reduce((a, b) => a + b, 0);
-        const nonGetRatio = (totalReqs - (behavior.methods['GET'] || 0)) / Math.max(totalReqs, 1);
-        if (nonGetRatio > 0.7 && totalReqs > 20) anomalyScore += 15;
-        
-        behavior.anomalyScore = Math.min(100, anomalyScore);
-        storage.set('behaviorPatterns', ip, behavior, 600000);
-        
-        return { 
-            anomalyScore: behavior.anomalyScore, 
-            requestRate: currentRPS, 
-            avgRPS: Math.round(behavior.avgRPS),
-            isAnomaly: behavior.anomalyScore > 50 
-        };
-    }
-    
-    recordError(ip) {
-        let b = storage.get('behaviorPatterns', ip) || { errorCount: 0 };
-        b.errorCount = (b.errorCount || 0) + 1;
-        storage.set('behaviorPatterns', ip, b, 600000);
-    }
-    
-    recordAuthFailure(ip) {
-        let b = storage.get('behaviorPatterns', ip) || { authFailures: 0 };
-        b.authFailures = (b.authFailures || 0) + 1;
-        storage.set('behaviorPatterns', ip, b, 600000);
-    }
-    
-    resetAuthFailures(ip) {
-        let b = storage.get('behaviorPatterns', ip);
-        if (b) { b.authFailures = 0; storage.set('behaviorPatterns', ip, b, 600000); }
-    }
-}
-
-const behaviorAnalyzer = new BehaviorAnalyzer();
-
-// ============================================
-// BOT DETECTOR
-// ============================================
-class BotDetector {
-    constructor() {
-        this.goodBots = [
-            { name: 'Googlebot', pattern: /googlebot/i, verify: '.google.com' },
-            { name: 'Bingbot', pattern: /bingbot/i, verify: '.bing.com' },
-            { name: 'DuckDuckBot', pattern: /duckduckbot/i },
-            { name: 'Slurp', pattern: /slurp/i, verify: '.yahoo.com' }
+        // التحقق من جميع نطاقات CDN
+        const allRanges = [
+            ...CDNIntegration.CLOUDFLARE_IP_RANGES,
+            ...CDNIntegration.CLOUDFRONT_IP_RANGES,
+            ...CDNIntegration.FASTLY_IP_RANGES
         ];
         
-        // 🔧 استثناء okhttp من البوتات السيئة (التطبيق يستخدمه)
-        this.trustedAgents = [/okhttp/i, /android/i, /dalvik/i];
-        
-        this.badBots = waf.badBots;
-    }
+        return allRanges.some(range => SecureUtils.isIPInRange(ip, range));
+    },
     
-    async detect(req, ip) {
-        const ua = req.headers?.['user-agent'] || '';
-        const result = { isBot: false, botType: null, confidence: 0, action: 'allow', reasons: [] };
-        
-        // 🔧 تخطي التطبيق الموثوق
-        if (this.trustedAgents.some(p => p.test(ua))) {
-            return { isBot: false, botType: 'trusted_app', confidence: 0, action: 'allow', reasons: ['Trusted mobile app'] };
-        }
-        
-        // فحص البوتات السيئة
-        for (const pattern of this.badBots) {
-            if (pattern.test(ua)) {
-                return { isBot: true, botType: 'malicious', confidence: 95, action: 'block', reasons: ['Known bad bot'] };
-            }
-        }
-        
-        // فحص البوتات الجيدة
-        for (const bot of this.goodBots) {
-            if (bot.pattern.test(ua)) {
-                if (bot.verify) {
-                    const verified = await this.verifyBot(ip, bot.verify);
-                    if (!verified) {
-                        return { isBot: true, botType: 'fake_crawler', confidence: 90, action: 'block', reasons: ['Failed DNS verification'] };
-                    }
-                }
-                return { isBot: true, botType: 'verified_crawler', confidence: 100, action: 'allow', reasons: [`Verified ${bot.name}`] };
-            }
-        }
-        
-        // تحليل Headers
+    // 🔥 استخراج IP العميل الحقيقي من خلف CDN
+    extractRealIP: (req) => {
         const headers = req.headers || {};
         
-        if (!headers['accept-language']) { result.confidence += 15; result.reasons.push('No Accept-Language'); }
-        if (!headers['accept-encoding']) { result.confidence += 10; result.reasons.push('No Accept-Encoding'); }
-        if (!headers['accept']) { result.confidence += 10; result.reasons.push('No Accept'); }
-        if (ua.length < 20) { result.confidence += 20; result.reasons.push('Short UA'); }
-        if (ua.length > 500) { result.confidence += 15; result.reasons.push('Oversized UA'); }
-        
-        const headerOrder = Object.keys(headers);
-        if (headerOrder.length > 0 && headerOrder[0] !== 'host') {
-            result.confidence += 10;
-            result.reasons.push('Unusual header order');
+        // 1. Cloudflare headers
+        if (headers['cf-connecting-ip'] && SecureUtils.isValidIP(headers['cf-connecting-ip'])) {
+            return headers['cf-connecting-ip'];
         }
         
-        if (headers['accept'] && !headers['accept'].includes('text/html') && !headers['accept'].includes('application/json')) {
-            result.confidence += 10;
-            result.reasons.push('Unusual Accept header');
+        // 2. True-Client-IP (Akamai, Fastly)
+        if (headers['true-client-ip'] && SecureUtils.isValidIP(headers['true-client-ip'])) {
+            return headers['true-client-ip'];
         }
         
-        const fingerprint = SecureUtils.generateFingerprint(req);
-        const fpData = storage.get('fingerprints', ip);
-        if (fpData && fpData.fingerprint !== fingerprint) {
-            result.confidence += 15;
-            result.reasons.push('Fingerprint mismatch');
-        }
-        storage.set('fingerprints', ip, { fingerprint }, 3600000);
-        
-        if (result.confidence >= 60) {
-            result.isBot = true;
-            result.botType = 'suspected';
-            result.action = 'challenge';
-        } else if (result.confidence >= 40) {
-            result.isBot = true;
-            result.botType = 'possible';
-            result.action = 'monitor';
+        // 3. X-Forwarded-For مع معالجة ذكية
+        if (headers['x-forwarded-for']) {
+            const ips = headers['x-forwarded-for']
+                .split(',')
+                .map(ip => ip.trim())
+                .filter(ip => SecureUtils.isValidIP(ip) && !CDNIntegration.isCDNIP(ip));
+            
+            if (ips.length > 0) return ips[0];
         }
         
-        return result;
-    }
+        // 4. X-Real-IP
+        if (headers['x-real-ip'] && SecureUtils.isValidIP(headers['x-real-ip'])) {
+            return headers['x-real-ip'];
+        }
+        
+        // Fallback
+        return (req.connection?.remoteAddress || req.socket?.remoteAddress || '127.0.0.1')
+            .replace(/^::ffff:/, '');
+    },
     
-    async verifyBot(ip, expectedDomain) {
-        try {
-            const dns = require('dns').promises;
-            const hostnames = await dns.reverse(ip);
-            return hostnames.some(h => h.endsWith(expectedDomain));
-        } catch { return false; }
-    }
-}
-
-const botDetector = new BotDetector();
-
-// ============================================
-// HONEYPOT
-// ============================================
-class Honeypot {
-    constructor() {
-        this.staticTrapPaths = [
-            '/admin.php', '/wp-admin', '/wp-login.php', '/phpmyadmin', '/.env', '/.git/config',
-            '/config.php', '/backup.sql', '/database.sql', '/.htaccess', '/.htpasswd',
-            '/xmlrpc.php', '/wp-config.php', '/administrator', '/.svn', '/.hg',
-            '/server-status', '/server-info', '/phpinfo.php', '/info.php', '/test.php',
-            '/shell.php', '/cmd.php', '/c99.php', '/r57.php', '/webshell'
-        ];
+    // 🔥 التحقق مما إذا كان الطلب يمر عبر CDN موثوق
+    isRequestViaTrustedCDN: (req) => {
+        const clientIP = getClientIP(req); // IP الذي يصل للخادم
         
-        this.trapFields = ['website', 'url', 'homepage', 'fax', 'company_url', 'http', 'link'];
-        
-        this.dynamicTraps = new Set();
-        this.generateDynamicTraps();
-        setInterval(() => this.generateDynamicTraps(), 3600000);
-    }
-    
-    generateDynamicTraps() {
-        this.dynamicTraps.clear();
-        const randomPaths = [
-            `/admin_${SecureUtils.generateSecureId(4)}`,
-            `/backup_${SecureUtils.generateSecureId(4)}.sql`,
-            `/config_${SecureUtils.generateSecureId(4)}.php`,
-            `/.env_${SecureUtils.generateSecureId(4)}`,
-            `/db_${SecureUtils.generateSecureId(4)}`
-        ];
-        randomPaths.forEach(p => this.dynamicTraps.add(p));
-    }
-    
-    check(req) {
-        const path = (req.path || '').toLowerCase();
-        
-        for (const trap of this.staticTrapPaths) {
-            if (path.includes(trap)) return { triggered: true, type: 'path', trap };
+        if (CDNIntegration.isCDNIP(clientIP)) {
+            // التحقق من وجود رؤوس CDN المطلوبة
+            const hasCFHeaders = req.headers['cf-ray'] || req.headers['cf-connecting-ip'];
+            const hasCloudFrontHeaders = req.headers['via'] && req.headers['via'].includes('CloudFront');
+            const hasFastlyHeaders = req.headers['x-served-by'] === 'Fastly';
+            
+            return hasCFHeaders || hasCloudFrontHeaders || hasFastlyHeaders;
         }
         
-        for (const trap of this.dynamicTraps) {
-            if (path === trap) return { triggered: true, type: 'dynamic_path', trap };
-        }
-        
-        if (req.body && typeof req.body === 'object') {
-            for (const field of this.trapFields) {
-                if (req.body[field] && String(req.body[field]).trim()) {
-                    return { triggered: true, type: 'form', trap: field };
-                }
-            }
-        }
-        
-        return { triggered: false };
-    }
+        return false;
+    },
     
-    getDynamicTraps() {
-        return Array.from(this.dynamicTraps);
+    // 🔥 إضافة رؤوس أمان CDN
+    addCDNSecurityHeaders: (res) => {
+        // Cloudflare headers
+        res.setHeader('CF-Cache-Status', 'DYNAMIC');
+        res.setHeader('CF-Ray', SecureUtils.generateSecureId(16));
+        
+        // CDN caching hints
+        res.setHeader('CDN-Cache-Control', 'no-store, no-cache, must-revalidate');
+        
+        // Request ID for tracing
+        res.setHeader('X-CDN-Request-ID', SecureUtils.generateSecureId(16));
     }
-}
-
-const honeypot = new Honeypot();
+};
 
 // ============================================
-// GET CLIENT IP
+// 🔧 UPDATED GET CLIENT IP
 // ============================================
 const getClientIP = (req) => {
-    const connectionIP = (req.connection?.remoteAddress || req.socket?.remoteAddress || '127.0.0.1').replace(/^::ffff:/, '');
+    // 🔥 استخدام CDNIntegration لاستخراج IP
+    const realIP = CDNIntegration.extractRealIP(req);
     
-    const isTrustedProxy = SECURITY_CONFIG.TRUSTED_PROXIES.some(range => {
-        if (range === connectionIP) return true;
-        return SecureUtils.isIPInRange(connectionIP, range);
-    });
-    
-    if (isTrustedProxy && req.headers?.['x-forwarded-for']) {
-        const ips = req.headers['x-forwarded-for']
-            .split(',')
-            .map(ip => ip.trim().replace(/^::ffff:/, ''))
-            .filter(ip => SecureUtils.isValidIP(ip));
-        
-        for (let i = ips.length - 1; i >= 0; i--) {
-            const ip = ips[i];
-            const isTrusted = SECURITY_CONFIG.TRUSTED_PROXIES.some(range => 
-                ip === range || SecureUtils.isIPInRange(ip, range)
-            );
-            if (!isTrusted && !SecureUtils.isPrivateIP(ip)) {
-                return ip;
-            }
-        }
-        
-        if (ips.length > 0) return ips[0];
+    // التحقق من صحة IP
+    if (SecureUtils.isValidIP(realIP)) {
+        return realIP;
     }
+    
+    // Fallback للطريقة القديمة
+    const connectionIP = (req.connection?.remoteAddress || 
+                         req.socket?.remoteAddress || 
+                         '127.0.0.1').replace(/^::ffff:/, '');
     
     return connectionIP;
 };
 
 // ============================================
-// SECURITY HEADERS
+// 🚦 ENHANCED RATE LIMITING
 // ============================================
-const addSecurityHeaders = (res, nonce = null) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '0');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=(), usb=()');
-    
-    const cspDirectives = [
-        "default-src 'self'",
-        nonce ? `script-src 'self' 'nonce-${nonce}'` : "script-src 'self'",
-        nonce ? `style-src 'self' 'nonce-${nonce}'` : "style-src 'self'",
-        "img-src 'self' data: https:",
-        "font-src 'self'",
-        "connect-src 'self'",
-        "frame-ancestors 'none'",
-        "base-uri 'self'",
-        "form-action 'self'",
-        "upgrade-insecure-requests"
-    ];
-    res.setHeader('Content-Security-Policy', cspDirectives.join('; '));
-    
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
-    res.setHeader('X-DNS-Prefetch-Control', 'off');
-    res.setHeader('X-Download-Options', 'noopen');
-    res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
-    
-    res.removeHeader('X-Powered-By');
-    res.removeHeader('Server');
-};
-
-// ============================================
-// LOG SECURITY EVENT
-// ============================================
-const logSecurityEvent = async (type, ip, details = {}) => {
-    const event = { 
-        type, 
-        ip: ip ? String(ip).slice(0, 45) : 'unknown', 
-        timestamp: new Date().toISOString(), 
-        ...details 
-    };
-    
-    console.log(`🛡️ [SECURITY] ${type} | IP: ${event.ip.slice(0, 20)}*** | ${JSON.stringify({ ...details, ip: undefined })}`);
-    
-    if (redisAvailable) {
-        try {
-            await redisClient.lpush('security:events', JSON.stringify(event));
-            await redisClient.ltrim('security:events', 0, 9999);
-        } catch {}
+class EnhancedRateLimiter {
+    constructor() {
+        this.endpointLimits = {
+            // 🔥 Login/Register - حماية شديدة
+            '/api/auth/login': { 
+                ipRPS: 5, 
+                globalRPS: 50,
+                capacity: 5, 
+                refillRate: 0.3,
+                blockDuration: 900000 // 15 دقيقة بعد 5 محاولات فاشلة
+            },
+            '/api/auth/register': { 
+                ipRPS: 3, 
+                globalRPS: 30,
+                capacity: 3, 
+                refillRate: 0.2,
+                blockDuration: 1800000 // 30 دقيقة
+            },
+            '/api/admin/login': { 
+                ipRPS: 3, 
+                globalRPS: 20,
+                capacity: 3, 
+                refillRate: 0.1,
+                blockDuration: 3600000 // ساعة كاملة
+            },
+            
+            // 🔥 Public API - حدود متوسطة
+            '/api/getUser': { 
+                ipRPS: 20, 
+                globalRPS: 200,
+                capacity: 30, 
+                refillRate: 5 
+            },
+            '/api/updateDevice': { 
+                ipRPS: 10, 
+                globalRPS: 100,
+                capacity: 20, 
+                refillRate: 2 
+            },
+            
+            // 🔥 Default limits
+            'default': { 
+                ipRPS: 50, 
+                globalRPS: 1000,
+                capacity: 100, 
+                refillRate: 10 
+            }
+        };
+        
+        // 🔥 Redis rate limiters لكل endpoint
+        this.redisLimiters = new Map();
+        this.initRedisLimiters();
     }
     
-    if (SECURITY_CONFIG.ALERT_WEBHOOK && ['waf_block', 'ddos_detected', 'brute_force', 'honeypot_triggered'].includes(type)) {
-        try {
-            const fetch = (await import('node-fetch')).default;
-            await fetch(SECURITY_CONFIG.ALERT_WEBHOOK, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(event),
-                timeout: 5000
-            });
-        } catch {}
+    initRedisLimiters() {
+        for (const [endpoint, config] of Object.entries(this.endpointLimits)) {
+            this.redisLimiters.set(
+                endpoint, 
+                new RedisRateLimiter(config.capacity, 60000)
+            );
+        }
     }
-};
+    
+    getEndpointConfig(path) {
+        for (const [endpoint, config] of Object.entries(this.endpointLimits)) {
+            if (path.startsWith(endpoint)) {
+                return config;
+            }
+        }
+        return this.endpointLimits.default;
+    }
+    
+    async checkRateLimit(req) {
+        const ip = getClientIP(req);
+        const path = req.path || req.url?.split('?')[0] || '/';
+        const config = this.getEndpointConfig(path);
+        
+        // 🔥 Redis-based rate limiting
+        if (redisAvailable) {
+            const limiter = this.redisLimiters.get(path) || 
+                           this.redisLimiters.get('default') ||
+                           new RedisRateLimiter(config.capacity);
+            
+            const result = await limiter.check(ip, path);
+            
+            if (!result.allowed) {
+                // تسجيل المخالفة
+                dynamicBlacklist.addViolation(ip, 1, 'rate_limit_exceeded');
+                
+                return {
+                    allowed: false,
+                    reason: 'Rate limit exceeded',
+                    retryAfter: result.retryAfter || 60,
+                    endpoint: path
+                };
+            }
+            
+            return { allowed: true, remaining: result.remaining };
+        }
+        
+        // 🔥 Memory-based fallback
+        return { allowed: true, remaining: config.capacity };
+    }
+    
+    // 🔥 Dynamic adjustment based on traffic
+    adjustLimitsBasedOnTraffic(currentRPS) {
+        const adjustmentFactor = currentRPS > 1000 ? 0.7 : 
+                                currentRPS > 500 ? 0.8 : 
+                                currentRPS > 100 ? 0.9 : 1;
+        
+        for (const [endpoint, config] of Object.entries(this.endpointLimits)) {
+            if (endpoint !== 'default') {
+                config.ipRPS = Math.floor(config.ipRPS * adjustmentFactor);
+                config.capacity = Math.floor(config.capacity * adjustmentFactor);
+            }
+        }
+    }
+}
 
 // ============================================
-// BLOCK IP
+// 🛡️ ENHANCED WAF WITH PAYLOAD VALIDATION
 // ============================================
-const blockIP = (ip, reason, duration = 3600000) => {
-    storage.set('blockedIPs', ip, { reason, blockedAt: Date.now() }, duration);
-    storage.increment('blockHistory', ip, 86400000 * 7);
-    logSecurityEvent('ip_blocked', ip, { reason, duration });
-};
+class EnhancedWAF extends WAFEngine {
+    constructor() {
+        super();
+        
+        // 🔥 Additional patterns
+        this.patterns.apiAbuse = [
+            /(?:api|v1|v2)\/.*?\.\.\/\.\./gi, // Path traversal in API
+            /(?:api|v1|v2)\/.*?select.*?from/gi, // SQLi in API paths
+            /(?:api|v1|v2)\/.*?union.*?select/gi
+        ];
+        
+        this.patterns.massAssignment = [
+            /(?:__proto__|constructor|prototype)\s*:/gi,
+            /"\$[a-zA-Z_]\w*"\s*:/gi, // MongoDB operators
+            /"\$[a-zA-Z_]\w*"\s*:\s*\{/gi
+        ];
+        
+        this.patterns.graphql = [
+            /__schema/gi,
+            /introspection/gi,
+            /__type/gi,
+            /query\s*\{\s*__/gi
+        ];
+    }
+    
+    scan(req) {
+        const results = super.scan(req);
+        const path = req.path || req.url?.split('?')[0] || '';
+        
+        // 🔥 Payload size validation
+        if (req.body) {
+            const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+            
+            // Maximum payload size
+            const maxBodySize = SECURITY_CONFIG.WAF?.maxBodySize || 1048576; // 1MB
+            
+            if (bodyStr.length > maxBodySize) {
+                results.threats.push({ 
+                    type: 'oversized_payload', 
+                    severity: 8, 
+                    location: 'body',
+                    size: bodyStr.length 
+                });
+                results.score += 8;
+            }
+            
+            // 🔥 Deep JSON validation
+            if (typeof req.body === 'object') {
+                this.validateJSONStructure(req.body, results);
+            }
+            
+            // 🔥 GraphQL protection
+            if (path.includes('/graphql') || path.includes('/gql')) {
+                this.scanGraphQL(req.body, results);
+            }
+            
+            // 🔥 Mass assignment protection
+            this.scanMassAssignment(req.body, results);
+        }
+        
+        // 🔥 API abuse detection
+        this.scanAPIAbuse(req, results);
+        
+        results.blocked = results.score >= (SECURITY_CONFIG.WAF?.blockThreshold || 10);
+        return results;
+    }
+    
+    validateJSONStructure(obj, results, depth = 0) {
+        if (depth > 10) { // منع التعمق المفرط
+            results.threats.push({ type: 'deep_json', severity: 5, location: 'body' });
+            results.score += 5;
+            return;
+        }
+        
+        if (Array.isArray(obj)) {
+            if (obj.length > 1000) { // arrays كبيرة جداً
+                results.threats.push({ type: 'large_array', severity: 3, location: 'body' });
+                results.score += 3;
+            }
+            
+            for (const item of obj.slice(0, 100)) { // تحقق من أول 100 عنصر فقط
+                if (typeof item === 'object' && item !== null) {
+                    this.validateJSONStructure(item, results, depth + 1);
+                }
+            }
+        } else if (typeof obj === 'object' && obj !== null) {
+            const keys = Object.keys(obj);
+            
+            if (keys.length > 100) { // objects كبيرة جداً
+                results.threats.push({ type: 'large_object', severity: 3, location: 'body' });
+                results.score += 3;
+            }
+            
+            for (const key of keys) {
+                // تحقق من مفاتيح خطيرة
+                if (key.toLowerCase().includes('password') || 
+                    key.toLowerCase().includes('token') ||
+                    key.toLowerCase().includes('secret')) {
+                    
+                    const value = obj[key];
+                    if (typeof value === 'string' && value.length > 1000) {
+                        results.threats.push({ 
+                            type: 'sensitive_data_leak', 
+                            severity: 7, 
+                            location: `body.${key}` 
+                        });
+                        results.score += 7;
+                    }
+                }
+                
+                const value = obj[key];
+                if (typeof value === 'object' && value !== null) {
+                    this.validateJSONStructure(value, results, depth + 1);
+                }
+            }
+        }
+    }
+    
+    scanGraphQL(body, results) {
+        const query = body.query || '';
+        
+        for (const pattern of this.patterns.graphql) {
+            if (pattern.test(query)) {
+                results.threats.push({ type: 'graphql_introspection', severity: 6, location: 'body' });
+                results.score += 6;
+                break;
+            }
+        }
+        
+        // تحقق من عمق query
+        const depth = this.calculateGraphQLDepth(query);
+        if (depth > 10) {
+            results.threats.push({ type: 'deep_graphql_query', severity: 5, location: 'body' });
+            results.score += 5;
+        }
+    }
+    
+    calculateGraphQLDepth(query) {
+        let depth = 0;
+        let maxDepth = 0;
+        
+        for (const char of query) {
+            if (char === '{') {
+                depth++;
+                maxDepth = Math.max(maxDepth, depth);
+            } else if (char === '}') {
+                depth--;
+            }
+        }
+        
+        return maxDepth;
+    }
+    
+    scanMassAssignment(body, results) {
+        const bodyStr = JSON.stringify(body).toLowerCase();
+        
+        for (const pattern of this.patterns.massAssignment) {
+            if (pattern.test(bodyStr)) {
+                results.threats.push({ type: 'mass_assignment', severity: 9, location: 'body' });
+                results.score += 9;
+                break;
+            }
+        }
+    }
+    
+    scanAPIAbuse(req, results) {
+        const path = (req.path || '').toLowerCase();
+        const url = (req.url || '').toLowerCase();
+        
+        for (const pattern of this.patterns.apiAbuse) {
+            if (pattern.test(path) || pattern.test(url)) {
+                results.threats.push({ type: 'api_abuse', severity: 7, location: 'url' });
+                results.score += 7;
+                break;
+            }
+        }
+    }
+}
 
 // ============================================
-// MAIN SECURITY MIDDLEWARE
+// 🔥 ENHANCED SECURITY MIDDLEWARE
 // ============================================
-const securityMiddleware = async (req, res, next) => {
+const enhancedSecurityMiddleware = async (req, res, next) => {
     const startTime = Date.now();
     const requestId = SecureUtils.generateSecureId(8);
     
@@ -1057,296 +907,273 @@ const securityMiddleware = async (req, res, next) => {
         const path = req.path || req.url?.split('?')[0] || '/';
         
         // Skip static files and exempt paths
-        if (SECURITY_CONFIG.STATIC_EXTENSIONS.test(path) || SECURITY_CONFIG.EXEMPT_PATHS.includes(path)) {
+        if (SECURITY_CONFIG.STATIC_EXTENSIONS.test(path) || 
+            SECURITY_CONFIG.EXEMPT_PATHS.includes(path)) {
             return next();
         }
         
         const ip = getClientIP(req);
         
-        // Skip security checks for localhost/internal IPs
-        const isExemptIP = SECURITY_CONFIG.EXEMPT_IPS?.includes(ip) || 
-                          ip === '127.0.0.1' || 
-                          ip === '::1' || 
-                          ip.startsWith('::ffff:127.');
-        
-        if (isExemptIP) {
-            req.security = { ip, requestId, reputation: 100, internal: true };
-            return next();
+        // 🔥 CDN Integration - إضافة رؤوس CDN
+        if (CDNIntegration.isRequestViaTrustedCDN(req)) {
+            CDNIntegration.addCDNSecurityHeaders(res);
+            req.isViaCDN = true;
         }
         
-        if (!SecureUtils.isValidIP(ip)) {
-            return res.status(400).json({ error: 'Invalid request', requestId });
-        }
-        
-        // 1. Check blocked
-        const blockData = storage.getWithMeta('blockedIPs', ip);
-        if (blockData) {
-            const remaining = Math.ceil((blockData.expiresAt - Date.now()) / 1000);
-            return res.status(403).json({
-                error: 'Access denied', 
-                reason: blockData.value.reason,
-                remaining_seconds: remaining, 
-                appeal_contact: SECURITY_CONFIG.APPEAL_CONTACT, 
+        // 🔥 Dynamic Blacklist Check
+        const blacklistCheck = dynamicBlacklist.isBlocked(ip);
+        if (blacklistCheck && blacklistCheck.blocked) {
+            return res.status(429).json({
+                error: 'Access temporarily restricted',
+                reason: blacklistCheck.reason,
+                remaining_seconds: blacklistCheck.remaining,
+                appeal_contact: SECURITY_CONFIG.APPEAL_CONTACT,
                 requestId
             });
         }
         
-        // 2. DDoS Protection
+        // 🔥 DDoS Protection
         const ddosCheck = ddosProtection.check(ip);
         if (!ddosCheck.allowed) {
+            // إضافة انتهاك للـ blacklist
+            dynamicBlacklist.addViolation(ip, 2, ddosCheck.type);
+            
             logSecurityEvent('ddos_detected', ip, ddosCheck);
-            return res.status(503).json({ error: 'Service temporarily unavailable', requestId });
+            return res.status(503).json({
+                error: 'Service temporarily unavailable',
+                retry_after: ddosCheck.retryAfter || 30,
+                requestId
+            });
         }
         
-        // 3. Honeypot
-        const honeypotCheck = honeypot.check(req);
-        if (honeypotCheck.triggered) {
-            logSecurityEvent('honeypot_triggered', ip, honeypotCheck);
-            blockIP(ip, 'Honeypot triggered', 86400000);
-            return setTimeout(() => res.status(404).json({ error: 'Not found' }), 3000 + Math.random() * 2000);
-        }
-        
-        // 4. Bot Detection
-        const botResult = await botDetector.detect(req, ip);
-        if (botResult.action === 'block') {
-            logSecurityEvent('bot_blocked', ip, botResult);
-            return res.status(403).json({ error: 'Access denied', requestId });
-        }
-        
-        // 5. Rate Limiting
+        // 🔥 Enhanced Rate Limiting
         if (SECURITY_CONFIG.ENABLE_RATE_LIMIT) {
-            const endpointType = path.includes('/admin') ? 'admin' : path.includes('/api/auth') ? 'auth' : path.includes('/api') ? 'api' : 'global';
-            const limiter = rateLimiters[endpointType] || rateLimiters.global;
-            const rateResult = await limiter.consume(`${ip}:${endpointType}`);
+            const rateLimitResult = await enhancedRateLimiter.checkRateLimit(req);
             
-            res.setHeader('X-RateLimit-Remaining', rateResult.remaining || 0);
-            
-            if (!rateResult.allowed) {
-                const violations = storage.increment('rateViolations', ip, 300000);
-                if (violations >= SECURITY_CONFIG.SOFT_BLOCK_VIOLATIONS) {
-                    blockIP(ip, 'Rate limit violations', 600000);
-                }
-                return res.status(429).json({ error: 'Too many requests', retry_after: Math.ceil((rateResult.resetIn || 60000) / 1000), requestId });
+            if (!rateLimitResult.allowed) {
+                res.setHeader('X-RateLimit-Remaining', 0);
+                res.setHeader('X-RateLimit-Reset', rateLimitResult.retryAfter || 60);
+                
+                return res.status(429).json({
+                    error: 'Too many requests',
+                    retry_after: rateLimitResult.retryAfter || 60,
+                    endpoint: rateLimitResult.endpoint,
+                    requestId
+                });
             }
+            
+            res.setHeader('X-RateLimit-Remaining', rateLimitResult.remaining || 0);
         }
         
-        // 6. IP Analysis
-        const ipAnalysis = await ipAnalyzer.analyze(ip);
-        if (ipAnalysis.reputation < 30 && path.includes('/admin')) {
-            return res.status(403).json({ error: 'Access denied', reason: 'Low reputation', requestId });
+        // 🔥 Request Complexity Analysis
+        const complexity = SecureUtils.computeRequestComplexity(req);
+        if (complexity > 5) {
+            // طلبات معقدة جداً تحتاج لمزيد من الفحص
+            req.isComplexRequest = true;
+            
+            // تسجيل للتحليل
+            logSecurityEvent('complex_request', ip, {
+                complexity,
+                path,
+                method: req.method,
+                bodySize: req.body ? JSON.stringify(req.body).length : 0
+            });
         }
         
-        // 7. WAF - 🔧 محسّن مع استثناءات ذكية
+        // 🔥 Enhanced WAF Scanning
         if (SECURITY_CONFIG.ENABLE_WAF && shouldScanPath(path)) {
-            const wafResult = waf.scan(req);
+            const wafResult = enhancedWAF.scan(req);
+            
             if (wafResult.blocked) {
-                logSecurityEvent('waf_block', ip, { threats: wafResult.threats, score: wafResult.score });
+                // إضافة انتهاك كبير للـ blacklist
+                dynamicBlacklist.addViolation(ip, 5, 'waf_violation');
+                
+                logSecurityEvent('waf_block', ip, {
+                    threats: wafResult.threats,
+                    score: wafResult.score,
+                    path
+                });
+                
                 blockIP(ip, 'WAF violation', 1800000);
-                return res.status(403).json({ error: 'Request blocked', requestId });
+                
+                return res.status(403).json({
+                    error: 'Request blocked by security system',
+                    requestId,
+                    blocked_at: new Date().toISOString()
+                });
+            }
+            
+            // إذا كان هناك تهديدات ولكن لم يتم الحظر
+            if (wafResult.score > 3) {
+                dynamicBlacklist.addViolation(ip, 1, 'waf_anomaly');
             }
         }
         
-        // 8. Behavior Analysis
-        const behavior = behaviorAnalyzer.analyze(ip, req);
-        if (behavior.isAnomaly && behavior.anomalyScore > SECURITY_CONFIG.ANOMALY_THRESHOLD) {
-            logSecurityEvent('anomaly_detected', ip, { score: behavior.anomalyScore, avgRPS: behavior.avgRPS });
-        }
-        
-        // 9. Security Headers
+        // 🔥 Security Headers with nonce
         const nonce = SecureUtils.generateSecureId(16);
         addSecurityHeaders(res, nonce);
         
-        // 10. Attach security info
-        req.security = { 
-            ip, 
-            requestId, 
-            reputation: ipAnalysis.reputation, 
-            anomalyScore: behavior.anomalyScore,
+        // 🔥 Attach security info
+        req.security = {
+            ip,
+            requestId,
+            complexity,
             fingerprint: SecureUtils.generateFingerprint(req),
-            nonce
+            nonce,
+            isViaCDN: req.isViaCDN || false,
+            isComplexRequest: req.isComplexRequest || false,
+            processingTime: Date.now() - startTime
         };
         
-        // Track response status for error rate
-        res.on('finish', () => {
-            if (res.statusCode >= 400) {
-                behaviorAnalyzer.recordError(ip);
-            }
-        });
-        
-        next();
-    } catch (error) {
-        console.error('Security middleware error:', error.message);
-        next();
-    }
-};
-
-// ============================================
-// BRUTE FORCE PROTECTION
-// ============================================
-const bruteForceProtection = async (req, res, next) => {
-    const ip = getClientIP(req);
-    const cfg = SECURITY_CONFIG.BRUTE_FORCE;
-    
-    const username = req.body?.username || req.body?.email || '';
-    const ipKey = ip;
-    const userKey = username ? `user:${SecureUtils.secureHash(username)}` : null;
-    
-    let ipAttempts = storage.get('loginAttempts', ipKey) || { count: 0, lockUntil: 0, lockCount: 0 };
-    let userAttempts = userKey ? (storage.get('userAttempts', userKey) || { count: 0, lockUntil: 0 }) : null;
-    
-    if (ipAttempts.lockUntil > Date.now()) {
-        const remaining = Math.ceil((ipAttempts.lockUntil - Date.now()) / 1000);
-        return res.status(429).json({ error: 'Too many attempts from this IP', remaining_seconds: remaining });
-    }
-    
-    if (userAttempts && userAttempts.lockUntil > Date.now()) {
-        const remaining = Math.ceil((userAttempts.lockUntil - Date.now()) / 1000);
-        return res.status(429).json({ error: 'Account temporarily locked', remaining_seconds: remaining });
-    }
-    
-    req.recordFailedAttempt = () => {
-        ipAttempts.count++;
-        behaviorAnalyzer.recordAuthFailure(ip);
-        
-        if (ipAttempts.count >= cfg.maxAttempts) {
-            const lockTime = Math.min(cfg.lockoutTime * Math.pow(cfg.escalationMultiplier, ipAttempts.lockCount), cfg.maxLockoutTime);
-            ipAttempts.lockUntil = Date.now() + lockTime;
-            ipAttempts.lockCount++;
-            ipAttempts.count = 0;
-            logSecurityEvent('brute_force', ip, { lockTime, lockCount: ipAttempts.lockCount, username: username ? '***' : null });
-        }
-        storage.set('loginAttempts', ipKey, ipAttempts, 86400000);
-        
-        if (userKey) {
-            userAttempts = userAttempts || { count: 0, lockUntil: 0 };
-            userAttempts.count++;
-            if (userAttempts.count >= cfg.maxAttempts * 2) {
-                userAttempts.lockUntil = Date.now() + cfg.lockoutTime;
-                userAttempts.count = 0;
-            }
-            storage.set('userAttempts', userKey, userAttempts, 86400000);
-        }
-    };
-    
-    req.resetFailedAttempts = () => {
-        storage.delete('loginAttempts', ipKey);
-        if (userKey) storage.delete('userAttempts', userKey);
-        behaviorAnalyzer.resetAuthFailures(ip);
-    };
-    
-    req.loginAttempts = { count: ipAttempts.count, remaining: cfg.maxAttempts - ipAttempts.count };
-    next();
-};
-
-// ============================================
-// HELPER FUNCTIONS
-// ============================================
-function shouldScanPath(path) {
-    const sensitive = ['/admin', '/api/', '/login', '/register', '/auth', '/user', '/payment', '/upload', '/download', '/export'];
-    return sensitive.some(p => path.includes(p));
-}
-
-// ============================================
-// ADMIN FUNCTIONS
-// ============================================
-const securityAdmin = {
-    getStats: () => ({
-        storage: storage.getStats(),
-        ddos: ddosProtection.getStats(),
-        redis: { available: redisAvailable },
-        threatLists: { torNodes: ipAnalyzer.torNodes.size, lastUpdate: ipAnalyzer.lastUpdate },
-        config: { 
-            protectionLevel: SECURITY_CONFIG.PROTECTION_LEVEL, 
-            wafEnabled: SECURITY_CONFIG.ENABLE_WAF, 
-            rateLimitEnabled: SECURITY_CONFIG.ENABLE_RATE_LIMIT,
-            trustedProxies: SECURITY_CONFIG.TRUSTED_PROXIES.length,
-            trustedAppEndpoints: TRUSTED_APP_ENDPOINTS.bodyExemptPaths.length
-        },
-        honeypot: { staticTraps: honeypot.staticTrapPaths.length, dynamicTraps: honeypot.dynamicTraps.size },
-        timestamp: new Date().toISOString()
-    }),
-    
-    getBlockedIPs: () => {
-        const blocked = [];
-        const store = storage.getStore('blockedIPs');
-        for (const [, item] of store.entries()) {
-            if (Date.now() < item.expiresAt) {
-                blocked.push({
-                    reason: item.value.reason,
-                    blockedAt: new Date(item.value.blockedAt).toISOString(),
-                    expiresAt: new Date(item.expiresAt).toISOString(),
-                    remaining: Math.ceil((item.expiresAt - Date.now()) / 1000)
+        // Track response for analysis
+        const originalSend = res.send;
+        res.send = function(data) {
+            const responseTime = Date.now() - startTime;
+            
+            // تسجيل استجابة طويلة
+            if (responseTime > 5000) { // أكثر من 5 ثوان
+                logSecurityEvent('slow_response', ip, {
+                    path,
+                    responseTime,
+                    statusCode: res.statusCode
                 });
             }
-        }
-        return blocked;
-    },
-    
-    unblockIP: (ip) => {
-        storage.delete('blockedIPs', ip);
-        storage.delete('loginAttempts', ip);
-        storage.delete('rateViolations', ip);
-        storage.delete('behaviorPatterns', ip);
-        logSecurityEvent('ip_unblocked', ip, { manual: true });
-        return { success: true };
-    },
-    
-    blockIP: (ip, reason, duration = 3600000) => {
-        blockIP(ip, reason, duration);
-        return { success: true };
-    },
-    
-    getSecurityEvents: async (limit = 100) => {
-        if (redisAvailable) {
-            try {
-                const events = await redisClient.lrange('security:events', 0, limit - 1);
-                return events.map(e => JSON.parse(e));
-            } catch { return []; }
-        }
-        return [];
-    },
-    
-    cleanup: () => ({ success: true, cleaned: storage.cleanup() }),
-    
-    getDynamicHoneypots: () => honeypot.getDynamicTraps()
+            
+            // إضافة header لوقت المعالجة
+            res.setHeader('X-Processing-Time', `${responseTime}ms`);
+            
+            return originalSend.call(this, data);
+        };
+        
+        next();
+        
+    } catch (error) {
+        console.error('Enhanced security middleware error:', error.message);
+        
+        // Fallback to basic security
+        req.security = { ip: getClientIP(req), requestId: SecureUtils.generateSecureId(8) };
+        next();
+    }
 };
 
 // ============================================
-// MAINTENANCE
+// 🎯 INITIALIZATION
+// ============================================
+// تهيئة المكونات المحسنة
+const dynamicBlacklist = new DynamicBlacklist();
+const ddosProtection = new DDoSProtection();
+const enhancedRateLimiter = new EnhancedRateLimiter();
+const enhancedWAF = new EnhancedWAF();
+
+// تهيئة Redis
+initRedis();
+
+// ============================================
+// 📊 ENHANCED ADMIN FUNCTIONS
+// ============================================
+const enhancedSecurityAdmin = {
+    ...securityAdmin, // الحفاظ على الدوال القديمة
+    
+    getEnhancedStats: () => ({
+        ...securityAdmin.getStats(),
+        blacklist: dynamicBlacklist.getStats(),
+        ddos: ddosProtection.getStats(),
+        rateLimiting: {
+            endpoints: Object.keys(enhancedRateLimiter.endpointLimits).length,
+            redisEnabled: redisAvailable
+        },
+        cdn: {
+            cloudflareRanges: CDNIntegration.CLOUDFLARE_IP_RANGES.length,
+            cloudfrontRanges: CDNIntegration.CLOUDFRONT_IP_RANGES.length,
+            fastlyRanges: CDNIntegration.FASTLY_IP_RANGES.length
+        }
+    }),
+    
+    getBlacklistDetails: () => {
+        const details = [];
+        for (const [ip, record] of dynamicBlacklist.blacklist.entries()) {
+            details.push({
+                ip,
+                blockedAt: new Date(record.blockedAt).toISOString(),
+                blockedUntil: new Date(record.blockedUntil).toISOString(),
+                reason: record.reason,
+                violations: record.violations
+            });
+        }
+        return details;
+    },
+    
+    clearBlacklist: () => {
+        for (const [ip] of dynamicBlacklist.blacklist.entries()) {
+            dynamicBlacklist.unblock(ip);
+        }
+        return { success: true, cleared: dynamicBlacklist.blacklist.size };
+    },
+    
+    adjustRateLimits: (endpoint, newLimits) => {
+        if (enhancedRateLimiter.endpointLimits[endpoint]) {
+            enhancedRateLimiter.endpointLimits[endpoint] = {
+                ...enhancedRateLimiter.endpointLimits[endpoint],
+                ...newLimits
+            };
+            return { success: true, endpoint, newLimits };
+        }
+        return { success: false, error: 'Endpoint not found' };
+    }
+};
+
+// ============================================
+// 📈 MAINTENANCE & MONITORING
 // ============================================
 setInterval(() => {
     const cleaned = storage.cleanup();
-    const stats = storage.getStats();
-    if (cleaned > 0 || stats.totalEntries > 1000) {
-        console.log(`🔧 [MAINTENANCE] Cleaned: ${cleaned}, Total: ${stats.totalEntries}`);
+    const blacklistCleaned = dynamicBlacklist.cleanup();
+    
+    if (cleaned > 0 || blacklistCleaned > 0) {
+        console.log(`🔧 [MAINTENANCE] Cleaned: ${cleaned} entries, ${blacklistCleaned} from blacklist`);
     }
-}, 300000);
+    
+    // 🔥 Auto-adjust rate limits based on traffic
+    const stats = ddosProtection.getStats();
+    enhancedRateLimiter.adjustLimitsBasedOnTraffic(stats.globalRPS);
+    
+}, 300000); // كل 5 دقائق
 
 // ============================================
-// EXPORTS
+// 📦 EXPORTS
 // ============================================
 module.exports = {
-    securityMiddleware,
+    securityMiddleware: enhancedSecurityMiddleware,
     bruteForceProtection,
     getClientIP,
     addSecurityHeaders,
-    securityAdmin,
+    securityAdmin: enhancedSecurityAdmin,
     
+    // المكونات المحسنة
     storage,
     ipAnalyzer,
-    waf,
+    waf: enhancedWAF,
     behaviorAnalyzer,
     botDetector,
     honeypot,
     ddosProtection,
     rateLimiters,
     
+    // المكونات الجديدة
+    dynamicBlacklist,
+    enhancedRateLimiter,
+    CDNIntegration,
+    
+    // الإعدادات
     SECURITY_CONFIG,
     TRUSTED_APP_ENDPOINTS,
     
+    // الأدوات
     utils: {
         blockIP,
         logSecurityEvent,
-        SecureUtils
+        SecureUtils,
+        isRequestViaCDN: CDNIntegration.isRequestViaTrustedCDN,
+        extractRealIP: CDNIntegration.extractRealIP
     }
 };
