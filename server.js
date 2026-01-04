@@ -7,6 +7,15 @@ const helmet = require('helmet');
 const cors = require('cors');
 const config = require('./config');
 
+
+// 🔍 Debug - احذفه بعد الإصلاح!
+console.log('🔍 Admin Config Check:', {
+    username: config.ADMIN_CREDENTIALS?.username,
+    passLength: config.ADMIN_CREDENTIALS?.password?.length,
+    passFirst2: config.ADMIN_CREDENTIALS?.password?.slice(0, 2),
+    passLast2: config.ADMIN_CREDENTIALS?.password?.slice(-2)
+});
+
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════════
