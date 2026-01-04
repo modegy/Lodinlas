@@ -214,101 +214,111 @@ class SecurityMiddleware {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // 🔥 WAF (Web Application Firewall)
+    // 🔥 WAF (Web Application Firewall) - Smart Detection
     // ═══════════════════════════════════════════════════════════════
     wafCheck(req) {
+        const currentPath = req.path || req.url?.split('?')[0] || '';
+        
         // فحص طول URL
         const maxUrlLength = this.wafConfig.MAX_URL_LENGTH || 2048;
-        if (req.url.length > maxUrlLength) {
+        if (req.url && req.url.length > maxUrlLength) {
             return { safe: false, reason: 'URL_TOO_LONG' };
         }
 
         // فحص حجم Body
         const contentLength = parseInt(req.headers['content-length'] || 0);
-        const maxBodySize = this.wafConfig.MAX_BODY_SIZE || 1048576; // 1MB
+        const maxBodySize = this.wafConfig.MAX_BODY_SIZE || 1048576;
         if (contentLength > maxBodySize) {
             return { safe: false, reason: 'BODY_TOO_LARGE' };
         }
 
-        // بناء الـ payload للفحص
-        const payload = this.buildPayloadForScan(req);
+        // ═══════════════════════════════════════════════════════════
+        // فحص URL و Query Parameters (الأكثر خطورة)
+        // ═══════════════════════════════════════════════════════════
+        const urlToCheck = decodeURIComponent(req.url || '').toLowerCase();
+        const queryString = JSON.stringify(req.query || {}).toLowerCase();
         
-        // فحص أنماط الهجوم
-        const attacks = [
-            // XSS
-            { 
-                pattern: /<script[\s\S]*?>[\s\S]*?<\/script>/gi, 
-                name: 'XSS_SCRIPT' 
-            },
-            { 
-                pattern: /javascript\s*:/gi, 
-                name: 'XSS_JAVASCRIPT' 
-            },
-            { 
-                pattern: /on\w+\s*=/gi, 
-                name: 'XSS_EVENT_HANDLER' 
-            },
-            
-            // SQL Injection
-            { 
-                pattern: /(\b(union|select|insert|update|delete|drop|create|alter|truncate)\b[\s\S]*\b(from|into|table|database|where)\b)/gi, 
-                name: 'SQL_INJECTION' 
-            },
-            { 
-                pattern: /(\bor\b|\band\b)[\s]*[\d\w]*[\s]*[=<>]/gi, 
-                name: 'SQL_BOOLEAN_INJECTION' 
-            },
-            { 
-                pattern: /(--|#|\/\*|\*\/)/g, 
-                name: 'SQL_COMMENT_INJECTION' 
-            },
-            
+        const urlAttacks = [
             // Path Traversal
-            { 
-                pattern: /\.\.\//g, 
-                name: 'PATH_TRAVERSAL' 
-            },
-            { 
-                pattern: /\.\.\\/g, 
-                name: 'PATH_TRAVERSAL_WIN' 
-            },
+            { pattern: /\.\.[\/\\]/, name: 'PATH_TRAVERSAL' },
+            { pattern: /%2e%2e[%2f%5c]/i, name: 'PATH_TRAVERSAL_ENCODED' },
             
-            // Command Injection
-            { 
-                pattern: /[;&|`$]|\$\(/g, 
-                name: 'COMMAND_INJECTION' 
-            },
-            { 
-                pattern: /(eval|exec|system|passthru|shell_exec|popen)\s*\(/gi, 
-                name: 'CODE_EXECUTION' 
-            },
+            // Command Injection في URL فقط
+            { pattern: /[;|`]\s*\w+/, name: 'COMMAND_INJECTION' },
+            { pattern: /\$\([^)]+\)/, name: 'COMMAND_SUBSTITUTION' },
+            { pattern: /%0[ad]/i, name: 'CRLF_INJECTION' },
             
-            // Template Injection
-            { 
-                pattern: /(\$\{|\{\{|<%|%>|\${.*})/g, 
-                name: 'TEMPLATE_INJECTION' 
-            },
+            // Suspicious Files
+            { pattern: /\/(\.env|\.git|\.htaccess|wp-config|phpinfo)/i, name: 'SENSITIVE_FILE_ACCESS' },
+            { pattern: /\/(etc\/passwd|proc\/self|windows\/system32)/i, name: 'SYSTEM_FILE_ACCESS' },
             
-            // LDAP Injection
-            { 
-                pattern: /[()\\*]/g, 
-                name: 'LDAP_INJECTION',
-                threshold: 5 // يحتاج 5+ تطابقات
-            },
-            
-            // XML/XXE
-            { 
-                pattern: /<!\s*\[CDATA\[|<!ENTITY/gi, 
-                name: 'XXE_ATTACK' 
-            }
+            // Protocol attacks
+            { pattern: /^(file|gopher|dict|php|data):\/\//i, name: 'PROTOCOL_ATTACK' }
         ];
 
-        for (const attack of attacks) {
-            const matches = payload.match(attack.pattern);
-            const threshold = attack.threshold || 1;
+        for (const attack of urlAttacks) {
+            if (attack.pattern.test(urlToCheck) || attack.pattern.test(queryString)) {
+                console.warn(`🚨 WAF [URL]: ${attack.name} | IP: ${req.clientIP || req.ip} | Path: ${currentPath}`);
+                return { safe: false, reason: attack.name };
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // فحص Body (بدون الحقول الحساسة)
+        // ═══════════════════════════════════════════════════════════
+        const bodyToCheck = this.sanitizeBodyForCheck(req.body);
+        
+        const bodyAttacks = [
+            // XSS
+            { pattern: /<script[^>]*>[\s\S]*?<\/script>/gi, name: 'XSS_SCRIPT' },
+            { pattern: /javascript\s*:/gi, name: 'XSS_PROTOCOL' },
+            { pattern: /on(load|error|click|mouse|focus|blur)\s*=/gi, name: 'XSS_EVENT' },
             
-            if (matches && matches.length >= threshold) {
-                console.warn(`🚨 WAF Block: ${attack.name} from ${req.clientIP || req.ip}`);
+            // SQL Injection (أنماط حقيقية، ليست كلمات عادية)
+            { pattern: /'\s*(or|and)\s*'?\d*\s*=\s*'?\d*/gi, name: 'SQL_INJECTION' },
+            { pattern: /union\s+(all\s+)?select\s+/gi, name: 'SQL_UNION' },
+            { pattern: /;\s*(drop|delete|truncate|update|insert)\s+/gi, name: 'SQL_DESTRUCTIVE' },
+            { pattern: /'\s*;\s*--/g, name: 'SQL_COMMENT' },
+            
+            // NoSQL Injection
+            { pattern: /\$where\s*:/gi, name: 'NOSQL_WHERE' },
+            { pattern: /\{\s*['"]\$[a-z]+['"]\s*:/gi, name: 'NOSQL_OPERATOR' },
+            
+            // Code Execution
+            { pattern: /\b(eval|exec|system|passthru|shell_exec|popen)\s*\(/gi, name: 'CODE_EXEC' },
+            
+            // XXE
+            { pattern: /<!ENTITY\s+/gi, name: 'XXE_ENTITY' },
+            { pattern: /<!\[CDATA\[/gi, name: 'XXE_CDATA' },
+            
+            // SSTI (Server-Side Template Injection)
+            { pattern: /\{\{.*\}\}/g, name: 'SSTI_DOUBLE_BRACE' },
+            { pattern: /<%.*%>/g, name: 'SSTI_ERB' },
+            { pattern: /\${[^}]+}/g, name: 'SSTI_DOLLAR' }
+        ];
+
+        for (const attack of bodyAttacks) {
+            if (attack.pattern.test(bodyToCheck)) {
+                console.warn(`🚨 WAF [BODY]: ${attack.name} | IP: ${req.clientIP || req.ip} | Path: ${currentPath}`);
+                return { safe: false, reason: attack.name };
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // فحص Headers (User-Agent, Referer فقط)
+        // ═══════════════════════════════════════════════════════════
+        const userAgent = (req.headers['user-agent'] || '').toLowerCase();
+        const referer = (req.headers['referer'] || '').toLowerCase();
+        
+        const headerAttacks = [
+            { pattern: /<script/gi, name: 'XSS_IN_HEADER' },
+            { pattern: /\.\.[\/\\]/g, name: 'PATH_TRAVERSAL_HEADER' }
+        ];
+        
+        const headersToCheck = userAgent + ' ' + referer;
+        for (const attack of headerAttacks) {
+            if (attack.pattern.test(headersToCheck)) {
+                console.warn(`🚨 WAF [HEADER]: ${attack.name} | IP: ${req.clientIP || req.ip}`);
                 return { safe: false, reason: attack.name };
             }
         }
@@ -316,15 +326,31 @@ class SecurityMiddleware {
         return { safe: true };
     }
 
-    buildPayloadForScan(req) {
-        const parts = [
-            req.url || '',
-            JSON.stringify(req.query || {}),
-            JSON.stringify(req.body || {}),
-            req.headers['user-agent'] || '',
-            req.headers['referer'] || ''
+    // تنظيف Body من الحقول الحساسة قبل الفحص
+    sanitizeBodyForCheck(body) {
+        if (!body || typeof body !== 'object') return '';
+        
+        // الحقول التي لا نفحصها (كلمات مرور، tokens، etc)
+        const sensitiveFields = [
+            'password', 'passwd', 'pass', 'pwd',
+            'token', 'access_token', 'refresh_token', 'session_token',
+            'api_key', 'apikey', 'api_secret', 'secret',
+            'credential', 'auth', 'authorization',
+            'private_key', 'secret_key'
         ];
-        return parts.join(' ').toLowerCase();
+        
+        const cleanBody = { ...body };
+        
+        for (const field of sensitiveFields) {
+            // حذف الحقول الحساسة (case insensitive)
+            for (const key of Object.keys(cleanBody)) {
+                if (key.toLowerCase().includes(field)) {
+                    delete cleanBody[key];
+                }
+            }
+        }
+        
+        return JSON.stringify(cleanBody).toLowerCase();
     }
 
     // ═══════════════════════════════════════════════════════════════
