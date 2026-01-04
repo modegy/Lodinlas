@@ -1,6 +1,6 @@
 {
   "name": "secure-firebase-proxy",
-  "version": "3.4.1",
+  "version": "3.4.2",
   "description": "Secure Proxy system for Firebase with SecureArmor v14.1 Enhanced Protection",
   "main": "server.js",
   "scripts": {
@@ -17,13 +17,8 @@
     "security:audit": "npm audit --production",
     "security:fix": "npm audit fix",
     "security:check": "node -e \"require('./config').validateConfig()\"",
-    "security:health": "node scripts/security-health.js",
-    "redis:test": "node scripts/redis-test.js",
-    "firebase:test": "node scripts/firebase-test.js",
-    "deploy": "npm run security:check && npm run security:audit && npm start",
-    "build": "echo 'No build step required'",
-    "clean": "rm -rf node_modules package-lock.json && npm install",
-    "docs": "node scripts/generate-docs.js"
+    "deploy": "npm run security:audit && npm start",
+    "clean": "rm -rf node_modules package-lock.json && npm install"
   },
   "keywords": [
     "firebase",
@@ -31,147 +26,63 @@
     "security",
     "ddos-protection",
     "rate-limiting",
-    "waf",
-    "bot-detection",
-    "brute-force-protection",
-    "honeypot",
-    "authentication",
-    "authorization",
-    "api-security",
-    "web-application-firewall",
-    "cybersecurity"
+    "waf"
   ],
   "author": "SecureArmor Team",
   "license": "MIT",
   "dependencies": {
-    
-    "express": "^4.18.2",
+    "express": "^4.21.2",
     "cors": "^2.8.5",
-    "helmet": "^7.1.0",
-    "dotenv": "^16.3.1",
+    "helmet": "^8.0.0",
+    "dotenv": "^16.4.7",
     
+    "axios": "^1.7.9",
     
-    "axios": "^1.6.2",
+    "ioredis": "^5.4.2",
     
-    
-    "ioredis": "^5.3.2",
-    
-    
-    "express-rate-limit": "^7.4.0",
-    "rate-limit-redis": "^4.1.2",
-    "node-fetch": "^3.3.2",
+    "express-rate-limit": "^7.5.0",
+    "rate-limit-redis": "^4.2.0",
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
-    "express-brute": "^1.0.1",
-    "express-brute-redis": "^0.0.1",
-    "csurf": "^1.11.0",
     "hpp": "^0.2.3",
-    "express-mongo-sanitize": "^2.2.0",
-    "xss-clean": "^0.1.4",
-    "express-validator": "^7.0.1",
+    "express-validator": "^7.2.1",
     "express-useragent": "^1.0.15",
-    "ua-parser-js": "^1.0.35",
-    "geoip-lite": "^1.4.9",
+    "ua-parser-js": "^1.0.39",
+    "geoip-lite": "^1.4.10",
     
-    
-    "winston": "^3.11.0",
+    "winston": "^3.17.0",
     "morgan": "^1.10.0",
-    "express-status-monitor": "^1.3.4",
-    "prom-client": "^14.2.0",
-    
+    "prom-client": "^15.1.3",
     
     "lodash": "^4.17.21",
-    "moment": "^2.29.4",
-    "uuid": "^9.0.1",
-    "validator": "^13.11.0",
-    "qs": "^6.11.2",
-    "compression": "^1.7.4",
-    "cookie-parser": "^1.4.6",
-    "body-parser": "^1.20.2",
+    "uuid": "^11.0.4",
+    "validator": "^13.12.0",
+    "qs": "^6.13.1",
+    "compression": "^1.7.5",
+    "cookie-parser": "^1.4.7",
+    "body-parser": "^1.20.3",
     
-    
-    "http-proxy-middleware": "^2.0.6",
+    "http-proxy-middleware": "^3.0.3",
     "request-ip": "^3.3.0",
-    "ipware": "^2.0.0",
-    "useragent": "^2.3.0",
     
-    
-    "node-cron": "^3.0.2",
-    "node-schedule": "^2.1.1",
-    "webhook-discord": "^3.1.1",
-    "nodemailer": "^6.9.7"
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.16"
   },
   "devDependencies": {
-    
-    "nodemon": "^3.0.2",
+    "nodemon": "^3.1.9",
     "jest": "^29.7.0",
-    "supertest": "^6.3.3",
-    "eslint": "^8.53.0",
-    "eslint-config-airbnb-base": "^15.0.0",
-    "eslint-plugin-import": "^2.29.0",
-    "eslint-plugin-security": "^1.7.1",
-    "prettier": "^3.0.3",
-    
-    
-    "@types/jest": "^29.5.8",
-    "jest-mock": "^29.7.0",
-    "testcontainers": "^10.1.0",
-    
-    
-    "swagger-jsdoc": "^6.2.8",
-    "swagger-ui-express": "^5.0.0",
-    "jsdoc": "^4.0.3"
+    "supertest": "^7.0.0",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2"
   },
   "engines": {
     "node": ">=18.0.0",
     "npm": ">=9.0.0"
   },
   "private": true,
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/your-username/secure-firebase-proxy.git"
-  },
-  "bugs": {
-    "url": "https://github.com/your-username/secure-firebase-proxy/issues"
-  },
-  "homepage": "https://github.com/your-username/secure-firebase-proxy#readme",
-  "funding": {
-    "type": "individual",
-    "url": "https://github.com/sponsors/your-username"
-  },
-  "contributors": [
-    "SecureArmor Team <team@securearmor.com>"
-  ],
-  "files": [
-    "server.js",
-    "config/",
-    "middleware/",
-    "routes/",
-    "services/",
-    "scripts/",
-    "tests/",
-    "docs/",
-    ".env.example",
-    "README.md",
-    "SECURITY.md",
-    "CHANGELOG.md"
-  ],
-  "os": [
-    "linux",
-    "darwin",
-    "win32"
-  ],
-  "cpu": [
-    "x64",
-    "arm64"
-  ],
-  "directories": {
-    "doc": "docs",
-    "test": "tests",
-    "config": "config",
-    "middleware": "middleware",
-    "routes": "routes",
-    "services": "services",
-    "scripts": "scripts"
+  "overrides": {
+    "semver": "^7.6.0",
+    "tough-cookie": "^5.0.0",
+    "got": "^14.0.0"
   }
 }
