@@ -1,138 +1,314 @@
 // middleware/security.js - Security Middleware v14.1
+// متوافق مع auth.js و config/index.js
+'use strict';
+
 const crypto = require('crypto');
 
 class SecurityMiddleware {
     constructor(config) {
         this.config = config.SECURITY || {};
+        this.ddosConfig = config.SECURITY?.DDOS || config.DDOS || {};
+        this.bruteForceConfig = config.SECURITY?.BRUTE_FORCE || {};
+        this.wafConfig = config.SECURITY?.WAF || {};
+        
+        // مخازن البيانات
         this.ipCache = new Map();
         this.rateLimitStore = new Map();
         this.blockedIPs = new Set();
-        this.bruteForceTracker = new Map();
+        this.requestCounts = new Map();
         
-        // تنظيف دوري للذاكرة
-        setInterval(() => this.cleanup(), 60000);
+        // إحصائيات
+        this.stats = {
+            totalRequests: 0,
+            blockedRequests: 0,
+            wafBlocks: 0,
+            rateLimitBlocks: 0,
+            startTime: Date.now()
+        };
+        
+        // تنظيف دوري
+        this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
+        
+        console.log('🛡️ Security Middleware initialized');
+        console.log(`   - Protection Level: ${this.config.PROTECTION_LEVEL || 'balanced'}`);
+        console.log(`   - WAF: ${this.config.ENABLE_WAF !== false ? '✅' : '❌'}`);
+        console.log(`   - Rate Limiting: ${this.config.ENABLE_RATE_LIMIT !== false ? '✅' : '❌'}`);
+        console.log(`   - Bot Detection: ${this.config.ENABLE_BOT_DETECTION !== false ? '✅' : '❌'}`);
     }
 
-    // ═══════════════════════════════════════════
-    // MAIN MIDDLEWARE
-    // ═══════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // 🛡️ MAIN MIDDLEWARE
+    // ═══════════════════════════════════════════════════════════════
     middleware() {
         return async (req, res, next) => {
+            const startTime = Date.now();
+            
             try {
                 const ip = this.getClientIP(req);
                 req.clientIP = ip;
+                req.securityContext = { ip, startTime };
+                
+                this.stats.totalRequests++;
 
-                // فحص IP المحظور
+                // 1. فحص IP المحظور
                 if (this.isBlocked(ip)) {
-                    return this.blockResponse(res, 'IP_BLOCKED');
+                    this.stats.blockedRequests++;
+                    return this.blockResponse(res, 'IP_BLOCKED', null, {
+                        reason: 'Your IP has been temporarily blocked',
+                        contact: this.config.APPEAL_CONTACT
+                    });
                 }
 
-                // Rate Limiting
+                // 2. DDoS Protection
+                if (!this.checkDDoS(ip)) {
+                    this.stats.blockedRequests++;
+                    return this.blockResponse(res, 'DDOS_DETECTED');
+                }
+
+                // 3. Rate Limiting
                 if (this.config.ENABLE_RATE_LIMIT !== false) {
                     const rateLimitResult = this.checkRateLimit(ip, req.path);
                     if (!rateLimitResult.allowed) {
+                        this.stats.rateLimitBlocks++;
                         return this.blockResponse(res, 'RATE_LIMITED', rateLimitResult.retryAfter);
                     }
+                    req.securityContext.rateLimit = rateLimitResult;
                 }
 
-                // WAF Protection
+                // 4. WAF Protection
                 if (this.config.ENABLE_WAF !== false) {
                     const wafResult = this.wafCheck(req);
                     if (!wafResult.safe) {
-                        this.recordViolation(ip, wafResult.reason);
-                        return this.blockResponse(res, 'WAF_BLOCKED', null, wafResult.reason);
+                        this.stats.wafBlocks++;
+                        this.recordViolation(ip, `WAF:${wafResult.reason}`);
+                        return this.blockResponse(res, 'WAF_BLOCKED', null, {
+                            reason: wafResult.reason
+                        });
                     }
                 }
 
-                // Bot Detection
+                // 5. Bot Detection
                 if (this.config.ENABLE_BOT_DETECTION !== false) {
                     const botScore = this.detectBot(req);
-                    req.botScore = botScore;
+                    req.securityContext.botScore = botScore;
+                    
                     if (botScore > (this.config.ANOMALY_THRESHOLD || 70)) {
-                        this.recordViolation(ip, 'BOT_DETECTED');
+                        this.recordViolation(ip, 'HIGH_BOT_SCORE');
+                        // لا نحظر مباشرة، فقط نسجل
                     }
                 }
 
-                // إضافة Security Headers
+                // 6. إضافة Security Headers
                 this.setSecurityHeaders(res);
 
+                // 7. تسجيل وقت المعالجة
+                res.on('finish', () => {
+                    const duration = Date.now() - startTime;
+                    if (duration > 5000) {
+                        console.warn(`⚠️ Slow request: ${req.method} ${req.path} - ${duration}ms`);
+                    }
+                });
+
                 next();
+                
             } catch (err) {
-                console.error('[Security] Error:', err.message);
+                console.error('[Security] Middleware error:', err.message);
+                // نسمح بالطلب في حالة الخطأ لتجنب تعطيل الخدمة
                 next();
             }
         };
     }
 
-    // ═══════════════════════════════════════════
-    // RATE LIMITING (Token Bucket)
-    // ═══════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // 🚫 DDoS PROTECTION
+    // ═══════════════════════════════════════════════════════════════
+    checkDDoS(ip) {
+        const now = Date.now();
+        const windowMs = 60000; // دقيقة واحدة
+        const maxRequests = this.ddosConfig.IP_RPS ? this.ddosConfig.IP_RPS * 60 : 
+                           this.ddosConfig.MAX_REQUESTS_PER_MINUTE || 100;
+        
+        const key = `ddos:${ip}`;
+        let data = this.requestCounts.get(key) || { count: 0, windowStart: now };
+        
+        // إعادة تعيين النافذة إذا انتهت
+        if (now - data.windowStart > windowMs) {
+            data = { count: 0, windowStart: now };
+        }
+        
+        data.count++;
+        this.requestCounts.set(key, data);
+        
+        // التحقق من تجاوز الحد
+        if (data.count > maxRequests) {
+            const blockDuration = this.ddosConfig.BLOCK_DURATION || 600000;
+            this.blockIP(ip, blockDuration);
+            console.warn(`🚨 DDoS detected from ${ip}: ${data.count} requests/min`);
+            return false;
+        }
+        
+        // تحذير عند الاقتراب من الحد
+        const warningThreshold = this.ddosConfig.WARNING_THRESHOLD || (maxRequests * 0.6);
+        if (data.count === Math.floor(warningThreshold)) {
+            console.warn(`⚠️ High request rate from ${ip}: ${data.count}/${maxRequests}`);
+        }
+        
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ⏱️ RATE LIMITING (Token Bucket Algorithm)
+    // ═══════════════════════════════════════════════════════════════
     checkRateLimit(ip, path) {
         const limitType = this.getLimitType(path);
         const limits = this.config.RATE_LIMITS?.[limitType] || { capacity: 100, refill: 10 };
-        const key = `${ip}:${limitType}`;
+        const key = `rate:${ip}:${limitType}`;
         const now = Date.now();
 
         let bucket = this.rateLimitStore.get(key);
+        
         if (!bucket) {
-            bucket = { tokens: limits.capacity, lastRefill: now };
+            bucket = { 
+                tokens: limits.capacity, 
+                lastRefill: now,
+                totalRequests: 0
+            };
         }
 
         // إعادة تعبئة التوكنز
-        const elapsed = (now - bucket.lastRefill) / 1000;
-        bucket.tokens = Math.min(limits.capacity, bucket.tokens + elapsed * limits.refill);
+        const elapsedSeconds = (now - bucket.lastRefill) / 1000;
+        const refillAmount = elapsedSeconds * limits.refill;
+        bucket.tokens = Math.min(limits.capacity, bucket.tokens + refillAmount);
         bucket.lastRefill = now;
+        bucket.totalRequests++;
 
         if (bucket.tokens >= 1) {
             bucket.tokens -= 1;
             this.rateLimitStore.set(key, bucket);
-            return { allowed: true };
+            return { 
+                allowed: true, 
+                remaining: Math.floor(bucket.tokens),
+                limit: limits.capacity,
+                type: limitType
+            };
         }
 
         this.rateLimitStore.set(key, bucket);
+        const retryAfter = Math.ceil((1 - bucket.tokens) / limits.refill);
+        
         return { 
             allowed: false, 
-            retryAfter: Math.ceil((1 - bucket.tokens) / limits.refill) 
+            retryAfter,
+            limit: limits.capacity,
+            type: limitType
         };
     }
 
     getLimitType(path) {
-        if (path.includes('/auth') || path.includes('/login')) return 'AUTH';
+        if (path.includes('/auth') || path.includes('/login') || path.includes('/verifyAccount')) {
+            return 'AUTH';
+        }
         if (path.includes('/admin')) return 'ADMIN';
         if (path.includes('/api')) return 'API';
         return 'GLOBAL';
     }
 
-    // ═══════════════════════════════════════════
-    // WAF (Web Application Firewall)
-    // ═══════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // 🔥 WAF (Web Application Firewall)
+    // ═══════════════════════════════════════════════════════════════
     wafCheck(req) {
-        const wafConfig = this.config.WAF || {};
-        
         // فحص طول URL
-        if (req.url.length > (wafConfig.MAX_URL_LENGTH || 2048)) {
+        const maxUrlLength = this.wafConfig.MAX_URL_LENGTH || 2048;
+        if (req.url.length > maxUrlLength) {
             return { safe: false, reason: 'URL_TOO_LONG' };
         }
 
         // فحص حجم Body
         const contentLength = parseInt(req.headers['content-length'] || 0);
-        if (contentLength > (wafConfig.MAX_BODY_SIZE || 1048576)) {
+        const maxBodySize = this.wafConfig.MAX_BODY_SIZE || 1048576; // 1MB
+        if (contentLength > maxBodySize) {
             return { safe: false, reason: 'BODY_TOO_LARGE' };
         }
 
-        // فحص أنماط الهجوم
-        const payload = `${req.url}${JSON.stringify(req.query || {})}${JSON.stringify(req.body || {})}`;
+        // بناء الـ payload للفحص
+        const payload = this.buildPayloadForScan(req);
         
+        // فحص أنماط الهجوم
         const attacks = [
-            { pattern: /<script[\s\S]*?>[\s\S]*?<\/script>/gi, name: 'XSS' },
-            { pattern: /(\b(union|select|insert|update|delete|drop|create|alter)\b.*\b(from|into|table|database)\b)/gi, name: 'SQL_INJECTION' },
-            { pattern: /\.\.\//g, name: 'PATH_TRAVERSAL' },
-            { pattern: /(\$\{|\{\{|<%|%>)/g, name: 'TEMPLATE_INJECTION' },
-            { pattern: /(eval|exec|system|passthru|shell_exec)\s*\(/gi, name: 'COMMAND_INJECTION' }
+            // XSS
+            { 
+                pattern: /<script[\s\S]*?>[\s\S]*?<\/script>/gi, 
+                name: 'XSS_SCRIPT' 
+            },
+            { 
+                pattern: /javascript\s*:/gi, 
+                name: 'XSS_JAVASCRIPT' 
+            },
+            { 
+                pattern: /on\w+\s*=/gi, 
+                name: 'XSS_EVENT_HANDLER' 
+            },
+            
+            // SQL Injection
+            { 
+                pattern: /(\b(union|select|insert|update|delete|drop|create|alter|truncate)\b[\s\S]*\b(from|into|table|database|where)\b)/gi, 
+                name: 'SQL_INJECTION' 
+            },
+            { 
+                pattern: /(\bor\b|\band\b)[\s]*[\d\w]*[\s]*[=<>]/gi, 
+                name: 'SQL_BOOLEAN_INJECTION' 
+            },
+            { 
+                pattern: /(--|#|\/\*|\*\/)/g, 
+                name: 'SQL_COMMENT_INJECTION' 
+            },
+            
+            // Path Traversal
+            { 
+                pattern: /\.\.\//g, 
+                name: 'PATH_TRAVERSAL' 
+            },
+            { 
+                pattern: /\.\.\\/g, 
+                name: 'PATH_TRAVERSAL_WIN' 
+            },
+            
+            // Command Injection
+            { 
+                pattern: /[;&|`$]|\$\(/g, 
+                name: 'COMMAND_INJECTION' 
+            },
+            { 
+                pattern: /(eval|exec|system|passthru|shell_exec|popen)\s*\(/gi, 
+                name: 'CODE_EXECUTION' 
+            },
+            
+            // Template Injection
+            { 
+                pattern: /(\$\{|\{\{|<%|%>|\${.*})/g, 
+                name: 'TEMPLATE_INJECTION' 
+            },
+            
+            // LDAP Injection
+            { 
+                pattern: /[()\\*]/g, 
+                name: 'LDAP_INJECTION',
+                threshold: 5 // يحتاج 5+ تطابقات
+            },
+            
+            // XML/XXE
+            { 
+                pattern: /<!\s*\[CDATA\[|<!ENTITY/gi, 
+                name: 'XXE_ATTACK' 
+            }
         ];
 
         for (const attack of attacks) {
-            if (attack.pattern.test(payload)) {
+            const matches = payload.match(attack.pattern);
+            const threshold = attack.threshold || 1;
+            
+            if (matches && matches.length >= threshold) {
+                console.warn(`🚨 WAF Block: ${attack.name} from ${req.clientIP || req.ip}`);
                 return { safe: false, reason: attack.name };
             }
         }
@@ -140,19 +316,46 @@ class SecurityMiddleware {
         return { safe: true };
     }
 
-    // ═══════════════════════════════════════════
-    // BOT DETECTION
-    // ═══════════════════════════════════════════
+    buildPayloadForScan(req) {
+        const parts = [
+            req.url || '',
+            JSON.stringify(req.query || {}),
+            JSON.stringify(req.body || {}),
+            req.headers['user-agent'] || '',
+            req.headers['referer'] || ''
+        ];
+        return parts.join(' ').toLowerCase();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 🤖 BOT DETECTION
+    // ═══════════════════════════════════════════════════════════════
     detectBot(req) {
         let score = 0;
         const ua = req.headers['user-agent'] || '';
 
         // لا يوجد User-Agent
-        if (!ua) score += 30;
-
-        // User-Agent مشبوه
-        const suspiciousUA = /(curl|wget|python|bot|spider|crawler|scraper)/i;
-        if (suspiciousUA.test(ua)) score += 25;
+        if (!ua) {
+            score += 30;
+        } else {
+            // User-Agent مشبوه
+            const suspiciousUA = [
+                /curl/i, /wget/i, /python/i, /httpie/i,
+                /postman/i, /insomnia/i,
+                /bot/i, /spider/i, /crawler/i, /scraper/i,
+                /headless/i, /phantom/i, /selenium/i
+            ];
+            
+            for (const pattern of suspiciousUA) {
+                if (pattern.test(ua)) {
+                    score += 20;
+                    break;
+                }
+            }
+            
+            // User-Agent قصير جداً
+            if (ua.length < 20) score += 15;
+        }
 
         // لا يوجد Accept-Language
         if (!req.headers['accept-language']) score += 15;
@@ -160,60 +363,42 @@ class SecurityMiddleware {
         // لا يوجد Accept
         if (!req.headers['accept']) score += 10;
 
-        // Headers غير طبيعية
-        if (req.headers['x-forwarded-for']?.split(',').length > 5) score += 20;
+        // لا يوجد Accept-Encoding
+        if (!req.headers['accept-encoding']) score += 5;
+
+        // عدد كبير من الـ X-Forwarded-For
+        const xff = req.headers['x-forwarded-for'];
+        if (xff && xff.split(',').length > 5) {
+            score += 20;
+        }
+
+        // فحص أنماط الطلبات المشبوهة
+        const path = req.path || '';
+        const suspiciousPaths = [
+            /\.env/i, /\.git/i, /\.htaccess/i,
+            /wp-admin/i, /wp-login/i, /phpmyadmin/i,
+            /admin\.php/i, /shell/i, /backdoor/i
+        ];
+        
+        for (const pattern of suspiciousPaths) {
+            if (pattern.test(path)) {
+                score += 25;
+                break;
+            }
+        }
 
         return Math.min(score, 100);
     }
 
-    // ═══════════════════════════════════════════
-    // BRUTE FORCE PROTECTION
-    // ═══════════════════════════════════════════
-    checkBruteForce(ip, endpoint) {
-        const config = this.config.BRUTE_FORCE || {};
-        const key = `${ip}:${endpoint}`;
-        const tracker = this.bruteForceTracker.get(key) || { attempts: 0, lockoutUntil: 0, escalation: 1 };
-        const now = Date.now();
-
-        if (tracker.lockoutUntil > now) {
-            return { allowed: false, retryAfter: Math.ceil((tracker.lockoutUntil - now) / 1000) };
-        }
-
-        return { allowed: true, attempts: tracker.attempts };
-    }
-
-    recordFailedAttempt(ip, endpoint) {
-        const config = this.config.BRUTE_FORCE || {};
-        const key = `${ip}:${endpoint}`;
-        const tracker = this.bruteForceTracker.get(key) || { attempts: 0, lockoutUntil: 0, escalation: 1 };
-        
-        tracker.attempts++;
-        
-        if (tracker.attempts >= (config.MAX_ATTEMPTS || 5)) {
-            const lockoutTime = Math.min(
-                (config.LOCKOUT_TIME || 900000) * tracker.escalation,
-                config.MAX_LOCKOUT_TIME || 86400000
-            );
-            tracker.lockoutUntil = Date.now() + lockoutTime;
-            tracker.escalation *= (config.ESCALATION_MULTIPLIER || 2);
-            tracker.attempts = 0;
-        }
-        
-        this.bruteForceTracker.set(key, tracker);
-    }
-
-    resetBruteForce(ip, endpoint) {
-        this.bruteForceTracker.delete(`${ip}:${endpoint}`);
-    }
-
-    // ═══════════════════════════════════════════
-    // UTILITIES
-    // ═══════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // 🔧 UTILITIES
+    // ═══════════════════════════════════════════════════════════════
     getClientIP(req) {
         return req.headers['cf-connecting-ip'] ||
                req.headers['x-real-ip'] ||
                req.headers['x-forwarded-for']?.split(',')[0].trim() ||
                req.socket?.remoteAddress ||
+               req.ip ||
                'unknown';
     }
 
@@ -221,85 +406,182 @@ class SecurityMiddleware {
         return this.blockedIPs.has(ip);
     }
 
-    blockIP(ip, duration) {
+    blockIP(ip, duration = 600000) {
         this.blockedIPs.add(ip);
-        if (duration) {
-            setTimeout(() => this.blockedIPs.delete(ip), duration);
+        console.warn(`🚫 IP Blocked: ${ip} for ${duration/1000}s`);
+        
+        if (duration > 0) {
+            setTimeout(() => {
+                this.blockedIPs.delete(ip);
+                console.log(`✅ IP Unblocked: ${ip}`);
+            }, duration);
         }
+        
+        // إرسال تنبيه إذا كان الـ webhook متاحاً
+        this.sendAlert('IP_BLOCKED', { ip, duration });
+    }
+
+    unblockIP(ip) {
+        const deleted = this.blockedIPs.delete(ip);
+        if (deleted) {
+            console.log(`✅ IP Manually Unblocked: ${ip}`);
+        }
+        return deleted;
     }
 
     recordViolation(ip, reason) {
-        const cache = this.ipCache.get(ip) || { violations: 0, reasons: [] };
+        const cache = this.ipCache.get(ip) || { 
+            violations: 0, 
+            reasons: [],
+            firstSeen: Date.now()
+        };
+        
         cache.violations++;
+        cache.lastViolation = Date.now();
         cache.reasons.push({ reason, time: Date.now() });
+        
+        // الاحتفاظ بآخر 10 أسباب فقط
+        if (cache.reasons.length > 10) {
+            cache.reasons = cache.reasons.slice(-10);
+        }
+        
         this.ipCache.set(ip, cache);
 
-        if (cache.violations >= (this.config.SOFT_BLOCK_VIOLATIONS || 3)) {
-            this.blockIP(ip, this.config.DDOS?.BLOCK_DURATION || 600000);
-            console.log(`[Security] IP blocked: ${ip} - Violations: ${cache.violations}`);
+        const softBlockViolations = this.config.SOFT_BLOCK_VIOLATIONS || 3;
+        if (cache.violations >= softBlockViolations) {
+            const blockDuration = this.ddosConfig.BLOCK_DURATION || 600000;
+            this.blockIP(ip, blockDuration);
         }
     }
 
     setSecurityHeaders(res) {
+        // هذه Headers إضافية - Helmet يضيف معظمها
         res.setHeader('X-Content-Type-Options', 'nosniff');
         res.setHeader('X-Frame-Options', 'DENY');
         res.setHeader('X-XSS-Protection', '1; mode=block');
-        res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-        res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+        res.setHeader('X-Download-Options', 'noopen');
+        res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
     }
 
     blockResponse(res, reason, retryAfter = null, details = null) {
-        const status = reason === 'RATE_LIMITED' ? 429 : 403;
+        const statusCodes = {
+            'IP_BLOCKED': 403,
+            'DDOS_DETECTED': 429,
+            'RATE_LIMITED': 429,
+            'WAF_BLOCKED': 403,
+            'BOT_DETECTED': 403
+        };
+        
+        const status = statusCodes[reason] || 403;
         
         if (retryAfter) {
             res.setHeader('Retry-After', retryAfter);
         }
 
         return res.status(status).json({
+            success: false,
             error: true,
             code: reason,
             message: this.getBlockMessage(reason),
             details: details,
-            contact: this.config.APPEAL_CONTACT || 'security@yourdomain.com'
+            retryAfter: retryAfter,
+            contact: this.config.APPEAL_CONTACT || 'security@yourdomain.com',
+            timestamp: new Date().toISOString()
         });
     }
 
     getBlockMessage(reason) {
         const messages = {
-            'IP_BLOCKED': 'Your IP has been blocked due to suspicious activity',
-            'RATE_LIMITED': 'Too many requests. Please slow down',
+            'IP_BLOCKED': 'Your IP has been temporarily blocked due to suspicious activity',
+            'DDOS_DETECTED': 'Too many requests detected. Please slow down.',
+            'RATE_LIMITED': 'Rate limit exceeded. Please wait before making more requests.',
             'WAF_BLOCKED': 'Request blocked by security filter',
-            'BOT_DETECTED': 'Automated access detected'
+            'BOT_DETECTED': 'Automated access detected and blocked'
         };
         return messages[reason] || 'Access denied';
     }
 
+    sendAlert(type, data) {
+        const webhook = this.config.ALERT_WEBHOOK;
+        if (!webhook) return;
+        
+        try {
+            // يمكن إضافة إرسال HTTP هنا
+            console.log(`📢 Security Alert: ${type}`, data);
+        } catch (err) {
+            console.error('Failed to send security alert:', err.message);
+        }
+    }
+
     cleanup() {
         const now = Date.now();
-        const ttl = (this.config.IP_CACHE_TTL || 300) * 1000;
+        const cacheTTL = (this.config.IP_CACHE_TTL || 300) * 1000;
+        let cleaned = 0;
 
-        for (const [key, data] of this.ipCache) {
-            if (data.lastUpdate && now - data.lastUpdate > ttl) {
-                this.ipCache.delete(key);
+        // تنظيف IP cache
+        for (const [ip, data] of this.ipCache) {
+            if (data.lastViolation && now - data.lastViolation > cacheTTL) {
+                this.ipCache.delete(ip);
+                cleaned++;
             }
         }
 
+        // تنظيف rate limit store
         for (const [key, bucket] of this.rateLimitStore) {
-            if (now - bucket.lastRefill > 300000) {
+            if (now - bucket.lastRefill > 300000) { // 5 دقائق
                 this.rateLimitStore.delete(key);
+                cleaned++;
             }
+        }
+
+        // تنظيف request counts
+        for (const [key, data] of this.requestCounts) {
+            if (now - data.windowStart > 120000) { // 2 دقائق
+                this.requestCounts.delete(key);
+                cleaned++;
+            }
+        }
+
+        if (cleaned > 0) {
+            console.log(`🧹 Security cleanup: ${cleaned} entries removed`);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 📊 STATS & MONITORING
+    // ═══════════════════════════════════════════════════════════════
+    getStats() {
+        const uptime = Date.now() - this.stats.startTime;
+        return {
+            ...this.stats,
+            uptime: Math.floor(uptime / 1000),
+            blockedIPs: this.blockedIPs.size,
+            cachedIPs: this.ipCache.size,
+            activeBuckets: this.rateLimitStore.size,
+            blockRate: this.stats.totalRequests > 0 
+                ? ((this.stats.blockedRequests / this.stats.totalRequests) * 100).toFixed(2) + '%'
+                : '0%'
+        };
+    }
+
+    // إيقاف التنظيف الدوري عند إغلاق التطبيق
+    destroy() {
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
         }
     }
 }
 
-// ═══════════════════════════════════════════
-// EXPORT
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// 📦 EXPORT
+// ═══════════════════════════════════════════════════════════════════
 let instance = null;
 
 module.exports = {
     init: (config) => {
-        instance = new SecurityMiddleware(config);
+        if (!instance) {
+            instance = new SecurityMiddleware(config);
+        }
         return instance;
     },
     getInstance: () => instance,
