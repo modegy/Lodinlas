@@ -1,7 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════
-// 🚀 SERVER.JS - SecureArmor v14.1 - Fixed Version
-// ═══════════════════════════════════════════════════════════════════
-
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
@@ -10,140 +6,135 @@ const config = require('./config');
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 1. CORS - يجب أن يكون أول شيء (قبل أي middleware آخر)
+// 🛡️ 1. CORS - إعدادات آمنة للإنتاج
 // ═══════════════════════════════════════════════════════════════════
-app.use((req, res, next) => {
-    // السماح لجميع الأصول أو الأصول المحددة
-    const allowedOrigins = config.CORS?.ALLOWED_ORIGINS || ['*'];
-    const origin = req.headers.origin;
-    
-    if (allowedOrigins.includes('*')) {
-        res.header('Access-Control-Allow-Origin', '*');
-    } else if (origin && allowedOrigins.includes(origin)) {
-        res.header('Access-Control-Allow-Origin', origin);
-    } else if (!origin) {
-        // للطلبات من التطبيق (بدون origin header)
-        res.header('Access-Control-Allow-Origin', '*');
-    }
-    
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 
-        'Content-Type, Authorization, Accept, Origin, ' +
-        'X-API-Key, X-Client-ID, X-Session-Token, X-Device-Fingerprint, ' +
-        'X-API-Signature, X-Timestamp, X-Nonce, X-Requested-With'
-    );
-    res.header('Access-Control-Expose-Headers', 'X-Session-Token, X-RateLimit-Remaining');
-    res.header('Access-Control-Max-Age', '86400');
-    
-    // معالجة طلبات OPTIONS (Preflight)
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-    
-    next();
-});
+const corsOptions = {
+    origin: (origin, callback) => {
+        // في الإنتاج: أصل محدد فقط، لا تسمح بـ '*' أبداً
+        const allowedOrigins = config.CORS?.ALLOWED_ORIGINS || [];
+        
+        // للطلبات بدون origin (mobile apps, curl, etc)
+        if (!origin && process.env.NODE_ENV === 'production') {
+            return callback(null, false);
+        }
+        
+        // في التطوير: السماح بالطلبات بدون origin للاختبار
+        if (!origin && process.env.NODE_ENV === 'development') {
+            return callback(null, true);
+        }
+        
+        // التحقق من القائمة البيضاء
+        if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.warn(`🚫 CORS Blocked: ${origin}`);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: [
+        'Content-Type', 
+        'Authorization', 
+        'Accept',
+        'X-API-Key',
+        'X-Client-ID',
+        'X-Session-Token',
+        'X-Device-Fingerprint',
+        'X-API-Signature',
+        'X-Timestamp',
+        'X-Nonce'
+    ],
+    exposedHeaders: ['X-Session-Token'],
+    maxAge: 86400
+};
+
+app.use(cors(corsOptions));
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 2. Security Headers (Helmet) - بعد CORS
+// 🛡️ 2. Security Headers - إعدادات قوية للإنتاج
 // ═══════════════════════════════════════════════════════════════════
 app.use(helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" },
-    crossOriginOpenerPolicy: false,
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:", "https:"],
+            connectSrc: ["'self'"],
+            fontSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            mediaSrc: ["'self'"],
+            frameSrc: ["'none'"],
+            frameAncestors: ["'none'"]
+        }
+    },
+    crossOriginResourcePolicy: { policy: "same-site" },
+    crossOriginOpenerPolicy: { policy: "same-origin" },
     crossOriginEmbedderPolicy: false,
-    contentSecurityPolicy: false,
     xssFilter: true,
     noSniff: true,
-    hidePoweredBy: true
+    hidePoweredBy: true,
+    hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+    },
+    frameguard: {
+        action: 'deny'
+    },
+    referrerPolicy: {
+        policy: 'strict-origin-when-cross-origin'
+    }
 }));
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 3. Body Parsers
+// 🛡️ 3. Body Parsers مع حدود حجم آمنة
 // ═══════════════════════════════════════════════════════════════════
 app.use(express.json({ 
-    limit: '10mb',
+    limit: '2mb',
     verify: (req, res, buf) => {
         req.rawBody = buf.toString();
     }
 }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+app.use(express.urlencoded({ 
+    extended: true, 
+    limit: '2mb',
+    parameterLimit: 50 // منع هجمات الكثافة البارامترية
+}));
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 4. Request Logger (للتشخيص)
+// 🛡️ 4. Request Logger مبسط للإنتاج
 // ═══════════════════════════════════════════════════════════════════
 app.use((req, res, next) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
-    const timestamp = new Date().toISOString();
+    const timestamp = new Date().toISOString().replace('T', ' ').substr(0, 19);
     
-    // تسجيل الطلبات المهمة فقط
-    if (!req.path.includes('health') && !req.path.includes('favicon')) {
-        console.log(`[${timestamp}] ${req.method} ${req.path} | IP: ${ip}`);
-    }
+    // تسجيل مختصر للإنتاج
+    console.log(`[${timestamp}] ${ip} - ${req.method} ${req.path}`);
     
     next();
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 5. Rate Limiting (اختياري - يمكن تفعيله)
+// 📡 5. المسارات العامة المطلوبة (بدون توثيق)
 // ═══════════════════════════════════════════════════════════════════
-let rateLimiter;
-try {
-    const rateLimit = require('express-rate-limit');
-    rateLimiter = rateLimit({
-        windowMs: 60 * 1000, // دقيقة واحدة
-        max: config.SECURITY?.RATE_LIMITS?.GLOBAL?.capacity || 100,
-        message: { success: false, error: 'Too many requests, please try again later' },
-        standardHeaders: true,
-        legacyHeaders: false,
-        skip: (req) => {
-            // تخطي بعض المسارات
-            return req.path === '/health' || req.path === '/api/serverTime';
-        }
+
+// ✅ Health Check - ضروري لـ load balancers و monitoring
+app.get('/health', (req, res) => {
+    const memoryUsage = process.memoryUsage();
+    res.json({ 
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        uptime: Math.floor(process.uptime()),
+        memory: {
+            used: Math.round(memoryUsage.heapUsed / 1024 / 1024) + 'MB',
+            total: Math.round(memoryUsage.heapTotal / 1024 / 1024) + 'MB'
+        },
+        version: '3.4.1'
     });
-    app.use('/api/', rateLimiter);
-    console.log('✅ Rate limiting enabled');
-} catch (e) {
-    console.log('⚠️ Rate limiting not available');
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 🛡️ 6. Security Middleware (إذا موجود)
-// ═══════════════════════════════════════════════════════════════════
-let securityMiddleware;
-try {
-    const security = require('./middleware/security');
-    if (security.securityMiddleware) {
-        app.use(security.securityMiddleware);
-        console.log('✅ Security middleware loaded');
-    }
-} catch (e) {
-    console.log('⚠️ Security middleware not found, continuing without it');
-}
-
-
-
-// في server.js - إضافة التوثيق المتقدم
-const { signatureAuth, apiKeyAuth, adminAuth, apiKeyRateLimit } = require('./middleware/auth');
-
-// ... بعد security middleware ...
-
-// 🔐 تطبيق التوثيق المتقدم
-app.use(signatureAuth);
-app.use(apiKeyAuth);
-app.use(apiKeyRateLimit);
-
-// 👤 توثيق الإدارة (للمسارات الإدارية فقط)
-app.use('/api/admin', adminAuth);
-app.use('/api/sub', adminAuth);
-
-// ... بقية الكود ...
-
-
-
-
-// ═══════════════════════════════════════════════════════════════════
-// 📡 7. API ENDPOINTS - الأساسية (قبل الـ routes)
-// ═══════════════════════════════════════════════════════════════════
+});
 
 // ✅ Server Time - مطلوب من التطبيق
 app.get('/api/serverTime', (req, res) => {
@@ -151,54 +142,99 @@ app.get('/api/serverTime', (req, res) => {
     res.json({
         unixtime: Math.floor(now.getTime() / 1000),
         datetime: now.toISOString(),
-        timestamp: now.getTime(),
-        timezone: 'UTC',
-        formatted: now.toLocaleString('en-US', { timeZone: 'UTC' })
-    });
-});
-
-// ✅ Health Check
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        timestamp: new Date().toISOString(),
-        uptime: Math.floor(process.uptime()),
-        version: '3.4.1',
-        memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
-    });
-});
-
-// ✅ Root endpoint
-app.get('/', (req, res) => {
-    res.json({ 
-        message: 'SecureArmor API Server v14.1',
-        version: '3.4.1',
-        status: 'running',
-        timestamp: new Date().toISOString(),
-        endpoints: {
-            health: '/health',
-            serverTime: '/api/serverTime',
-            mobile: '/api/*',
-            admin: '/api/admin/*',
-            subadmin: '/api/sub/*'
-        }
+        timestamp: now.getTime()
     });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 📡 8. ROUTES - استيراد الـ routes الموجودة
+// 🔐 6. API Key Authentication - الحماية الأساسية
+// ═══════════════════════════════════════════════════════════════════
+app.use('/api/*', (req, res, next) => {
+    // تخطي المسارات العامة
+    if (req.path === '/api/serverTime') {
+        return next();
+    }
+    
+    const apiKey = req.headers['x-api-key'] || req.headers['x-api-key'] || req.query.apiKey;
+    const validApiKey = config.APP_API_KEY;
+    
+    if (!validApiKey) {
+        console.error('❌ APP_API_KEY غير معين في الإنتاج!');
+        return res.status(500).json({ 
+            success: false, 
+            error: 'Server configuration error' 
+        });
+    }
+    
+    if (!apiKey || apiKey !== validApiKey) {
+        console.warn(`🚫 محاولة وصول بمفتاح غير صحيح من IP: ${req.ip}`);
+        return res.status(401).json({ 
+            success: false, 
+            error: 'Invalid API key',
+            code: 'INVALID_API_KEY'
+        });
+    }
+    
+    next();
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🛡️ 7. Rate Limiting للإنتاج
+// ═══════════════════════════════════════════════════════════════════
+const rateLimit = require('express-rate-limit');
+
+// Rate Limiting للـ API
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 دقيقة
+    max: config.SECURITY?.RATE_LIMITS?.API || 50, // 50 طلب لكل 15 دقيقة
+    message: {
+        success: false,
+        error: 'Too many requests, please try again later',
+        retryAfter: '15 minutes'
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.path === '/health' || req.path === '/api/serverTime',
+    keyGenerator: (req) => req.ip // استخدام الـ IP كمعرف
+});
+
+app.use('/api/*', apiLimiter);
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔐 8. التوثيق المتقدم - فقط للمسارات التي تحتاجه
 // ═══════════════════════════════════════════════════════════════════
 
-// Mobile Routes (للتطبيق)
+// استيراد middlewares التوثيق
+const { signatureAuth, adminAuth } = require('./middleware/auth');
+
+// تطبيق التوثيق الموقعي فقط على المسارات الحساسة
+const protectedPaths = [
+    '/api/verifyAccount',
+    '/api/getUser',
+    '/api/updateDevice'
+];
+
+app.use(protectedPaths, signatureAuth);
+
+// التوثيق الإداري
+app.use('/api/admin', adminAuth);
+app.use('/api/sub', adminAuth);
+
+// ═══════════════════════════════════════════════════════════════════
+// 📡 9. ROUTES المحمية
+// ═══════════════════════════════════════════════════════════════════
+
+// Mobile Routes
 try {
     const mobileRoutes = require('./routes/mobile');
     app.use('/api', mobileRoutes);
     console.log('✅ Mobile routes loaded: /api/*');
 } catch (e) {
     console.error('❌ Failed to load mobile routes:', e.message);
+    // Fallback routes ستتعامل مع هذا
 }
 
-// Admin Routes (للوحة التحكم)
+// Admin Routes
 try {
     const adminRoutes = require('./routes/admin');
     app.use('/api/admin', adminRoutes);
@@ -207,7 +243,7 @@ try {
     console.error('❌ Failed to load admin routes:', e.message);
 }
 
-// SubAdmin Routes (للمشرفين الفرعيين)
+// SubAdmin Routes
 try {
     const subAdminRoutes = require('./routes/subadmin');
     app.use('/api/sub', subAdminRoutes);
@@ -217,52 +253,92 @@ try {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 📡 9. FALLBACK ROUTES - في حالة عدم وجود mobile.js
+// 🛡️ 10. أمان إضافي للإنتاج
 // ═══════════════════════════════════════════════════════════════════
 
-// Fallback getUser إذا لم يكن موجوداً
-app.post('/api/getUser', async (req, res, next) => {
-    // إذا تم التعامل معه بالفعل، تخطي
-    if (res.headersSent) return;
+// التحقق من Content-Type للطلبات
+app.use('/api/*', (req, res, next) => {
+    if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+        const contentType = req.headers['content-type'];
+        if (!contentType || !contentType.includes('application/json')) {
+            return res.status(415).json({
+                success: false,
+                error: 'Unsupported Media Type. Use application/json'
+            });
+        }
+    }
+    next();
+});
+
+// منع هجمات NoSQL Injection
+app.use((req, res, next) => {
+    const checkForInjection = (obj) => {
+        for (let key in obj) {
+            if (typeof obj[key] === 'string') {
+                // حماية ضد محاولات NoSQL Injection
+                const dangerousPatterns = [
+                    /\$where/i,
+                    /\$ne/i,
+                    /\$gt/i,
+                    /\$lt/i,
+                    /\$in/i,
+                    /\$nin/i,
+                    /\$exists/i,
+                    /\$regex/i,
+                    /\.\.\//, // Directory traversal
+                    /\/etc\/passwd/,
+                    /\/proc\/self/
+                ];
+                
+                for (let pattern of dangerousPatterns) {
+                    if (pattern.test(obj[key])) {
+                        console.warn(`⚠️ محاولة هجوم محتملة: ${pattern} من IP: ${req.ip}`);
+                        throw new Error('Invalid input detected');
+                    }
+                }
+            } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+                checkForInjection(obj[key]);
+            }
+        }
+    };
     
+    try {
+        if (req.body) checkForInjection(req.body);
+        if (req.query) checkForInjection(req.query);
+        next();
+    } catch (error) {
+        res.status(400).json({
+            success: false,
+            error: 'Invalid input detected'
+        });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 📡 11. Fallback Routes (إذا فشل تحميل المسارات الأساسية)
+// ═══════════════════════════════════════════════════════════════════
+
+// Fallback getUser
+app.post('/api/getUser', async (req, res) => {
     try {
         const { firebase, FB_KEY } = require('./services/firebase');
         const { username } = req.body;
         
-        if (!username) {
-            return res.status(400).json(null);
-        }
+        if (!username) return res.status(400).json(null);
         
-        const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
-        const response = await firebase.get(url);
+        const response = await firebase.get(`users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`);
         const users = response.data || {};
         
-        if (Object.keys(users).length === 0) {
-            return res.json(null);
-        }
+        if (Object.keys(users).length === 0) return res.json(null);
         
         const userId = Object.keys(users)[0];
         const user = users[userId];
         
-        // تنسيق التاريخ
-        const formatDate = (timestamp) => {
-            if (!timestamp) return '';
-            const date = new Date(timestamp);
-            const day = String(date.getDate()).padStart(2, '0');
-            const month = String(date.getMonth() + 1).padStart(2, '0');
-            const year = date.getFullYear();
-            const hours = String(date.getHours()).padStart(2, '0');
-            const minutes = String(date.getMinutes()).padStart(2, '0');
-            return `${day}/${month}/${year} ${hours}:${minutes}`;
-        };
-        
         res.json({
             username: user.username,
-            password_hash: user.password_hash,
             is_active: user.is_active !== false,
             device_id: user.device_id || '',
-            expiry_date: formatDate(user.subscription_end || user.expiry_timestamp),
-            subscription_end: user.subscription_end || user.expiry_timestamp
+            subscription_end: user.subscription_end
         });
         
     } catch (error) {
@@ -271,60 +347,8 @@ app.post('/api/getUser', async (req, res, next) => {
     }
 });
 
-// Fallback updateDevice إذا لم يكن موجوداً
-app.post('/api/updateDevice', async (req, res, next) => {
-    if (res.headersSent) return;
-    
-    try {
-        const { firebase, FB_KEY } = require('./services/firebase');
-        const { username, deviceId, deviceInfo } = req.body;
-        
-        if (!username || !deviceId) {
-            return res.status(400).json({ success: false, error: 'Missing data' });
-        }
-        
-        const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
-        const response = await firebase.get(url);
-        const users = response.data || {};
-        
-        if (Object.keys(users).length === 0) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-        
-        const userId = Object.keys(users)[0];
-        const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
-        
-        const updateData = {
-            device_id: deviceId,
-            last_login: Date.now(),
-            ip_address: ip
-        };
-        
-        if (deviceInfo) {
-            Object.assign(updateData, {
-                device_model: deviceInfo.device_model || 'Unknown',
-                device_brand: deviceInfo.device_brand || 'Unknown',
-                android_version: deviceInfo.android_version || 'Unknown',
-                is_rooted: deviceInfo.is_rooted || false
-            });
-        }
-        
-        await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, updateData);
-        
-        console.log(`📱 Device updated: ${username} | IP: ${ip}`);
-        
-        res.json({ success: true, message: 'Device updated successfully' });
-        
-    } catch (error) {
-        console.error('Fallback updateDevice error:', error.message);
-        res.status(500).json({ success: false, error: 'Server error' });
-    }
-});
-
-// Fallback verifyAccount إذا لم يكن موجوداً
-app.post('/api/verifyAccount', async (req, res, next) => {
-    if (res.headersSent) return;
-    
+// Fallback verifyAccount
+app.post('/api/verifyAccount', async (req, res) => {
     try {
         const { firebase, FB_KEY } = require('./services/firebase');
         const crypto = require('crypto');
@@ -335,9 +359,7 @@ app.post('/api/verifyAccount', async (req, res, next) => {
         }
         
         const passHash = crypto.createHash('sha256').update(password, 'utf8').digest('hex');
-        
-        const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
-        const response = await firebase.get(url);
+        const response = await firebase.get(`users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`);
         const users = response.data || {};
         
         if (Object.keys(users).length === 0) {
@@ -363,82 +385,138 @@ app.post('/api/verifyAccount', async (req, res, next) => {
         
     } catch (error) {
         console.error('Fallback verifyAccount error:', error.message);
-        res.status(500).json({ success: false, code: 0, error: 'Server error' });
+        res.status(500).json({ success: false, code: 0 });
     }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// ❌ 10. Error Handlers
+// ❌ 12. Error Handlers للإنتاج
 // ═══════════════════════════════════════════════════════════════════
 
 // 404 Handler
-app.use((req, res, next) => {
-    res.status(404).json({ 
-        success: false, 
-        error: 'Endpoint not found',
-        path: req.path,
-        method: req.method
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        error: 'Endpoint not found'
     });
 });
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-    console.error('❌ Server Error:', err.message);
-    console.error(err.stack);
+    const timestamp = new Date().toISOString();
+    const errorId = `ERR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    res.status(err.status || 500).json({
+    console.error(`[${timestamp}] [${errorId}] Error:`, {
+        message: err.message,
+        stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+        path: req.path,
+        method: req.method,
+        ip: req.ip
+    });
+    
+    // تحديد نوع الخطأ
+    let statusCode = 500;
+    let errorMessage = 'Internal server error';
+    
+    if (err.message.includes('CORS')) {
+        statusCode = 403;
+        errorMessage = 'Access forbidden';
+    } else if (err.message.includes('Invalid input')) {
+        statusCode = 400;
+        errorMessage = 'Invalid request data';
+    }
+    
+    res.status(statusCode).json({
         success: false,
-        error: config.NODE_ENV === 'production' ? 'Internal server error' : err.message,
-        ...(config.NODE_ENV !== 'production' && { stack: err.stack })
+        error: errorMessage,
+        reference: errorId, // للإبلاغ عن الأخطاء
+        timestamp: timestamp
     });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🚀 11. START SERVER
+// 🚀 13. START SERVER
 // ═══════════════════════════════════════════════════════════════════
 
 const PORT = config.PORT || process.env.PORT || 10000;
 
+// التحقق من الإعدادات قبل التشغيل
+if (process.env.NODE_ENV === 'production') {
+    const requiredConfigs = ['APP_API_KEY', 'CORS.ALLOWED_ORIGINS'];
+    const missingConfigs = [];
+    
+    if (!config.APP_API_KEY || config.APP_API_KEY.includes('default')) {
+        missingConfigs.push('APP_API_KEY must be set and secure');
+    }
+    
+    if (!config.CORS?.ALLOWED_ORIGINS || config.CORS.ALLOWED_ORIGINS.length === 0) {
+        missingConfigs.push('CORS.ALLOWED_ORIGINS must be configured');
+    }
+    
+    if (missingConfigs.length > 0) {
+        console.error('❌ إعدادات الإنتاج المطلوبة مفقودة:');
+        missingConfigs.forEach(msg => console.error(`   - ${msg}`));
+        console.error('❌ لا يمكن تشغيل الخادم في وضع الإنتاج بدون هذه الإعدادات');
+        process.exit(1);
+    }
+}
+
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('');
-    console.log('═══════════════════════════════════════════════════════════════');
-    console.log('🚀 SecureArmor Server v14.1 Started Successfully!');
-    console.log('═══════════════════════════════════════════════════════════════');
+    console.log('\n' + '═'.repeat(60));
+    console.log('🚀 SecureArmor Server - PRODUCTION MODE');
+    console.log('═'.repeat(60));
     console.log(`📍 Port: ${PORT}`);
-    console.log(`🌍 Environment: ${config.NODE_ENV || 'production'}`);
-    console.log(`🔥 Firebase: ${config.FIREBASE_URL ? '✅ Configured' : '❌ Not configured'}`);
-    console.log(`👤 Admin: ${config.ADMIN_CREDENTIALS?.username || 'Not set'}`);
-    console.log(`🔑 API Key: ${config.APP_API_KEY ? '✅ Set' : '⚠️ Using default'}`);
-    console.log('═══════════════════════════════════════════════════════════════');
-    console.log('📡 Available Endpoints:');
-    console.log('   GET  /health          - Health check');
-    console.log('   GET  /api/serverTime  - Server time');
-    console.log('   POST /api/getUser     - Get user data');
-    console.log('   POST /api/updateDevice - Update device');
-    console.log('   POST /api/verifyAccount - Verify account');
-    console.log('   POST /api/admin/login - Admin login');
-    console.log('   POST /api/sub/verify-key - SubAdmin verify');
-    console.log('═══════════════════════════════════════════════════════════════');
-    console.log('');
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'production'}`);
+    console.log(`🔐 API Key Protection: ${config.APP_API_KEY ? '✅ ENABLED' : '❌ DISABLED'}`);
+    console.log(`🛡️ CORS Protection: ${config.CORS?.ALLOWED_ORIGINS?.length > 0 ? '✅ RESTRICTED' : '❌ OPEN'}`);
+    console.log(`📊 Rate Limiting: ✅ ENABLED (${config.SECURITY?.RATE_LIMITS?.API || 50}/15min)`);
+    console.log(`🛡️ Security Headers: ✅ FULLY ENABLED`);
+    console.log('═'.repeat(60));
+    console.log('📡 Server is ready to handle requests');
+    console.log('═'.repeat(60) + '\n');
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 12. Graceful Shutdown
+// 🛡️ 14. Graceful Shutdown للإنتاج
 // ═══════════════════════════════════════════════════════════════════
 
+let isShuttingDown = false;
+
 process.on('SIGTERM', () => {
-    console.log('📴 SIGTERM received, shutting down gracefully...');
-    process.exit(0);
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    
+    console.log('📴 SIGTERM received, starting graceful shutdown...');
+    setTimeout(() => {
+        console.log('✅ Graceful shutdown completed');
+        process.exit(0);
+    }, 10000); // انتظار 10 ثوانٍ لإكمال الطلبات الحالية
 });
 
 process.on('SIGINT', () => {
-    console.log('📴 SIGINT received, shutting down gracefully...');
-    process.exit(0);
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    
+    console.log('📴 SIGINT received, starting graceful shutdown...');
+    setTimeout(() => {
+        console.log('✅ Graceful shutdown completed');
+        process.exit(0);
+    }, 10000);
 });
 
 process.on('uncaughtException', (err) => {
-    console.error('❌ Uncaught Exception:', err.message);
-    console.error(err.stack);
+    console.error('❌ Uncaught Exception:', {
+        message: err.message,
+        stack: err.stack,
+        timestamp: new Date().toISOString()
+    });
+    
+    // في الإنتاج، لا تخرج فوراً، دع الخادم يستمر
+    if (process.env.NODE_ENV === 'production') {
+        console.error('⚠️ Keeping server alive despite uncaught exception');
+    } else {
+        process.exit(1);
+    }
 });
 
 process.on('unhandledRejection', (reason, promise) => {
