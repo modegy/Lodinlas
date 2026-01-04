@@ -1,5 +1,6 @@
 // middleware/security.js - SecureArmor v14.1 Enhanced Edition
 // إصلاح جميع الثغرات المحتملة + تحسينات متقدمة
+// 🔧 FIX: Smart WAF exclusion for trusted app endpoints
 'use strict';
 
 const crypto = require('crypto');
@@ -25,7 +26,6 @@ const SecureUtils = {
         return str.slice(0, maxLength).replace(/[\x00-\x1f\x7f]/g, '').trim();
     },
     
-    // ✅ إصلاح #9: دعم IPv4 و IPv6
     isValidIP: (ip) => {
         if (!ip || typeof ip !== 'string') return false;
         const ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
@@ -36,13 +36,13 @@ const SecureUtils = {
     isIPv6: (ip) => ip && ip.includes(':'),
     
     ipToInt: (ip) => {
-        if (!ip || ip.includes(':')) return 0; // IPv6 يُعامل بشكل مختلف
+        if (!ip || ip.includes(':')) return 0;
         return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet), 0) >>> 0;
     },
     
     isIPInRange: (ip, cidr) => {
         if (!ip) return false;
-        if (SecureUtils.isIPv6(ip)) return ip === cidr; // IPv6 exact match فقط
+        if (SecureUtils.isIPv6(ip)) return ip === cidr;
         if (!cidr.includes('/')) return ip === cidr;
         
         try {
@@ -61,7 +61,6 @@ const SecureUtils = {
         return privateRanges.some(range => SecureUtils.isIPInRange(ip, range));
     },
     
-    // ✅ إصلاح #7: Fingerprint للجهاز
     generateFingerprint: (req) => {
         const components = [
             req.headers?.['user-agent'] || '',
@@ -70,6 +69,82 @@ const SecureUtils = {
             req.headers?.['accept'] || ''
         ];
         return SecureUtils.secureHash(components.join('|')).slice(0, 16);
+    }
+};
+
+// ============================================
+// 🔧 TRUSTED APP ENDPOINTS - المسارات الموثوقة
+// ============================================
+// هذه المسارات تُستخدم من التطبيق وتحتوي على بيانات جهاز قد تُفسَّر خطأً
+const TRUSTED_APP_ENDPOINTS = {
+    // المسارات المستثناة من فحص SQL Injection في Body فقط
+    // (لا تزال تُفحص ضد XSS و Path Traversal و Command Injection)
+    bodyExemptPaths: [
+        '/api/updateDevice',
+        '/api/updatedevice',
+        '/api/getUser',
+        '/api/getuser',
+        '/api/verifyAccount',
+        '/api/verifyaccount'
+    ],
+    
+    // الحقول المسموحة في deviceInfo (whitelist)
+    allowedDeviceFields: [
+        'device_model', 'device_brand', 'device_manufacturer', 'device_product',
+        'device_type', 'android_version', 'sdk_version', 'is_rooted', 
+        'has_screen_lock', 'fingerprint_enabled', 'total_ram', 'screen_size',
+        'screen_density', 'network_type', 'carrier_name', 'battery_level',
+        'is_charging', 'security_threat', 'location'
+    ],
+    
+    // التحقق من أن الطلب من التطبيق الشرعي
+    isFromTrustedApp: (req) => {
+        const apiKey = req.headers['x-api-key'] || req.headers['x-client-id'];
+        const signature = req.headers['x-api-signature'];
+        const userAgent = req.headers['user-agent'] || '';
+        
+        // يجب أن يكون لديه API Key
+        if (!apiKey) return false;
+        
+        // التحقق من User-Agent (التطبيق يستخدم okhttp)
+        const trustedAgents = ['okhttp', 'android', 'mobile'];
+        const hasValidUA = trustedAgents.some(ua => userAgent.toLowerCase().includes(ua));
+        
+        // يجب أن يكون لديه توقيع أو UA صحيح
+        return signature || hasValidUA;
+    },
+    
+    // التحقق من أن المسار مستثنى
+    isBodyExemptPath: (path) => {
+        if (!path) return false;
+        const cleanPath = path.split('?')[0].toLowerCase();
+        return TRUSTED_APP_ENDPOINTS.bodyExemptPaths.some(p => 
+            cleanPath === p || cleanPath.endsWith(p)
+        );
+    },
+    
+    // تنظيف deviceInfo من أي محتوى ضار
+    sanitizeDeviceInfo: (deviceInfo) => {
+        if (!deviceInfo || typeof deviceInfo !== 'object') return {};
+        
+        const sanitized = {};
+        for (const [key, value] of Object.entries(deviceInfo)) {
+            // فقط الحقول المسموحة
+            if (!TRUSTED_APP_ENDPOINTS.allowedDeviceFields.includes(key)) continue;
+            
+            // تنظيف القيم
+            if (typeof value === 'string') {
+                // إزالة أي محتوى XSS محتمل
+                sanitized[key] = value
+                    .replace(/<[^>]*>/g, '')
+                    .replace(/javascript:/gi, '')
+                    .replace(/on\w+=/gi, '')
+                    .slice(0, 200);
+            } else if (typeof value === 'number' || typeof value === 'boolean') {
+                sanitized[key] = value;
+            }
+        }
+        return sanitized;
     }
 };
 
@@ -118,13 +193,13 @@ const SECURITY_CONFIG = {
     // Trusted Proxies
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES 
         ? process.env.TRUSTED_PROXIES.split(',').map(p => p.trim())
-        : ['127.0.0.1'],
+        : ['127.0.0.1', '::1'],
     
-    // Exempt Paths (لا تفحصها)
+    // Exempt Paths
     EXEMPT_PATHS: ['/health', '/favicon.ico', '/robots.txt', '/api/health', '/', '/api/serverTime'],
     STATIC_EXTENSIONS: /\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map)$/i,
     
-    // IPs المستثناة من الفحص (localhost + internal)
+    // IPs المستثناة
     EXEMPT_IPS: ['127.0.0.1', '::1', '::ffff:127.0.0.1'],
     
     // WAF Settings
@@ -166,7 +241,6 @@ const initRedis = async () => {
             maxRetriesPerRequest: 3,
             retryStrategy: (times) => times > 10 ? null : Math.min(times * 100, 3000),
             lazyConnect: true,
-            // ✅ إصلاح #9: حماية Redis
             password: process.env.REDIS_PASSWORD || undefined,
             tls: process.env.REDIS_TLS === 'true' ? {} : undefined
         });
@@ -251,7 +325,7 @@ class SecureStorage {
 const storage = new SecureStorage();
 
 // ============================================
-// RATE LIMITER - محسّن #2
+// RATE LIMITER
 // ============================================
 class RateLimiter {
     constructor(capacity, refillRate) {
@@ -268,7 +342,6 @@ class RateLimiter {
     async consumeRedis(identifier, tokens) {
         const key = `rl:${SecureUtils.secureHash(identifier)}`;
         try {
-            // ✅ إصلاح #2: Lua script محسّن للدقة
             const lua = `
                 local key, cap, rate, tokens, now = KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
                 local b = redis.call('HMGET', key, 'tokens', 'lastRefill')
@@ -326,7 +399,7 @@ class DDoSProtection {
         const now = Date.now();
         for (const [ip, data] of this.connections.entries()) {
             if (now - data.lastSeen > 60000) this.connections.delete(ip);
-            else data.burst = Math.max(0, data.burst - 10); // تقليل burst تدريجياً
+            else data.burst = Math.max(0, data.burst - 10);
         }
     }
     
@@ -419,14 +492,12 @@ class IPAnalyzer {
 const ipAnalyzer = new IPAnalyzer();
 
 // ============================================
-// WAF ENGINE - محسّن #3
+// WAF ENGINE - 🔧 محسّن مع استثناءات ذكية
 // ============================================
 class WAFEngine {
     constructor() {
-        // ✅ إصلاح #3: Patterns محسّنة ومتقدمة
         this.patterns = {
             sqlInjection: [
-                // Classic SQL Injection
                 /(?:union\s+(?:all\s+)?select)/i,
                 /(?:select\s+.*?\s+from\s+)/i,
                 /(?:insert\s+into\s+.*?\s+values)/i,
@@ -434,21 +505,19 @@ class WAFEngine {
                 /(?:delete\s+from\s+)/i,
                 /(?:drop\s+(?:table|database|column))/i,
                 /(?:truncate\s+table)/i,
-                // Bypass attempts
-                /(?:\/\*.*?\*\/)/i,                          // SQL comments
-                /(?:--|#|\/\*).*$/i,                         // Line comments
-                /(?:'\s*(?:or|and)\s*'?\d*'?\s*[=<>])/i,    // ' or '1'='1
+                /(?:\/\*.*?\*\/)/i,
+                /(?:--|#|\/\*).*$/i,
+                /(?:'\s*(?:or|and)\s*'?\d*'?\s*[=<>])/i,
                 /(?:'\s*;\s*(?:select|insert|update|delete))/i,
-                /(?:(?:0x|x')[0-9a-f]+)/i,                   // Hex encoding
-                /(?:char\s*\(\s*\d+\s*\))/i,                 // CHAR() function
-                /(?:concat\s*\()/i,                          // CONCAT()
+                /(?:(?:0x|x')[0-9a-f]+)/i,
+                /(?:char\s*\(\s*\d+\s*\))/i,
+                /(?:concat\s*\()/i,
                 /(?:benchmark\s*\()/i,
                 /(?:sleep\s*\()/i,
                 /(?:waitfor\s+delay)/i,
                 /(?:pg_sleep)/i,
-                // NoSQL Injection
                 /(?:\$(?:where|gt|lt|ne|eq|regex|in|nin|or|and|not|exists))/i,
-                /(?:\{\s*["\']?\$)/i,                        // MongoDB operators
+                /(?:\{\s*["\']?\$)/i,
             ],
             xss: [
                 /<script[^>]*>[\s\S]*?<\/script>/gi,
@@ -476,18 +545,18 @@ class WAFEngine {
                 /(?:\/var\/log\/)/i,
                 /(?:c:\\windows\\)/i,
                 /(?:boot\.ini|win\.ini|system32)/i,
-                /(?:%2e%2e%2f|%2e%2e\/|\.\.%2f)/gi,          // URL encoded
-                /(?:%252e%252e%252f)/gi,                     // Double encoded
-                /(?:\.\.%c0%af|\.\.%c1%9c)/gi               // Overlong UTF-8
+                /(?:%2e%2e%2f|%2e%2e\/|\.\.%2f)/gi,
+                /(?:%252e%252e%252f)/gi,
+                /(?:\.\.%c0%af|\.\.%c1%9c)/gi
             ],
             commandInjection: [
                 /(?:[;&|`]\s*(?:cat|ls|dir|type|wget|curl|nc|bash|sh|cmd|powershell|python|perl|ruby|php))/gi,
-                /(?:\$\([^)]+\))/g,                          // $(command)
-                /(?:`[^`]+`)/g,                              // `command`
+                /(?:\$\([^)]+\))/g,
+                /(?:`[^`]+`)/g,
                 /(?:\|\s*(?:cat|ls|dir|wget|curl|nc|bash|sh))/gi,
-                /(?:>\s*\/)/gi,                              // Redirect to root
+                /(?:>\s*\/)/gi,
                 /(?:;\s*(?:rm|del|format)\s)/gi,
-                /(?:\$\{[^}]+\})/g                           // ${command}
+                /(?:\$\{[^}]+\})/g
             ],
             xxe: [
                 /<!ENTITY/gi,
@@ -518,24 +587,26 @@ class WAFEngine {
         ];
     }
     
+    // 🔧 الفحص الرئيسي مع استثناءات ذكية
     scan(req) {
         const results = { blocked: false, score: 0, threats: [] };
         const cfg = SECURITY_CONFIG.WAF;
+        const path = req.path || req.url?.split('?')[0] || '';
         
+        // التحقق من طول URL
         if (req.url && req.url.length > cfg.maxURLLength) {
             results.threats.push({ type: 'oversized_url', severity: 5 });
             results.score += 5;
         }
         
-        // ✅ تحسين: فحص URL مع decoding متعدد المستويات
+        // فحص URL (دائماً)
         let urlToScan = req.url || '';
         try {
             urlToScan = decodeURIComponent(urlToScan);
-            urlToScan = decodeURIComponent(urlToScan); // Double decode
+            urlToScan = decodeURIComponent(urlToScan);
         } catch {}
         urlToScan = SecureUtils.sanitizeString(urlToScan.toLowerCase(), cfg.maxURLLength);
         
-        // فحص URL
         for (const [category, patterns] of Object.entries(this.patterns)) {
             for (const pattern of patterns) {
                 if (pattern.test(urlToScan)) {
@@ -547,26 +618,56 @@ class WAFEngine {
             }
         }
         
-        // ✅ تحسين #3: فحص Body بشكل أعمق
+        // 🔧 فحص Body مع استثناءات ذكية للتطبيق الموثوق
         if (req.body) {
-            const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-            const bodyToScan = bodyStr.slice(0, cfg.maxBodySize).toLowerCase();
+            const isTrustedEndpoint = TRUSTED_APP_ENDPOINTS.isBodyExemptPath(path);
+            const isFromApp = TRUSTED_APP_ENDPOINTS.isFromTrustedApp(req);
             
-            for (const [category, patterns] of Object.entries(this.patterns)) {
-                for (const pattern of patterns) {
-                    if (pattern.test(bodyToScan)) {
-                        const severity = this.getSeverity(category);
-                        results.threats.push({ type: `body_${category}`, severity, location: 'body' });
-                        results.score += severity;
-                        break;
+            // إذا كان من التطبيق الموثوق لمسار موثوق
+            if (isTrustedEndpoint && isFromApp) {
+                // فحص XSS فقط (الأهم للأمان) - تخطي SQL Injection
+                const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+                const bodyToScan = bodyStr.slice(0, cfg.maxBodySize).toLowerCase();
+                
+                // فحص XSS و Command Injection فقط
+                const criticalCategories = ['xss', 'commandInjection', 'xxe', 'lfi'];
+                for (const category of criticalCategories) {
+                    for (const pattern of this.patterns[category]) {
+                        if (pattern.test(bodyToScan)) {
+                            const severity = this.getSeverity(category);
+                            results.threats.push({ type: `body_${category}`, severity, location: 'body' });
+                            results.score += severity;
+                            break;
+                        }
+                    }
+                }
+                
+                // 🔧 تنظيف deviceInfo إذا موجود
+                if (req.body.deviceInfo) {
+                    req.body.deviceInfo = TRUSTED_APP_ENDPOINTS.sanitizeDeviceInfo(req.body.deviceInfo);
+                }
+                
+            } else {
+                // فحص كامل للمسارات غير الموثوقة
+                const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+                const bodyToScan = bodyStr.slice(0, cfg.maxBodySize).toLowerCase();
+                
+                for (const [category, patterns] of Object.entries(this.patterns)) {
+                    for (const pattern of patterns) {
+                        if (pattern.test(bodyToScan)) {
+                            const severity = this.getSeverity(category);
+                            results.threats.push({ type: `body_${category}`, severity, location: 'body' });
+                            results.score += severity;
+                            break;
+                        }
                     }
                 }
             }
         }
         
-        // فحص Headers
+        // فحص Headers (دائماً)
         const headers = req.headers || {};
-        const headersToCheck = ['referer', 'user-agent', 'cookie', 'x-forwarded-for', 'x-forwarded-host'];
+        const headersToCheck = ['referer', 'x-forwarded-host'];
         for (const header of headersToCheck) {
             if (headers[header]) {
                 const headerValue = String(headers[header]).toLowerCase();
@@ -580,7 +681,7 @@ class WAFEngine {
             }
         }
         
-        // فحص Bot
+        // فحص Bot (دائماً)
         const ua = headers['user-agent'] || '';
         if (this.badBots.some(p => p.test(ua))) {
             results.threats.push({ type: 'malicious_bot', severity: 10 });
@@ -600,11 +701,10 @@ class WAFEngine {
 const waf = new WAFEngine();
 
 // ============================================
-// BEHAVIOR ANALYZER - محسّن #5
+// BEHAVIOR ANALYZER
 // ============================================
 class BehaviorAnalyzer {
     constructor() {
-        // ✅ إصلاح #5: Moving average
         this.baselineRPS = 10;
         this.learningRate = 0.1;
     }
@@ -626,28 +726,23 @@ class BehaviorAnalyzer {
         if (!behavior.endpoints.includes(req.path)) behavior.endpoints.push(req.path);
         if (behavior.endpoints.length > 100) behavior.endpoints = behavior.endpoints.slice(-100);
         
-        // تتبع Methods
         behavior.methods = behavior.methods || {};
         behavior.methods[req.method] = (behavior.methods[req.method] || 0) + 1;
         
-        // ✅ حساب Moving Average RPS
         const currentRPS = behavior.requests.length;
         behavior.avgRPS = behavior.avgRPS * (1 - this.learningRate) + currentRPS * this.learningRate;
         
         let anomalyScore = 0;
         
-        // مقارنة مع المتوسط بدلاً من threshold ثابت
         if (currentRPS > behavior.avgRPS * 3) anomalyScore += 30;
         else if (currentRPS > behavior.avgRPS * 2) anomalyScore += 15;
         
         if (behavior.endpoints.length > 50) anomalyScore += 20;
         if (behavior.authFailures > 3) anomalyScore += Math.min(behavior.authFailures * 5, 30);
         
-        // نسبة الأخطاء
         const errorRatio = behavior.errorCount / Math.max(behavior.requests.length, 1);
         if (errorRatio > 0.5) anomalyScore += 20;
         
-        // نسبة غير GET requests
         const totalReqs = Object.values(behavior.methods).reduce((a, b) => a + b, 0);
         const nonGetRatio = (totalReqs - (behavior.methods['GET'] || 0)) / Math.max(totalReqs, 1);
         if (nonGetRatio > 0.7 && totalReqs > 20) anomalyScore += 15;
@@ -684,7 +779,7 @@ class BehaviorAnalyzer {
 const behaviorAnalyzer = new BehaviorAnalyzer();
 
 // ============================================
-// BOT DETECTOR - محسّن #6
+// BOT DETECTOR
 // ============================================
 class BotDetector {
     constructor() {
@@ -695,20 +790,20 @@ class BotDetector {
             { name: 'Slurp', pattern: /slurp/i, verify: '.yahoo.com' }
         ];
         
-        this.badBots = waf.badBots; // استخدام نفس القائمة
+        // 🔧 استثناء okhttp من البوتات السيئة (التطبيق يستخدمه)
+        this.trustedAgents = [/okhttp/i, /android/i, /dalvik/i];
         
-        // ✅ تحسين #6: أنماط سلوك البوت
-        this.botBehaviors = {
-            noJsFingerprint: true,
-            linearRequestPattern: true,
-            noMouseMovement: true,
-            exactTiming: true
-        };
+        this.badBots = waf.badBots;
     }
     
     async detect(req, ip) {
         const ua = req.headers?.['user-agent'] || '';
         const result = { isBot: false, botType: null, confidence: 0, action: 'allow', reasons: [] };
+        
+        // 🔧 تخطي التطبيق الموثوق
+        if (this.trustedAgents.some(p => p.test(ua))) {
+            return { isBot: false, botType: 'trusted_app', confidence: 0, action: 'allow', reasons: ['Trusted mobile app'] };
+        }
         
         // فحص البوتات السيئة
         for (const pattern of this.badBots) {
@@ -720,7 +815,6 @@ class BotDetector {
         // فحص البوتات الجيدة
         for (const bot of this.goodBots) {
             if (bot.pattern.test(ua)) {
-                // ✅ تحسين: التحقق من DNS للبوتات الجيدة
                 if (bot.verify) {
                     const verified = await this.verifyBot(ip, bot.verify);
                     if (!verified) {
@@ -731,7 +825,7 @@ class BotDetector {
             }
         }
         
-        // ✅ تحسين #6: تحليل Headers متقدم
+        // تحليل Headers
         const headers = req.headers || {};
         
         if (!headers['accept-language']) { result.confidence += 15; result.reasons.push('No Accept-Language'); }
@@ -740,20 +834,17 @@ class BotDetector {
         if (ua.length < 20) { result.confidence += 20; result.reasons.push('Short UA'); }
         if (ua.length > 500) { result.confidence += 15; result.reasons.push('Oversized UA'); }
         
-        // فحص ترتيب Headers
         const headerOrder = Object.keys(headers);
         if (headerOrder.length > 0 && headerOrder[0] !== 'host') {
             result.confidence += 10;
             result.reasons.push('Unusual header order');
         }
         
-        // فحص Accept header
         if (headers['accept'] && !headers['accept'].includes('text/html') && !headers['accept'].includes('application/json')) {
             result.confidence += 10;
             result.reasons.push('Unusual Accept header');
         }
         
-        // فحص Fingerprint consistency
         const fingerprint = SecureUtils.generateFingerprint(req);
         const fpData = storage.get('fingerprints', ip);
         if (fpData && fpData.fingerprint !== fingerprint) {
@@ -787,7 +878,7 @@ class BotDetector {
 const botDetector = new BotDetector();
 
 // ============================================
-// HONEYPOT - محسّن #4
+// HONEYPOT
 // ============================================
 class Honeypot {
     constructor() {
@@ -801,7 +892,6 @@ class Honeypot {
         
         this.trapFields = ['website', 'url', 'homepage', 'fax', 'company_url', 'http', 'link'];
         
-        // ✅ إصلاح #4: مصائد ديناميكية لكل session
         this.dynamicTraps = new Set();
         this.generateDynamicTraps();
         setInterval(() => this.generateDynamicTraps(), 3600000);
@@ -822,17 +912,14 @@ class Honeypot {
     check(req) {
         const path = (req.path || '').toLowerCase();
         
-        // فحص المصائد الثابتة
         for (const trap of this.staticTrapPaths) {
             if (path.includes(trap)) return { triggered: true, type: 'path', trap };
         }
         
-        // فحص المصائد الديناميكية
         for (const trap of this.dynamicTraps) {
             if (path === trap) return { triggered: true, type: 'dynamic_path', trap };
         }
         
-        // فحص حقول النموذج
         if (req.body && typeof req.body === 'object') {
             for (const field of this.trapFields) {
                 if (req.body[field] && String(req.body[field]).trim()) {
@@ -852,12 +939,11 @@ class Honeypot {
 const honeypot = new Honeypot();
 
 // ============================================
-// GET CLIENT IP - محسّن #1
+// GET CLIENT IP
 // ============================================
 const getClientIP = (req) => {
     const connectionIP = (req.connection?.remoteAddress || req.socket?.remoteAddress || '127.0.0.1').replace(/^::ffff:/, '');
     
-    // ✅ إصلاح #1: تحقق صارم من trusted proxies
     const isTrustedProxy = SECURITY_CONFIG.TRUSTED_PROXIES.some(range => {
         if (range === connectionIP) return true;
         return SecureUtils.isIPInRange(connectionIP, range);
@@ -869,7 +955,6 @@ const getClientIP = (req) => {
             .map(ip => ip.trim().replace(/^::ffff:/, ''))
             .filter(ip => SecureUtils.isValidIP(ip));
         
-        // ✅ أخذ آخر IP غير موثوق (أقرب للـ client الحقيقي)
         for (let i = ips.length - 1; i >= 0; i--) {
             const ip = ips[i];
             const isTrusted = SECURITY_CONFIG.TRUSTED_PROXIES.some(range => 
@@ -880,7 +965,6 @@ const getClientIP = (req) => {
             }
         }
         
-        // Fallback للأول
         if (ips.length > 0) return ips[0];
     }
     
@@ -888,16 +972,15 @@ const getClientIP = (req) => {
 };
 
 // ============================================
-// SECURITY HEADERS - محسّن #8
+// SECURITY HEADERS
 // ============================================
 const addSecurityHeaders = (res, nonce = null) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '0'); // Modern browsers don't need this
+    res.setHeader('X-XSS-Protection', '0');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=(), usb=()');
     
-    // ✅ إصلاح #8: CSP محسّن (بدون unsafe-inline إذا أمكن)
     const cspDirectives = [
         "default-src 'self'",
         nonce ? `script-src 'self' 'nonce-${nonce}'` : "script-src 'self'",
@@ -932,7 +1015,6 @@ const logSecurityEvent = async (type, ip, details = {}) => {
         ...details 
     };
     
-    // ✅ إصلاح #9: لا نكشف معلومات حساسة في الـ logs
     console.log(`🛡️ [SECURITY] ${type} | IP: ${event.ip.slice(0, 20)}*** | ${JSON.stringify({ ...details, ip: undefined })}`);
     
     if (redisAvailable) {
@@ -981,7 +1063,7 @@ const securityMiddleware = async (req, res, next) => {
         
         const ip = getClientIP(req);
         
-        // ✅ Skip security checks for localhost/internal IPs
+        // Skip security checks for localhost/internal IPs
         const isExemptIP = SECURITY_CONFIG.EXEMPT_IPS?.includes(ip) || 
                           ip === '127.0.0.1' || 
                           ip === '::1' || 
@@ -1054,7 +1136,7 @@ const securityMiddleware = async (req, res, next) => {
             return res.status(403).json({ error: 'Access denied', reason: 'Low reputation', requestId });
         }
         
-        // 7. WAF
+        // 7. WAF - 🔧 محسّن مع استثناءات ذكية
         if (SECURITY_CONFIG.ENABLE_WAF && shouldScanPath(path)) {
             const wafResult = waf.scan(req);
             if (wafResult.blocked) {
@@ -1099,28 +1181,24 @@ const securityMiddleware = async (req, res, next) => {
 };
 
 // ============================================
-// BRUTE FORCE PROTECTION - محسّن #7
+// BRUTE FORCE PROTECTION
 // ============================================
 const bruteForceProtection = async (req, res, next) => {
     const ip = getClientIP(req);
     const cfg = SECURITY_CONFIG.BRUTE_FORCE;
     
-    // ✅ إصلاح #7: Rate limit على IP + Username
     const username = req.body?.username || req.body?.email || '';
     const ipKey = ip;
     const userKey = username ? `user:${SecureUtils.secureHash(username)}` : null;
-    const combinedKey = username ? `${ip}:${SecureUtils.secureHash(username)}` : null;
     
     let ipAttempts = storage.get('loginAttempts', ipKey) || { count: 0, lockUntil: 0, lockCount: 0 };
     let userAttempts = userKey ? (storage.get('userAttempts', userKey) || { count: 0, lockUntil: 0 }) : null;
     
-    // Check IP lock
     if (ipAttempts.lockUntil > Date.now()) {
         const remaining = Math.ceil((ipAttempts.lockUntil - Date.now()) / 1000);
         return res.status(429).json({ error: 'Too many attempts from this IP', remaining_seconds: remaining });
     }
     
-    // ✅ Check username lock (حماية إضافية)
     if (userAttempts && userAttempts.lockUntil > Date.now()) {
         const remaining = Math.ceil((userAttempts.lockUntil - Date.now()) / 1000);
         return res.status(429).json({ error: 'Account temporarily locked', remaining_seconds: remaining });
@@ -1139,11 +1217,10 @@ const bruteForceProtection = async (req, res, next) => {
         }
         storage.set('loginAttempts', ipKey, ipAttempts, 86400000);
         
-        // ✅ Lock username أيضاً
         if (userKey) {
             userAttempts = userAttempts || { count: 0, lockUntil: 0 };
             userAttempts.count++;
-            if (userAttempts.count >= cfg.maxAttempts * 2) { // عتبة أعلى للـ username
+            if (userAttempts.count >= cfg.maxAttempts * 2) {
                 userAttempts.lockUntil = Date.now() + cfg.lockoutTime;
                 userAttempts.count = 0;
             }
@@ -1182,7 +1259,8 @@ const securityAdmin = {
             protectionLevel: SECURITY_CONFIG.PROTECTION_LEVEL, 
             wafEnabled: SECURITY_CONFIG.ENABLE_WAF, 
             rateLimitEnabled: SECURITY_CONFIG.ENABLE_RATE_LIMIT,
-            trustedProxies: SECURITY_CONFIG.TRUSTED_PROXIES.length
+            trustedProxies: SECURITY_CONFIG.TRUSTED_PROXIES.length,
+            trustedAppEndpoints: TRUSTED_APP_ENDPOINTS.bodyExemptPaths.length
         },
         honeypot: { staticTraps: honeypot.staticTrapPaths.length, dynamicTraps: honeypot.dynamicTraps.size },
         timestamp: new Date().toISOString()
@@ -1264,6 +1342,7 @@ module.exports = {
     rateLimiters,
     
     SECURITY_CONFIG,
+    TRUSTED_APP_ENDPOINTS,
     
     utils: {
         blockIP,
