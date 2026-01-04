@@ -120,6 +120,27 @@ try {
     console.log('⚠️ Security middleware not found, continuing without it');
 }
 
+
+
+// في server.js - إضافة التوثيق المتقدم
+const { signatureAuth, apiKeyAuth, adminAuth, apiKeyRateLimit } = require('./middleware/auth');
+
+// ... بعد security middleware ...
+
+// 🔐 تطبيق التوثيق المتقدم
+app.use(signatureAuth);
+app.use(apiKeyAuth);
+app.use(apiKeyRateLimit);
+
+// 👤 توثيق الإدارة (للمسارات الإدارية فقط)
+app.use('/api/admin', adminAuth);
+app.use('/api/sub', adminAuth);
+
+// ... بقية الكود ...
+
+
+
+
 // ═══════════════════════════════════════════════════════════════════
 // 📡 7. API ENDPOINTS - الأساسية (قبل الـ routes)
 // ═══════════════════════════════════════════════════════════════════
