@@ -28,17 +28,23 @@ const corsOptions = {
     origin: (origin, callback) => {
         const allowedOrigins = config.CORS?.ALLOWED_ORIGINS || [];
         
-        if (!origin) return callback(null, true);
-        
-        if (allowedOrigins.includes('*') && process.env.NODE_ENV !== 'production') {
+        // السماح للطلبات بدون origin (mobile apps, Postman, local files)
+        if (!origin || origin === 'null') {
             return callback(null, true);
         }
         
+        // السماح لجميع الـ origins إذا كانت القائمة تحتوي على *
+        if (allowedOrigins.includes('*')) {
+            return callback(null, true);
+        }
+        
+        // التحقق من القائمة البيضاء
         if (allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
-            console.warn(`🚫 CORS Blocked: ${origin}`);
-            callback(new Error('Not allowed by CORS'));
+            // في الإنتاج: السماح مؤقتاً مع تحذير
+            console.warn(`⚠️ CORS Warning: ${origin} not in whitelist, allowing anyway`);
+            callback(null, true);
         }
     },
     credentials: true,
@@ -55,6 +61,9 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+// معالجة OPTIONS requests (Preflight)
+app.options('*', cors(corsOptions));
 
 // ═══════════════════════════════════════════════════════════════════
 // 🛡️ 3. Security Headers (Helmet)
