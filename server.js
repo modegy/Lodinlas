@@ -1,3 +1,4 @@
+
 // server.js - SecureArmor Main Server v14.1
 'use strict';
 
@@ -241,11 +242,36 @@ try {
 const appProtectedPaths = ['/api/verifyAccount', '/api/getUser', '/api/updateDevice'];
 app.use(appProtectedPaths, authApp);
 
-// مسارات الأدمن (Session Token / Master Token)
-app.use('/api/admin', authAdmin);
+// مسارات الأدمن المستثناة من التوثيق (تسجيل الدخول)
+const adminPublicPaths = ['/api/admin/login', '/api/admin/auth'];
+app.use(adminPublicPaths, (req, res, next) => {
+    // السماح بدون توثيق
+    next();
+});
 
-// مسارات الـ Sub-Admin (API Key خاص)
-app.use('/api/sub', authSubAdmin);
+// مسارات الأدمن المحمية (تحتاج Session Token)
+app.use('/api/admin', (req, res, next) => {
+    // تخطي المسارات العامة
+    if (req.path === '/login' || req.path === '/auth') {
+        return next();
+    }
+    // تطبيق التوثيق على باقي المسارات
+    authAdmin(req, res, next);
+});
+
+// مسارات الـ Sub-Admin المستثناة
+const subAdminPublicPaths = ['/api/sub/verify-key', '/api/sub/login'];
+app.use(subAdminPublicPaths, (req, res, next) => {
+    next();
+});
+
+// مسارات الـ Sub-Admin المحمية
+app.use('/api/sub', (req, res, next) => {
+    if (req.path === '/verify-key' || req.path === '/login') {
+        return next();
+    }
+    authSubAdmin(req, res, next);
+});
 
 // ═══════════════════════════════════════════════════════════════════
 // 📡 12. ROUTES
