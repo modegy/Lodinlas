@@ -4,6 +4,74 @@
 const crypto = require('crypto');
 const config = require('../config');
 
+// تحديث SecureUtils لإضافة وظائف التشفير
+const SecureUtils = {
+    // ... الدوال الحالية ...
+    
+    // 🔐 تشفير البيانات باستخدام ENCRYPTION_KEY
+    encryptData: (data) => {
+        return config.encryptData(data);
+    },
+    
+    // 🔓 فك تشفير البيانات
+    decryptData: (encryptedData) => {
+        return config.decryptData(encryptedData);
+    },
+    
+    // 🏷️ توقيع البيانات
+    signData: (data) => {
+        return config.signData(data);
+    },
+    
+    // ✅ التحقق من التوقيع
+    verifySignature: (data, signature) => {
+        return config.verifySignature(data, signature);
+    },
+    
+    // 👣 إنشاء بصمة متقدمة
+    generateSecureFingerprint: (req) => {
+        const components = [
+            req.headers?.['user-agent'] || '',
+            req.headers?.['accept-language'] || '',
+            req.headers?.['accept-encoding'] || '',
+            req.headers?.['accept'] || '',
+            req.headers?.['sec-ch-ua'] || '',
+            req.headers?.['sec-ch-ua-platform'] || '',
+            req.ip || '',
+            config.generateAppFingerprint()
+        ];
+        
+        const data = components.join('|');
+        return crypto
+            .createHmac('sha256', config.FINGERPRINT_SECRET)
+            .update(data)
+            .digest('hex')
+            .slice(0, 32);
+    },
+    
+    // 🔄 إنشاء تحدي أمان
+    generateSecurityChallenge: () => {
+        const timestamp = Date.now();
+        const nonce = SecureUtils.generateSecureId(16);
+        const data = `${timestamp}:${nonce}:${config.CHALLENGE_SECRET}`;
+        
+        return {
+            timestamp,
+            nonce,
+            challenge: SecureUtils.secureHash(data)
+        };
+    },
+    
+    // ✅ التحقق من التحدي
+    verifySecurityChallenge: (challengeData, clientResponse) => {
+        const { timestamp, nonce } = challengeData;
+        const expected = `${timestamp}:${nonce}:${config.CHALLENGE_SECRET}`;
+        const expectedChallenge = SecureUtils.secureHash(expected);
+        
+        return SecureUtils.secureCompare(expectedChallenge, clientResponse);
+    }
+};
+
 // ============================================
 // 🎯 CONFIGURATION - من config/index.js
 // ============================================
@@ -1743,3 +1811,4 @@ module.exports = {
 };
 
 console.log('✅ SecureArmor v14.1 loaded successfully');
+
