@@ -1,25 +1,34 @@
-
 // server.js - SecureArmor Main Server v14.1
 'use strict';
 
 const express = require('express');
 const helmet = require('helmet');
-const cors = require('cors');
 const config = require('./config');
-
-
-// 🔍 Debug - احذفه بعد الإصلاح!
-console.log('🔍 Admin Config Check:', {
-    username: config.ADMIN_CREDENTIALS?.username,
-    passLength: config.ADMIN_CREDENTIALS?.password?.length,
-    passFirst2: config.ADMIN_CREDENTIALS?.password?.slice(0, 2),
-    passLast2: config.ADMIN_CREDENTIALS?.password?.slice(-2)
-});
 
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 1. SECURITY MIDDLEWARE - تحميل أولاً
+// 🛡️ 1. CORS - يجب أن يكون أول شيء!
+// ═══════════════════════════════════════════════════════════════════
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-API-Key, X-Client-ID, X-Session-Token, X-Device-Fingerprint, X-API-Signature, X-Timestamp, X-Nonce, X-Master-Token, X-Admin-Key, X-Fresh-Login, X-API-Timestamp, X-API-Nonce');
+    res.setHeader('Access-Control-Expose-Headers', 'X-Session-Token');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    
+    next();
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🛡️ 2. SECURITY MIDDLEWARE
 // ═══════════════════════════════════════════════════════════════════
 let security = null;
 try {
@@ -32,72 +41,13 @@ try {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 2. CORS
-// ═══════════════════════════════════════════════════════════════════
-const corsOptions = {
-    origin: (origin, callback) => {
-        const allowedOrigins = config.CORS?.ALLOWED_ORIGINS || [];
-        
-        // السماح للطلبات بدون origin (mobile apps, Postman, local files)
-        if (!origin || origin === 'null') {
-            return callback(null, true);
-        }
-        
-        // السماح لجميع الـ origins إذا كانت القائمة تحتوي على *
-        if (allowedOrigins.includes('*')) {
-            return callback(null, true);
-        }
-        
-        // التحقق من القائمة البيضاء
-        if (allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            // في الإنتاج: السماح مؤقتاً مع تحذير
-            console.warn(`⚠️ CORS Warning: ${origin} not in whitelist, allowing anyway`);
-            callback(null, true);
-        }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: [
-        'Content-Type', 'Authorization', 'Accept',
-        'X-API-Key', 'X-Client-ID', 'X-Session-Token',
-        'X-Device-Fingerprint', 'X-API-Signature',
-        'X-Timestamp', 'X-Nonce', 'X-Master-Token',
-        'X-Admin-Key', 'X-API-Timestamp', 'X-API-Nonce'
-    ],
-    exposedHeaders: ['X-Session-Token'],
-    maxAge: 86400
-};
-
-app.use(cors(corsOptions));
-
-// معالجة OPTIONS requests (Preflight)
-app.options('*', cors(corsOptions));
-
-// ═══════════════════════════════════════════════════════════════════
 // 🛡️ 3. Security Headers (Helmet)
 // ═══════════════════════════════════════════════════════════════════
 app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            scriptSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
-            imgSrc: ["'self'", "data:", "https:"],
-            connectSrc: ["'self'"],
-            fontSrc: ["'self'"],
-            objectSrc: ["'none'"],
-            frameSrc: ["'none'"],
-            frameAncestors: ["'none'"]
-        }
-    },
-    crossOriginResourcePolicy: { policy: "same-site" },
-    crossOriginOpenerPolicy: { policy: "same-origin" },
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    crossOriginOpenerPolicy: false,
     crossOriginEmbedderPolicy: false,
-    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
-    frameguard: { action: 'deny' },
-    referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+    contentSecurityPolicy: false
 }));
 
 // ═══════════════════════════════════════════════════════════════════
@@ -124,8 +74,6 @@ app.use((req, res, next) => {
 // ═══════════════════════════════════════════════════════════════════
 app.get('/health', (req, res) => {
     const mem = process.memoryUsage();
-    const securityStats = security?.getStats() || {};
-    
     res.json({ 
         status: 'ok',
         timestamp: new Date().toISOString(),
@@ -133,11 +81,6 @@ app.get('/health', (req, res) => {
         memory: {
             used: Math.round(mem.heapUsed / 1024 / 1024) + 'MB',
             total: Math.round(mem.heapTotal / 1024 / 1024) + 'MB'
-        },
-        security: {
-            active: !!security,
-            blockedIPs: securityStats.blockedIPs || 0,
-            totalRequests: securityStats.totalRequests || 0
         },
         version: '14.1.0'
     });
@@ -156,7 +99,7 @@ app.get('/api/serverTime', (req, res) => {
 // 🛡️ 7. Content-Type Validation
 // ═══════════════════════════════════════════════════════════════════
 app.use('/api', (req, res, next) => {
-    if (req.path === '/serverTime' || req.method === 'GET') return next();
+    if (req.path === '/serverTime' || req.method === 'GET' || req.method === 'OPTIONS') return next();
     
     if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
         const contentType = req.headers['content-type'];
@@ -171,67 +114,31 @@ app.use('/api', (req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛡️ 8. NoSQL Injection Protection
-// ═══════════════════════════════════════════════════════════════════
-app.use('/api', (req, res, next) => {
-    const dangerousPatterns = [
-        /\$where/i, /\$ne/i, /\$gt/i, /\$lt/i, /\$in/i,
-        /\$nin/i, /\$exists/i, /\$regex/i,
-        /\.\.\//, /\/etc\/passwd/, /\/proc\/self/
-    ];
-    
-    const checkObj = (obj) => {
-        for (let key in obj) {
-            const val = obj[key];
-            if (typeof val === 'string') {
-                for (let pattern of dangerousPatterns) {
-                    if (pattern.test(val) || pattern.test(key)) {
-                        console.warn(`⚠️ Injection attempt from IP: ${req.clientIP || req.ip}`);
-                        return false;
-                    }
-                }
-            } else if (typeof val === 'object' && val !== null) {
-                if (!checkObj(val)) return false;
-            }
-        }
-        return true;
-    };
-    
-    if (!checkObj(req.body) || !checkObj(req.query)) {
-        return res.status(400).json({ success: false, error: 'Invalid input detected' });
-    }
-    next();
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// ⏱️ 9. Rate Limiting (Express)
+// ⏱️ 8. Rate Limiting
 // ═══════════════════════════════════════════════════════════════════
 const rateLimit = require('express-rate-limit');
 
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: config.SECURITY?.RATE_LIMITS?.API?.capacity || 50,
-    message: { success: false, error: 'Too many requests', retryAfter: '15 minutes' },
+    max: 100,
+    message: { success: false, error: 'Too many requests' },
     standardHeaders: true,
     legacyHeaders: false,
-    skip: (req) => req.path === '/serverTime',
-    keyGenerator: (req) => req.clientIP || req.ip
+    skip: (req) => req.path === '/serverTime' || req.method === 'OPTIONS'
 });
 
 app.use('/api', apiLimiter);
 
 // ═══════════════════════════════════════════════════════════════════
-// 🔐 10. استيراد Auth Middleware
+// 🔐 9. استيراد Auth Middleware
 // ═══════════════════════════════════════════════════════════════════
-let authApp, authAdmin, authSubAdmin, checkSubAdminPermission, checkUserOwnership;
+let authApp, authAdmin, authSubAdmin;
 
 try {
     const authModule = require('./middleware/auth');
     authApp = authModule.authApp;
     authAdmin = authModule.authAdmin;
     authSubAdmin = authModule.authSubAdmin;
-    checkSubAdminPermission = authModule.checkSubAdminPermission;
-    checkUserOwnership = authModule.checkUserOwnership;
     console.log('✅ Auth middleware loaded successfully');
 } catch (err) {
     console.error('❌ Failed to load auth middleware:', err.message);
@@ -239,51 +146,34 @@ try {
     authApp = fallback;
     authAdmin = fallback;
     authSubAdmin = fallback;
-    checkSubAdminPermission = () => fallback;
-    checkUserOwnership = fallback;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 🔐 11. تطبيق التوثيق على المسارات
+// 🔐 10. تطبيق التوثيق على المسارات
 // ═══════════════════════════════════════════════════════════════════
 
-// المسارات المحمية للتطبيق (API Key + Signature)
-const appProtectedPaths = ['/api/verifyAccount', '/api/getUser', '/api/updateDevice'];
-app.use(appProtectedPaths, authApp);
+// المسارات المحمية للتطبيق
+app.use(['/api/verifyAccount', '/api/getUser', '/api/updateDevice'], authApp);
 
-// مسارات الأدمن المستثناة من التوثيق (تسجيل الدخول)
-const adminPublicPaths = ['/api/admin/login', '/api/admin/auth'];
-app.use(adminPublicPaths, (req, res, next) => {
-    // السماح بدون توثيق
-    next();
-});
-
-// مسارات الأدمن المحمية (تحتاج Session Token)
+// مسارات الأدمن - استثناء login
 app.use('/api/admin', (req, res, next) => {
-    // تخطي المسارات العامة
     if (req.path === '/login' || req.path === '/auth') {
         return next();
     }
-    // تطبيق التوثيق على باقي المسارات
     authAdmin(req, res, next);
 });
 
-// مسارات الـ Sub-Admin المستثناة
-const subAdminPublicPaths = ['/api/sub/verify-key', '/api/sub/login'];
-app.use(subAdminPublicPaths, (req, res, next) => {
-    next();
-});
-
-// مسارات الـ Sub-Admin المحمية
+// مسارات Sub-Admin - استثناء verify-key و login و logout
 app.use('/api/sub', (req, res, next) => {
-    if (req.path === '/verify-key' || req.path === '/login') {
+    const publicPaths = ['/verify-key', '/login', '/logout'];
+    if (publicPaths.includes(req.path)) {
         return next();
     }
     authSubAdmin(req, res, next);
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 📡 12. ROUTES
+// 📡 11. ROUTES
 // ═══════════════════════════════════════════════════════════════════
 const loadRoute = (path, mountPath, name) => {
     try {
@@ -302,7 +192,7 @@ loadRoute('./routes/admin', '/api/admin', 'Admin');
 loadRoute('./routes/subadmin', '/api/sub', 'SubAdmin');
 
 // ═══════════════════════════════════════════════════════════════════
-// 📡 13. Fallback Routes
+// 📡 12. Fallback Routes
 // ═══════════════════════════════════════════════════════════════════
 app.post('/api/getUser', async (req, res) => {
     try {
@@ -361,26 +251,19 @@ app.post('/api/verifyAccount', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// ❌ 14. Error Handlers
+// ❌ 13. Error Handlers
 // ═══════════════════════════════════════════════════════════════════
 app.use((req, res) => {
     res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
 app.use((err, req, res, next) => {
-    const errorId = `ERR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    console.error(`[${errorId}] Error:`, err.message);
-    
-    const statusCode = err.message.includes('CORS') ? 403 : 500;
-    res.status(statusCode).json({
-        success: false,
-        error: statusCode === 403 ? 'Access forbidden' : 'Internal server error',
-        reference: errorId
-    });
+    console.error('Error:', err.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🚀 15. START SERVER
+// 🚀 14. START SERVER
 // ═══════════════════════════════════════════════════════════════════
 const PORT = config.PORT || 10000;
 
@@ -390,30 +273,21 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('═'.repeat(60));
     console.log(`📍 Port: ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'production'}`);
-    console.log(`🔐 API Key: ${config.APP_API_KEY ? '✅ Set' : '❌ Missing!'}`);
-    console.log(`🔏 Signing Secret: ${config.APP_SIGNING_SECRET ? '✅ Set' : '❌ Missing!'}`);
-    console.log(`🛡️ Security Middleware: ${security ? '✅ Active' : '⚠️ Not loaded'}`);
-    console.log(`📊 Rate Limiting: ✅ Active`);
+    console.log(`🔐 API Key: ${config.APP_API_KEY ? '✅' : '❌'}`);
+    console.log(`🛡️ Security: ${security ? '✅' : '⚠️'}`);
     console.log('═'.repeat(60) + '\n');
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 🔄 16. Graceful Shutdown
-// ═══════════════════════════════════════════════════════════════════
+// Graceful Shutdown
 ['SIGTERM', 'SIGINT'].forEach(signal => {
     process.on(signal, () => {
-        console.log(`📴 ${signal} received, shutting down gracefully...`);
+        console.log(`📴 ${signal} received`);
         if (security) security.destroy();
         setTimeout(() => process.exit(0), 5000);
     });
 });
 
-process.on('uncaughtException', (err) => {
-    console.error('❌ Uncaught Exception:', err.message);
-});
-
-process.on('unhandledRejection', (reason) => {
-    console.error('❌ Unhandled Rejection:', reason);
-});
+process.on('uncaughtException', (err) => console.error('❌ Uncaught:', err.message));
+process.on('unhandledRejection', (reason) => console.error('❌ Unhandled:', reason));
 
 module.exports = app;
