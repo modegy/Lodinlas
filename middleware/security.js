@@ -1,8 +1,8 @@
 // middleware/security.js - Security Middleware v14.1
-// متوافق مع auth.js و config/index.js
 'use strict';
 
 const crypto = require('crypto');
+const helmet = require('helmet');
 
 class SecurityMiddleware {
     constructor(config) {
@@ -11,13 +11,14 @@ class SecurityMiddleware {
         this.bruteForceConfig = config.SECURITY?.BRUTE_FORCE || {};
         this.wafConfig = config.SECURITY?.WAF || {};
         
-        // مخازن البيانات
+        // Data stores
         this.ipCache = new Map();
         this.rateLimitStore = new Map();
         this.blockedIPs = new Set();
         this.requestCounts = new Map();
+        this.loginAttempts = new Map();
         
-        // إحصائيات
+        // Statistics
         this.stats = {
             totalRequests: 0,
             blockedRequests: 0,
@@ -26,7 +27,7 @@ class SecurityMiddleware {
             startTime: Date.now()
         };
         
-        // تنظيف دوري
+        // Periodic cleanup
         this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
         
         console.log('🛡️ Security Middleware initialized');
@@ -50,7 +51,7 @@ class SecurityMiddleware {
                 
                 this.stats.totalRequests++;
 
-                // 1. فحص IP المحظور
+                // 1. Check blocked IP
                 if (this.isBlocked(ip)) {
                     this.stats.blockedRequests++;
                     return this.blockResponse(res, 'IP_BLOCKED', null, {
@@ -94,14 +95,13 @@ class SecurityMiddleware {
                     
                     if (botScore > (this.config.ANOMALY_THRESHOLD || 70)) {
                         this.recordViolation(ip, 'HIGH_BOT_SCORE');
-                        // لا نحظر مباشرة، فقط نسجل
                     }
                 }
 
-                // 6. إضافة Security Headers
+                // 6. Add Security Headers
                 this.setSecurityHeaders(res);
 
-                // 7. تسجيل وقت المعالجة
+                // 7. Log slow requests
                 res.on('finish', () => {
                     const duration = Date.now() - startTime;
                     if (duration > 5000) {
@@ -113,7 +113,6 @@ class SecurityMiddleware {
                 
             } catch (err) {
                 console.error('[Security] Middleware error:', err.message);
-                // نسمح بالطلب في حالة الخطأ لتجنب تعطيل الخدمة
                 next();
             }
         };
@@ -124,14 +123,13 @@ class SecurityMiddleware {
     // ═══════════════════════════════════════════════════════════════
     checkDDoS(ip) {
         const now = Date.now();
-        const windowMs = 60000; // دقيقة واحدة
+        const windowMs = 60000;
         const maxRequests = this.ddosConfig.IP_RPS ? this.ddosConfig.IP_RPS * 60 : 
                            this.ddosConfig.MAX_REQUESTS_PER_MINUTE || 100;
         
         const key = `ddos:${ip}`;
         let data = this.requestCounts.get(key) || { count: 0, windowStart: now };
         
-        // إعادة تعيين النافذة إذا انتهت
         if (now - data.windowStart > windowMs) {
             data = { count: 0, windowStart: now };
         }
@@ -139,7 +137,6 @@ class SecurityMiddleware {
         data.count++;
         this.requestCounts.set(key, data);
         
-        // التحقق من تجاوز الحد
         if (data.count > maxRequests) {
             const blockDuration = this.ddosConfig.BLOCK_DURATION || 600000;
             this.blockIP(ip, blockDuration);
@@ -147,7 +144,6 @@ class SecurityMiddleware {
             return false;
         }
         
-        // تحذير عند الاقتراب من الحد
         const warningThreshold = this.ddosConfig.WARNING_THRESHOLD || (maxRequests * 0.6);
         if (data.count === Math.floor(warningThreshold)) {
             console.warn(`⚠️ High request rate from ${ip}: ${data.count}/${maxRequests}`);
@@ -175,7 +171,6 @@ class SecurityMiddleware {
             };
         }
 
-        // إعادة تعبئة التوكنز
         const elapsedSeconds = (now - bucket.lastRefill) / 1000;
         const refillAmount = elapsedSeconds * limits.refill;
         bucket.tokens = Math.min(limits.capacity, bucket.tokens + refillAmount);
@@ -214,45 +209,34 @@ class SecurityMiddleware {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // 🔥 WAF (Web Application Firewall) - Smart Detection
+    // 🔥 WAF (Web Application Firewall)
     // ═══════════════════════════════════════════════════════════════
     wafCheck(req) {
         const currentPath = req.path || req.url?.split('?')[0] || '';
         
-        // فحص طول URL
         const maxUrlLength = this.wafConfig.MAX_URL_LENGTH || 2048;
         if (req.url && req.url.length > maxUrlLength) {
             return { safe: false, reason: 'URL_TOO_LONG' };
         }
 
-        // فحص حجم Body
         const contentLength = parseInt(req.headers['content-length'] || 0);
         const maxBodySize = this.wafConfig.MAX_BODY_SIZE || 1048576;
         if (contentLength > maxBodySize) {
             return { safe: false, reason: 'BODY_TOO_LARGE' };
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // فحص URL و Query Parameters (الأكثر خطورة)
-        // ═══════════════════════════════════════════════════════════
+        // URL & Query Check
         const urlToCheck = decodeURIComponent(req.url || '').toLowerCase();
         const queryString = JSON.stringify(req.query || {}).toLowerCase();
         
         const urlAttacks = [
-            // Path Traversal
             { pattern: /\.\.[\/\\]/, name: 'PATH_TRAVERSAL' },
             { pattern: /%2e%2e[%2f%5c]/i, name: 'PATH_TRAVERSAL_ENCODED' },
-            
-            // Command Injection في URL فقط
             { pattern: /[;|`]\s*\w+/, name: 'COMMAND_INJECTION' },
             { pattern: /\$\([^)]+\)/, name: 'COMMAND_SUBSTITUTION' },
             { pattern: /%0[ad]/i, name: 'CRLF_INJECTION' },
-            
-            // Suspicious Files
             { pattern: /\/(\.env|\.git|\.htaccess|wp-config|phpinfo)/i, name: 'SENSITIVE_FILE_ACCESS' },
             { pattern: /\/(etc\/passwd|proc\/self|windows\/system32)/i, name: 'SYSTEM_FILE_ACCESS' },
-            
-            // Protocol attacks
             { pattern: /^(file|gopher|dict|php|data):\/\//i, name: 'PROTOCOL_ATTACK' }
         ];
 
@@ -263,35 +247,22 @@ class SecurityMiddleware {
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // فحص Body (بدون الحقول الحساسة)
-        // ═══════════════════════════════════════════════════════════
+        // Body Check
         const bodyToCheck = this.sanitizeBodyForCheck(req.body);
         
         const bodyAttacks = [
-            // XSS
             { pattern: /<script[^>]*>[\s\S]*?<\/script>/gi, name: 'XSS_SCRIPT' },
             { pattern: /javascript\s*:/gi, name: 'XSS_PROTOCOL' },
             { pattern: /on(load|error|click|mouse|focus|blur)\s*=/gi, name: 'XSS_EVENT' },
-            
-            // SQL Injection (أنماط حقيقية، ليست كلمات عادية)
             { pattern: /'\s*(or|and)\s*'?\d*\s*=\s*'?\d*/gi, name: 'SQL_INJECTION' },
             { pattern: /union\s+(all\s+)?select\s+/gi, name: 'SQL_UNION' },
             { pattern: /;\s*(drop|delete|truncate|update|insert)\s+/gi, name: 'SQL_DESTRUCTIVE' },
             { pattern: /'\s*;\s*--/g, name: 'SQL_COMMENT' },
-            
-            // NoSQL Injection
             { pattern: /\$where\s*:/gi, name: 'NOSQL_WHERE' },
             { pattern: /\{\s*['"]\$[a-z]+['"]\s*:/gi, name: 'NOSQL_OPERATOR' },
-            
-            // Code Execution
             { pattern: /\b(eval|exec|system|passthru|shell_exec|popen)\s*\(/gi, name: 'CODE_EXEC' },
-            
-            // XXE
             { pattern: /<!ENTITY\s+/gi, name: 'XXE_ENTITY' },
             { pattern: /<!\[CDATA\[/gi, name: 'XXE_CDATA' },
-            
-            // SSTI (Server-Side Template Injection)
             { pattern: /\{\{.*\}\}/g, name: 'SSTI_DOUBLE_BRACE' },
             { pattern: /<%.*%>/g, name: 'SSTI_ERB' },
             { pattern: /\${[^}]+}/g, name: 'SSTI_DOLLAR' }
@@ -304,9 +275,7 @@ class SecurityMiddleware {
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // فحص Headers (User-Agent, Referer فقط)
-        // ═══════════════════════════════════════════════════════════
+        // Header Check
         const userAgent = (req.headers['user-agent'] || '').toLowerCase();
         const referer = (req.headers['referer'] || '').toLowerCase();
         
@@ -326,11 +295,9 @@ class SecurityMiddleware {
         return { safe: true };
     }
 
-    // تنظيف Body من الحقول الحساسة قبل الفحص
     sanitizeBodyForCheck(body) {
         if (!body || typeof body !== 'object') return '';
         
-        // الحقول التي لا نفحصها (كلمات مرور، tokens، etc)
         const sensitiveFields = [
             'password', 'passwd', 'pass', 'pwd',
             'token', 'access_token', 'refresh_token', 'session_token',
@@ -342,7 +309,6 @@ class SecurityMiddleware {
         const cleanBody = { ...body };
         
         for (const field of sensitiveFields) {
-            // حذف الحقول الحساسة (case insensitive)
             for (const key of Object.keys(cleanBody)) {
                 if (key.toLowerCase().includes(field)) {
                     delete cleanBody[key];
@@ -360,11 +326,9 @@ class SecurityMiddleware {
         let score = 0;
         const ua = req.headers['user-agent'] || '';
 
-        // لا يوجد User-Agent
         if (!ua) {
             score += 30;
         } else {
-            // User-Agent مشبوه
             const suspiciousUA = [
                 /curl/i, /wget/i, /python/i, /httpie/i,
                 /postman/i, /insomnia/i,
@@ -379,26 +343,18 @@ class SecurityMiddleware {
                 }
             }
             
-            // User-Agent قصير جداً
             if (ua.length < 20) score += 15;
         }
 
-        // لا يوجد Accept-Language
         if (!req.headers['accept-language']) score += 15;
-
-        // لا يوجد Accept
         if (!req.headers['accept']) score += 10;
-
-        // لا يوجد Accept-Encoding
         if (!req.headers['accept-encoding']) score += 5;
 
-        // عدد كبير من الـ X-Forwarded-For
         const xff = req.headers['x-forwarded-for'];
         if (xff && xff.split(',').length > 5) {
             score += 20;
         }
 
-        // فحص أنماط الطلبات المشبوهة
         const path = req.path || '';
         const suspiciousPaths = [
             /\.env/i, /\.git/i, /\.htaccess/i,
@@ -414,6 +370,49 @@ class SecurityMiddleware {
         }
 
         return Math.min(score, 100);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 🔐 BRUTE FORCE PROTECTION
+    // ═══════════════════════════════════════════════════════════════
+    bruteForceProtection() {
+        return (req, res, next) => {
+            const ip = this.getClientIP(req);
+            const maxAttempts = this.bruteForceConfig.MAX_ATTEMPTS || 5;
+            const lockoutDuration = this.bruteForceConfig.LOCKOUT_DURATION || 15 * 60 * 1000;
+
+            if (!this.loginAttempts.has(ip)) {
+                this.loginAttempts.set(ip, { count: 0, lastAttempt: Date.now() });
+            }
+
+            const attempt = this.loginAttempts.get(ip);
+
+            if (Date.now() - attempt.lastAttempt > lockoutDuration) {
+                attempt.count = 0;
+            }
+
+            if (attempt.count >= maxAttempts) {
+                const remainingTime = Math.ceil((lockoutDuration - (Date.now() - attempt.lastAttempt)) / 1000 / 60);
+                return res.status(429).json({
+                    success: false,
+                    error: `Too many attempts. Try again in ${remainingTime} minutes`
+                });
+            }
+
+            next();
+        };
+    }
+
+    recordLoginAttempt(ip, success) {
+        const attempt = this.loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
+        
+        if (success) {
+            this.loginAttempts.delete(ip);
+        } else {
+            attempt.count++;
+            attempt.lastAttempt = Date.now();
+            this.loginAttempts.set(ip, attempt);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -442,9 +441,6 @@ class SecurityMiddleware {
                 console.log(`✅ IP Unblocked: ${ip}`);
             }, duration);
         }
-        
-        // إرسال تنبيه إذا كان الـ webhook متاحاً
-        this.sendAlert('IP_BLOCKED', { ip, duration });
     }
 
     unblockIP(ip) {
@@ -466,7 +462,6 @@ class SecurityMiddleware {
         cache.lastViolation = Date.now();
         cache.reasons.push({ reason, time: Date.now() });
         
-        // الاحتفاظ بآخر 10 أسباب فقط
         if (cache.reasons.length > 10) {
             cache.reasons = cache.reasons.slice(-10);
         }
@@ -481,7 +476,6 @@ class SecurityMiddleware {
     }
 
     setSecurityHeaders(res) {
-        // هذه Headers إضافية - Helmet يضيف معظمها
         res.setHeader('X-Content-Type-Options', 'nosniff');
         res.setHeader('X-Frame-Options', 'DENY');
         res.setHeader('X-XSS-Protection', '1; mode=block');
@@ -511,7 +505,6 @@ class SecurityMiddleware {
             message: this.getBlockMessage(reason),
             details: details,
             retryAfter: retryAfter,
-            contact: this.config.APPEAL_CONTACT || 'security@yourdomain.com',
             timestamp: new Date().toISOString()
         });
     }
@@ -527,24 +520,11 @@ class SecurityMiddleware {
         return messages[reason] || 'Access denied';
     }
 
-    sendAlert(type, data) {
-        const webhook = this.config.ALERT_WEBHOOK;
-        if (!webhook) return;
-        
-        try {
-            // يمكن إضافة إرسال HTTP هنا
-            console.log(`📢 Security Alert: ${type}`, data);
-        } catch (err) {
-            console.error('Failed to send security alert:', err.message);
-        }
-    }
-
     cleanup() {
         const now = Date.now();
         const cacheTTL = (this.config.IP_CACHE_TTL || 300) * 1000;
         let cleaned = 0;
 
-        // تنظيف IP cache
         for (const [ip, data] of this.ipCache) {
             if (data.lastViolation && now - data.lastViolation > cacheTTL) {
                 this.ipCache.delete(ip);
@@ -552,18 +532,23 @@ class SecurityMiddleware {
             }
         }
 
-        // تنظيف rate limit store
         for (const [key, bucket] of this.rateLimitStore) {
-            if (now - bucket.lastRefill > 300000) { // 5 دقائق
+            if (now - bucket.lastRefill > 300000) {
                 this.rateLimitStore.delete(key);
                 cleaned++;
             }
         }
 
-        // تنظيف request counts
         for (const [key, data] of this.requestCounts) {
-            if (now - data.windowStart > 120000) { // 2 دقائق
+            if (now - data.windowStart > 120000) {
                 this.requestCounts.delete(key);
+                cleaned++;
+            }
+        }
+
+        for (const [ip, attempt] of this.loginAttempts) {
+            if (now - attempt.lastAttempt > 60 * 60 * 1000) {
+                this.loginAttempts.delete(ip);
                 cleaned++;
             }
         }
@@ -582,6 +567,7 @@ class SecurityMiddleware {
             ...this.stats,
             uptime: Math.floor(uptime / 1000),
             blockedIPs: this.blockedIPs.size,
+            blockedIPsList: Array.from(this.blockedIPs).slice(0, 20),
             cachedIPs: this.ipCache.size,
             activeBuckets: this.rateLimitStore.size,
             blockRate: this.stats.totalRequests > 0 
@@ -590,7 +576,6 @@ class SecurityMiddleware {
         };
     }
 
-    // إيقاف التنظيف الدوري عند إغلاق التطبيق
     destroy() {
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
@@ -599,11 +584,20 @@ class SecurityMiddleware {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// 📦 HELMET CONFIG
+// ═══════════════════════════════════════════════════════════════════
+const helmetConfig = helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false
+});
+
+// ═══════════════════════════════════════════════════════════════════
 // 📦 EXPORT
 // ═══════════════════════════════════════════════════════════════════
 let instance = null;
 
 module.exports = {
+    helmetConfig,
     init: (config) => {
         if (!instance) {
             instance = new SecurityMiddleware(config);
