@@ -1,3 +1,6 @@
+// routes/masterAdmin.js - Master Admin Routes v14.1
+'use strict';
+
 const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
@@ -5,16 +8,18 @@ const router = express.Router();
 const { firebase, FB_KEY } = require('../config/database');
 const { ADMIN_CREDENTIALS, adminSessions, loginAttempts } = require('../config/constants');
 const { authAdmin } = require('../middleware/auth');
-const { loginLimiter, apiLimiter, bruteForceProtection, getSecurityStats, unblockIP } = require('../middleware/security');
+const { getInstance: getSecurityInstance } = require('../middleware/security');
 const { generateToken, hashPassword, formatDate, getClientIP } = require('../utils/helpers');
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // 👑 AUTH ENDPOINTS
-// ═══════════════════════════════════════════
-router.post('/login', loginLimiter, bruteForceProtection, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════
+router.post('/login', async (req, res) => {
+    const security = getSecurityInstance();
+    
     try {
         const { username, password } = req.body;
-        const ip = getClientIP(req);
+        const ip = req.clientIP || getClientIP(req);
 
         if (!username || !password) {
             return res.status(400).json({
@@ -23,21 +28,24 @@ router.post('/login', loginLimiter, bruteForceProtection, async (req, res) => {
             });
         }
 
+        // Artificial delay to prevent timing attacks
         await new Promise(resolve => setTimeout(resolve, 1000));
 
         if (username !== ADMIN_CREDENTIALS.username || password !== ADMIN_CREDENTIALS.password) {
-            const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
-            attempt.count++;
-            attempt.lastAttempt = Date.now();
-            loginAttempts.set(ip, attempt);
-
+            if (security) {
+                security.recordLoginAttempt(ip, false);
+            }
+            
             return res.status(401).json({
                 success: false,
                 error: 'Invalid credentials'
             });
         }
 
-        loginAttempts.delete(ip);
+        if (security) {
+            security.recordLoginAttempt(ip, true);
+        }
+        
         const sessionToken = generateToken();
 
         adminSessions.set(sessionToken, {
@@ -98,10 +106,10 @@ router.get('/verify-session', authAdmin, (req, res) => {
     });
 });
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // 👥 USER MANAGEMENT
-// ═══════════════════════════════════════════
-router.get('/users', authAdmin, apiLimiter, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════
+router.get('/users', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
@@ -131,22 +139,16 @@ router.get('/users', authAdmin, apiLimiter, async (req, res) => {
 
     } catch (error) {
         console.error('Get users error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch users'
-        });
+        res.status(500).json({ success: false, error: 'Failed to fetch users' });
     }
 });
 
-router.get('/users/:id', authAdmin, apiLimiter, async (req, res) => {
+router.get('/users/:id', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
 
         if (!response.data) {
-            return res.status(404).json({
-                success: false,
-                error: 'User not found'
-            });
+            return res.status(404).json({ success: false, error: 'User not found' });
         }
 
         const user = response.data;
@@ -166,32 +168,23 @@ router.get('/users/:id', authAdmin, apiLimiter, async (req, res) => {
 
     } catch (error) {
         console.error('Get user error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch user'
-        });
+        res.status(500).json({ success: false, error: 'Failed to fetch user' });
     }
 });
 
-router.post('/users', authAdmin, apiLimiter, async (req, res) => {
+router.post('/users', authAdmin, async (req, res) => {
     try {
         const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
 
         if (!username || !password) {
-            return res.status(400).json({
-                success: false,
-                error: 'Username and password required'
-            });
+            return res.status(400).json({ success: false, error: 'Username and password required' });
         }
 
         const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
         const checkRes = await firebase.get(checkUrl);
 
         if (checkRes.data && Object.keys(checkRes.data).length > 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'Username already exists'
-            });
+            return res.status(400).json({ success: false, error: 'Username already exists' });
         }
 
         let expiryTimestamp;
@@ -200,10 +193,7 @@ router.post('/users', authAdmin, apiLimiter, async (req, res) => {
         } else if (expiryMinutes) {
             expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
         } else {
-            return res.status(400).json({
-                success: false,
-                error: 'Expiry time required'
-            });
+            return res.status(400).json({ success: false, error: 'Expiry time required' });
         }
 
         const userData = {
@@ -219,25 +209,17 @@ router.post('/users', authAdmin, apiLimiter, async (req, res) => {
         };
 
         const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
-
         console.log(`✅ User created by Master Admin: ${username}`);
 
-        res.json({
-            success: true,
-            message: 'User created',
-            userId: createRes.data.name
-        });
+        res.json({ success: true, message: 'User created', userId: createRes.data.name });
 
     } catch (error) {
         console.error('Create user error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to create user'
-        });
+        res.status(500).json({ success: false, error: 'Failed to create user' });
     }
 });
 
-router.patch('/users/:id', authAdmin, apiLimiter, async (req, res) => {
+router.patch('/users/:id', authAdmin, async (req, res) => {
     try {
         const { is_active, max_devices, notes } = req.body;
         const updateData = {};
@@ -247,97 +229,64 @@ router.patch('/users/:id', authAdmin, apiLimiter, async (req, res) => {
         if (notes !== undefined) updateData.notes = notes;
 
         await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, updateData);
-
-        res.json({
-            success: true,
-            message: 'User updated'
-        });
+        res.json({ success: true, message: 'User updated' });
 
     } catch (error) {
         console.error('Update user error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to update user'
-        });
+        res.status(500).json({ success: false, error: 'Failed to update user' });
     }
 });
 
-router.delete('/users/:id', authAdmin, apiLimiter, async (req, res) => {
+router.delete('/users/:id', authAdmin, async (req, res) => {
     try {
         await firebase.delete(`users/${req.params.id}.json?auth=${FB_KEY}`);
-
         console.log(`🗑️ User deleted: ${req.params.id}`);
-
-        res.json({
-            success: true,
-            message: 'User deleted'
-        });
+        res.json({ success: true, message: 'User deleted' });
 
     } catch (error) {
         console.error('Delete user error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to delete user'
-        });
+        res.status(500).json({ success: false, error: 'Failed to delete user' });
     }
 });
 
-router.post('/users/delete-expired', authAdmin, apiLimiter, async (req, res) => {
+router.post('/users/delete-expired', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
         const now = Date.now();
 
         const deletePromises = [];
-        let expiredIds = [];
+        let expiredCount = 0;
 
         for (const [id, user] of Object.entries(users)) {
             if (user.subscription_end && user.subscription_end <= now) {
-                expiredIds.push(id);
-                deletePromises.push(
-                    firebase.delete(`users/${id}.json?auth=${FB_KEY}`)
-                );
+                deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
+                expiredCount++;
             }
         }
 
         if (deletePromises.length === 0) {
-            return res.json({
-                success: true,
-                message: 'No expired users found',
-                count: 0
-            });
+            return res.json({ success: true, message: 'No expired users found', count: 0 });
         }
 
         await Promise.all(deletePromises);
+        console.log(`🗑️ Bulk deleted ${expiredCount} expired users`);
 
-        console.log(`🗑️ Bulk deleted ${expiredIds.length} expired users`);
-
-        res.json({
-            success: true,
-            message: `Deleted ${expiredIds.length} expired users`,
-            count: expiredIds.length
-        });
+        res.json({ success: true, message: `Deleted ${expiredCount} expired users`, count: expiredCount });
 
     } catch (error) {
         console.error('Delete expired error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to delete expired users'
-        });
+        res.status(500).json({ success: false, error: 'Failed to delete expired users' });
     }
 });
 
-router.post('/users/:id/extend', authAdmin, apiLimiter, async (req, res) => {
+router.post('/users/:id/extend', authAdmin, async (req, res) => {
     try {
         const { minutes, days, hours } = req.body;
-
         const userRes = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
 
         if (!userRes.data) {
-            return res.status(404).json({
-                success: false,
-                error: 'User not found'
-            });
+            return res.status(404).json({ success: false, error: 'User not found' });
         }
 
         const user = userRes.data;
@@ -345,17 +294,11 @@ router.post('/users/:id/extend', authAdmin, apiLimiter, async (req, res) => {
         const currentEnd = user.subscription_end || now;
 
         let extensionMs = 0;
-        if (minutes) {
-            extensionMs = minutes * 60 * 1000;
-        } else if (days || hours) {
-            extensionMs = ((days || 0) * 24 * 60 * 60 * 1000) + ((hours || 0) * 60 * 60 * 1000);
-        }
+        if (minutes) extensionMs = minutes * 60 * 1000;
+        else if (days || hours) extensionMs = ((days || 0) * 24 * 60 * 60 * 1000) + ((hours || 0) * 60 * 60 * 1000);
 
         if (!extensionMs) {
-            return res.status(400).json({
-                success: false,
-                error: 'Extension time required'
-            });
+            return res.status(400).json({ success: false, error: 'Extension time required' });
         }
 
         const newEndDate = (currentEnd > now ? currentEnd : now) + extensionMs;
@@ -365,44 +308,27 @@ router.post('/users/:id/extend', authAdmin, apiLimiter, async (req, res) => {
             is_active: true
         });
 
-        res.json({
-            success: true,
-            message: 'Subscription extended',
-            new_end_date: newEndDate
-        });
+        res.json({ success: true, message: 'Subscription extended', new_end_date: newEndDate });
 
     } catch (error) {
         console.error('Extend subscription error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to extend subscription'
-        });
+        res.status(500).json({ success: false, error: 'Failed to extend subscription' });
     }
 });
 
-router.post('/users/:id/reset-device', authAdmin, apiLimiter, async (req, res) => {
+router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
     try {
-        await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, {
-            device_id: ''
-        });
-
+        await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, { device_id: '' });
         console.log(`🔄 Device reset for user: ${req.params.id}`);
-
-        res.json({
-            success: true,
-            message: 'Device reset'
-        });
+        res.json({ success: true, message: 'Device reset' });
 
     } catch (error) {
         console.error('Reset device error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to reset device'
-        });
+        res.status(500).json({ success: false, error: 'Failed to reset device' });
     }
 });
 
-router.get('/users/:id/login-history', authAdmin, apiLimiter, async (req, res) => {
+router.get('/users/:id/login-history', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
 
@@ -411,14 +337,12 @@ router.get('/users/:id/login-history', authAdmin, apiLimiter, async (req, res) =
         }
 
         const user = response.data;
-        const history = user.login_history || [];
-
         res.json({
             success: true,
             data: {
                 username: user.username,
                 total_logins: user.login_count || 0,
-                login_history: history.reverse()
+                login_history: (user.login_history || []).reverse()
             }
         });
 
@@ -428,10 +352,10 @@ router.get('/users/:id/login-history', authAdmin, apiLimiter, async (req, res) =
     }
 });
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // 🔑 API KEYS MANAGEMENT
-// ═══════════════════════════════════════════
-router.get('/api-keys', authAdmin, apiLimiter, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════
+router.get('/api-keys', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
         const keys = response.data || {};
@@ -451,30 +375,20 @@ router.get('/api-keys', authAdmin, apiLimiter, async (req, res) => {
             };
         }
 
-        res.json({
-            success: true,
-            data: formattedKeys,
-            count: Object.keys(formattedKeys).length
-        });
+        res.json({ success: true, data: formattedKeys, count: Object.keys(formattedKeys).length });
 
     } catch (error) {
         console.error('Get API keys error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch API keys'
-        });
+        res.status(500).json({ success: false, error: 'Failed to fetch API keys' });
     }
 });
 
-router.post('/api-keys', authAdmin, apiLimiter, async (req, res) => {
+router.post('/api-keys', authAdmin, async (req, res) => {
     try {
         const { adminName, permissionLevel, expiryDays } = req.body;
 
         if (!adminName) {
-            return res.status(400).json({
-                success: false,
-                error: 'Admin name required'
-            });
+            return res.status(400).json({ success: false, error: 'Admin name required' });
         }
 
         const apiKey = `AK_${crypto.randomBytes(16).toString('hex')}`;
@@ -493,7 +407,6 @@ router.post('/api-keys', authAdmin, apiLimiter, async (req, res) => {
         };
 
         await firebase.post(`api_keys.json?auth=${FB_KEY}`, keyData);
-
         console.log(`🔑 API Key created for: ${adminName}`);
 
         res.json({
@@ -506,78 +419,47 @@ router.post('/api-keys', authAdmin, apiLimiter, async (req, res) => {
 
     } catch (error) {
         console.error('Create API key error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to create API key'
-        });
+        res.status(500).json({ success: false, error: 'Failed to create API key' });
     }
 });
 
-router.patch('/api-keys/:id', authAdmin, apiLimiter, async (req, res) => {
+router.patch('/api-keys/:id', authAdmin, async (req, res) => {
     try {
         const { is_active } = req.body;
-
-        await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, {
-            is_active
-        });
-
-        res.json({
-            success: true,
-            message: 'API Key updated'
-        });
+        await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, { is_active });
+        res.json({ success: true, message: 'API Key updated' });
 
     } catch (error) {
         console.error('Update API key error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to update API key'
-        });
+        res.status(500).json({ success: false, error: 'Failed to update API key' });
     }
 });
 
-router.delete('/api-keys/:id', authAdmin, apiLimiter, async (req, res) => {
+router.delete('/api-keys/:id', authAdmin, async (req, res) => {
     try {
         await firebase.delete(`api_keys/${req.params.id}.json?auth=${FB_KEY}`);
-
         console.log(`🗑️ API Key deleted: ${req.params.id}`);
-
-        res.json({
-            success: true,
-            message: 'API Key deleted'
-        });
+        res.json({ success: true, message: 'API Key deleted' });
 
     } catch (error) {
         console.error('Delete API key error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to delete API key'
-        });
+        res.status(500).json({ success: false, error: 'Failed to delete API key' });
     }
 });
 
-router.post('/api-keys/:id/unbind-device', authAdmin, apiLimiter, async (req, res) => {
+router.post('/api-keys/:id/unbind-device', authAdmin, async (req, res) => {
     try {
-        await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, {
-            bound_device: null
-        });
-
+        await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, { bound_device: null });
         console.log(`🔓 Device unbound from API key: ${req.params.id}`);
-
-        res.json({
-            success: true,
-            message: 'Device unbound'
-        });
+        res.json({ success: true, message: 'Device unbound' });
 
     } catch (error) {
         console.error('Unbind device error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to unbind device'
-        });
+        res.status(500).json({ success: false, error: 'Failed to unbind device' });
     }
 });
 
-router.post('/api-keys/:id/regenerate-secret', authAdmin, apiLimiter, async (req, res) => {
+router.post('/api-keys/:id/regenerate-secret', authAdmin, async (req, res) => {
     try {
         const newSecret = `SS_${crypto.randomBytes(32).toString('hex')}`;
 
@@ -597,33 +479,35 @@ router.post('/api-keys/:id/regenerate-secret', authAdmin, apiLimiter, async (req
 
     } catch (error) {
         console.error('Regenerate secret error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to regenerate secret'
-        });
+        res.status(500).json({ success: false, error: 'Failed to regenerate secret' });
     }
 });
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // 📡 SECURITY & STATS
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 router.get('/security-stats', authAdmin, (req, res) => {
-    res.json({
-        success: true,
-        stats: getSecurityStats()
-    });
+    const security = getSecurityInstance();
+    if (security) {
+        res.json({ success: true, stats: security.getStats() });
+    } else {
+        res.json({ success: true, stats: { message: 'Security not initialized' } });
+    }
 });
 
 router.post('/unblock-ip', authAdmin, (req, res) => {
     const { ip } = req.body;
     if (!ip) return res.status(400).json({ error: 'IP required' });
 
-    unblockIP(ip);
+    const security = getSecurityInstance();
+    if (security) {
+        security.unblockIP(ip);
+    }
 
     res.json({ success: true, message: `IP ${ip} unblocked` });
 });
 
-router.get('/device-stats', authAdmin, apiLimiter, async (req, res) => {
+router.get('/device-stats', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
@@ -669,7 +553,7 @@ router.get('/device-stats', authAdmin, apiLimiter, async (req, res) => {
     }
 });
 
-router.get('/rooted-devices', authAdmin, apiLimiter, async (req, res) => {
+router.get('/rooted-devices', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
@@ -698,9 +582,9 @@ router.get('/rooted-devices', authAdmin, apiLimiter, async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // 🛠️ MAINTENANCE
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 router.post('/fix-old-users', authAdmin, async (req, res) => {
     try {
         console.log('🔧 Starting fix-old-users process...');
@@ -714,10 +598,7 @@ router.post('/fix-old-users', authAdmin, async (req, res) => {
 
         for (const [id, user] of Object.entries(users)) {
             if (!user.created_by_key) {
-                await firebase.patch(`users/${id}.json?auth=${FB_KEY}`, {
-                    created_by_key: 'master'
-                });
-                console.log(`   ✅ Fixed: ${user.username} → created_by_key: "master"`);
+                await firebase.patch(`users/${id}.json?auth=${FB_KEY}`, { created_by_key: 'master' });
                 fixedUsers.push(user.username);
                 fixed++;
             } else {
@@ -730,16 +611,14 @@ router.post('/fix-old-users', authAdmin, async (req, res) => {
         res.json({
             success: true,
             message: `Fixed ${fixed} old users. ${alreadyFixed} already had created_by_key`,
-            fixed: fixed,
-            alreadyFixed: alreadyFixed,
-            fixedUsers: fixedUsers
+            fixed,
+            alreadyFixed,
+            fixedUsers
         });
+
     } catch (error) {
         console.error('❌ Fix-old-users error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -749,10 +628,7 @@ router.get('/debug-users', authAdmin, async (req, res) => {
         const users = response.data || {};
 
         const debugInfo = [];
-        let withKey = 0;
-        let withoutKey = 0;
-        let masterUsers = 0;
-        let subAdminUsers = 0;
+        let withKey = 0, withoutKey = 0, masterUsers = 0, subAdminUsers = 0;
 
         for (const [id, user] of Object.entries(users)) {
             const keyStatus = user.created_by_key || 'MISSING';
@@ -766,11 +642,8 @@ router.get('/debug-users', authAdmin, async (req, res) => {
 
             if (user.created_by_key) {
                 withKey++;
-                if (user.created_by_key === 'master') {
-                    masterUsers++;
-                } else {
-                    subAdminUsers++;
-                }
+                if (user.created_by_key === 'master') masterUsers++;
+                else subAdminUsers++;
             } else {
                 withoutKey++;
             }
@@ -778,21 +651,16 @@ router.get('/debug-users', authAdmin, async (req, res) => {
 
         res.json({
             success: true,
-            summary: {
-                total: Object.keys(users).length,
-                withKey,
-                withoutKey,
-                masterUsers,
-                subAdminUsers
-            },
+            summary: { total: Object.keys(users).length, withKey, withoutKey, masterUsers, subAdminUsers },
             users: debugInfo
         });
+
     } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 📦 EXPORT
+// ═══════════════════════════════════════════════════════════════════
 module.exports = router;
