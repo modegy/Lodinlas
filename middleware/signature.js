@@ -1,20 +1,28 @@
-// middleware/signature.js
-const crypto = require('crypto');
-const config = require('../config');
-const { firebase, FB_KEY } = require('../services/firebase');
+// middleware/signature.js - Signature Verification v14.1
+'use strict';
 
-// Cache for Sub Admin Keys
+const crypto = require('crypto');
+const { firebase, FB_KEY } = require('../config/database');
+const { SIGNING_SALT, SIGNED_ENDPOINTS, APP_API_KEY, APP_SIGNING_SECRET, MASTER_ADMIN_TOKEN, MASTER_SIGNING_SECRET } = require('../config/constants');
+
+// ═══════════════════════════════════════════════════════════════════
+// 💾 CACHES
+// ═══════════════════════════════════════════════════════════════════
 const keyCache = new Map();
 const usedNonces = new Map();
 
-// Derive signing key from API Key
+// ═══════════════════════════════════════════════════════════════════
+// 🔑 DERIVE SIGNING KEY
+// ═══════════════════════════════════════════════════════════════════
 const deriveSigningKey = (apiKey) => {
-    return crypto.createHmac('sha256', config.SIGNING_SALT)
+    return crypto.createHmac('sha256', SIGNING_SALT)
         .update(apiKey)
         .digest('hex');
 };
 
-// Get Sub Admin Signing Secret
+// ═══════════════════════════════════════════════════════════════════
+// 🔍 GET SUB ADMIN SIGNING SECRET
+// ═══════════════════════════════════════════════════════════════════
 const getSubAdminSigningSecret = async (clientId, currentPath) => {
     try {
         // 1. Check cache first
@@ -67,13 +75,17 @@ const getSubAdminSigningSecret = async (clientId, currentPath) => {
     }
 };
 
-// Verify Signature Middleware
+// ═══════════════════════════════════════════════════════════════════
+// 🔐 VERIFY SIGNATURE MIDDLEWARE
+// ═══════════════════════════════════════════════════════════════════
 const verifySignature = async (req, res, next) => {
     try {
         console.log('🔐 [SIGNATURE] Verifying:', req.method, req.path);
         
         const path = req.path;
-        const needsSignature = config.SIGNED_ENDPOINTS.some(endpoint => {
+        
+        // Check if endpoint needs signature
+        const needsSignature = SIGNED_ENDPOINTS.some(endpoint => {
             if (endpoint.includes(':')) {
                 const pattern = endpoint.replace(/:[^/]+/g, '([^/]+)');
                 const regex = new RegExp(`^${pattern}$`);
@@ -86,6 +98,7 @@ const verifySignature = async (req, res, next) => {
             return next();
         }
 
+        // Extract headers
         const signature = req.headers['x-api-signature'];
         const timestamp = req.headers['x-timestamp'];
         const nonce = req.headers['x-nonce'];
@@ -114,7 +127,7 @@ const verifySignature = async (req, res, next) => {
         }
         
         // Convert seconds to milliseconds if needed
-        if (requestTime < 1000000000000) { // Before 2001-09-09
+        if (requestTime < 1000000000000) {
             requestTime = requestTime * 1000;
         }
         
@@ -130,7 +143,7 @@ const verifySignature = async (req, res, next) => {
             });
         }
 
-        // Prevent replay attacks
+        // Prevent replay attacks (nonce check)
         const nonceKey = `${clientId}:${nonce}:${timestamp}`;
         if (usedNonces.has(nonceKey)) {
             console.warn(`❌ [SIGNATURE] Nonce reused: ${nonce}`);
@@ -144,10 +157,10 @@ const verifySignature = async (req, res, next) => {
         // Get secret key
         let secretKey;
         
-        if (clientId === config.APP_API_KEY) {
-            secretKey = config.APP_SIGNING_SECRET;
-        } else if (clientId === config.MASTER_ADMIN_TOKEN) {
-            secretKey = config.MASTER_SIGNING_SECRET;
+        if (clientId === APP_API_KEY) {
+            secretKey = APP_SIGNING_SECRET;
+        } else if (clientId === MASTER_ADMIN_TOKEN) {
+            secretKey = MASTER_SIGNING_SECRET;
         } else {
             secretKey = await getSubAdminSigningSecret(clientId, path);
         }
@@ -197,11 +210,17 @@ const verifySignature = async (req, res, next) => {
             .digest('base64')
             .replace(/=+$/, '');
 
-        // Use constant-time comparison to prevent timing attacks
-        const isValid = crypto.timingSafeEqual(
-            Buffer.from(signature),
-            Buffer.from(expectedSignature)
-        );
+        // Timing-safe comparison to prevent timing attacks
+        let isValid = false;
+        try {
+            isValid = crypto.timingSafeEqual(
+                Buffer.from(signature),
+                Buffer.from(expectedSignature)
+            );
+        } catch (e) {
+            // Length mismatch
+            isValid = false;
+        }
 
         if (!isValid) {
             console.error(`❌ [SIGNATURE] Invalid signature for ${req.method} ${req.path}`);
@@ -231,7 +250,9 @@ const verifySignature = async (req, res, next) => {
     }
 };
 
-// Generate signature for outgoing requests
+// ═══════════════════════════════════════════════════════════════════
+// 📤 GENERATE SIGNATURE (For outgoing requests)
+// ═══════════════════════════════════════════════════════════════════
 const generateSignature = (method, path, body, timestamp, nonce, clientId, secretKey) => {
     let stringToSign = '';
     
@@ -253,36 +274,42 @@ const generateSignature = (method, path, body, timestamp, nonce, clientId, secre
         .replace(/=+$/, '');
 };
 
-// Cleanup caches periodically
+// ═══════════════════════════════════════════════════════════════════
+// 🧹 CLEANUP
+// ═══════════════════════════════════════════════════════════════════
 setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
     
-    // Clean key cache
+    // Clean key cache (30 minutes)
     for (const [apiKey, keyData] of keyCache.entries()) {
-        if (now - keyData.cache_time > 30 * 60 * 1000) { // 30 minutes
+        if (now - keyData.cache_time > 30 * 60 * 1000) {
             keyCache.delete(apiKey);
             cleaned++;
         }
     }
     
-    // Clean used nonces
+    // Clean used nonces (10 minutes)
     for (const [nonceKey, timestamp] of usedNonces.entries()) {
-        if (now - timestamp > 10 * 60 * 1000) { // 10 minutes
+        if (now - timestamp > 10 * 60 * 1000) {
             usedNonces.delete(nonceKey);
             cleaned++;
         }
     }
     
     if (cleaned > 0) {
-        console.log(`[SIGNATURE_CLEANUP] Cleaned ${cleaned} entries`);
+        console.log(`🧹 [SIGNATURE] Cleanup: ${cleaned} entries removed`);
     }
-}, 5 * 60 * 1000); // Run every 5 minutes
+}, 5 * 60 * 1000); // Every 5 minutes
 
+// ═══════════════════════════════════════════════════════════════════
+// 📦 EXPORT
+// ═══════════════════════════════════════════════════════════════════
 module.exports = {
     verifySignature,
     deriveSigningKey,
     getSubAdminSigningSecret,
     generateSignature,
-    keyCache
+    keyCache,
+    usedNonces
 };
