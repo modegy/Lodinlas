@@ -11,6 +11,72 @@ const { authAdmin } = require('../middleware/auth');
 const { getInstance: getSecurityInstance } = require('../middleware/security');
 const { generateToken, hashPassword, formatDate, getClientIP } = require('../utils/helpers');
 
+
+// في ملف routes/masterAdmin.js
+// أضف هذا الـ endpoint في أول الملف بعد الـ imports
+
+
+
+// ═══════════════════════════════════════════
+// 🔐 LOGIN ENDPOINT
+// ═══════════════════════════════════════════
+router.post('/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+
+        if (!username || !password) {
+            return res.status(400).json({
+                success: false,
+                error: 'اسم المستخدم وكلمة المرور مطلوبان'
+            });
+        }
+
+        // قراءة من Environment Variables
+        const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+        const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+
+        console.log('🔐 Login attempt:', username);
+
+        // التحقق من بيانات الدخول
+        if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+            // إنشاء session token
+            const sessionToken = crypto.randomBytes(32).toString('hex');
+            
+            // حفظ الـ session
+            adminSessions.set(sessionToken, {
+                username,
+                createdAt: Date.now()
+            });
+
+            console.log('✅ Login successful:', username);
+
+            return res.json({
+                success: true,
+                sessionToken,
+                username,
+                message: 'تم تسجيل الدخول بنجاح'
+            });
+        }
+
+        console.log('❌ Login failed: Invalid credentials');
+
+        // بيانات خاطئة
+        return res.status(401).json({
+            success: false,
+            error: 'اسم المستخدم أو كلمة المرور غير صحيحة'
+        });
+
+    } catch (error) {
+        console.error('Login error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: 'خطأ في تسجيل الدخول'
+        });
+    }
+});
+
+
+
 // ═══════════════════════════════════════════════════════════════════
 // 👑 AUTH ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════
