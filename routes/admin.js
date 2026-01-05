@@ -1,5 +1,4 @@
-
-// routes/admin.js - نقاط النهاية للوحة الإدارة (مُصلح)
+// routes/admin.js - نقاط النهاية للوحة الإدارة (مُحدث بالكامل)
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
@@ -37,7 +36,6 @@ router.post('/login', async (req, res) => {
         const ip = req.clientIP || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
         const userAgent = req.headers['user-agent'] || 'Unknown';
         
-        // التحقق من البيانات المطلوبة
         if (!username || !password) {
             return res.status(400).json({ 
                 success: false, 
@@ -46,7 +44,6 @@ router.post('/login', async (req, res) => {
             });
         }
         
-        // التحقق من إعدادات الأدمن
         if (!config.ADMIN_CREDENTIALS?.username || !config.ADMIN_CREDENTIALS?.password) {
             console.error('❌ Admin credentials not configured in environment');
             return res.status(500).json({ 
@@ -56,15 +53,12 @@ router.post('/login', async (req, res) => {
             });
         }
         
-        // Rate limiting delay
         await new Promise(resolve => setTimeout(resolve, 500));
         
-        // التحقق من بيانات الدخول
         const isValidUsername = username === config.ADMIN_CREDENTIALS.username;
         const isValidPassword = password === config.ADMIN_CREDENTIALS.password;
         
         if (!isValidUsername || !isValidPassword) {
-            // تسجيل المحاولة الفاشلة
             const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
             attempt.count++;
             attempt.lastAttempt = Date.now();
@@ -79,17 +73,12 @@ router.post('/login', async (req, res) => {
             });
         }
         
-        // نجاح تسجيل الدخول - مسح محاولات الفشل
         loginAttempts.delete(ip);
         
-        // إنشاء جلسة باستخدام createAdminSession من auth.js
         let sessionData;
-        
         if (typeof createAdminSession === 'function') {
-            // استخدام الدالة من auth.js
             sessionData = createAdminSession(username, ip, userAgent);
         } else {
-            // Fallback - إنشاء جلسة يدوياً
             const sessionToken = crypto.randomBytes(32).toString('hex');
             sessionData = {
                 token: sessionToken,
@@ -123,18 +112,11 @@ router.post('/login', async (req, res) => {
 router.post('/logout', authAdmin, (req, res) => {
     try {
         const sessionToken = req.headers['x-session-token'];
-        
-        if (sessionToken) {
-            if (typeof invalidateAdminSession === 'function') {
-                invalidateAdminSession(sessionToken);
-            }
-            console.log(`👋 Admin logout: ${req.adminUser} from ${req.ip}`);
+        if (sessionToken && typeof invalidateAdminSession === 'function') {
+            invalidateAdminSession(sessionToken);
         }
-        
-        res.json({ 
-            success: true, 
-            message: 'Logged out successfully' 
-        });
+        console.log(`👋 Admin logout: ${req.adminUser} from ${req.ip}`);
+        res.json({ success: true, message: 'Logged out successfully' });
     } catch (error) {
         console.error('Logout error:', error);
         res.status(500).json({ success: false, error: 'Logout failed' });
@@ -142,23 +124,14 @@ router.post('/logout', authAdmin, (req, res) => {
 });
 
 router.get('/verify-session', authAdmin, (req, res) => {
-    try {
-        res.json({
-            success: true,
-            session: { 
-                username: req.adminUser,
-                role: req.adminRole || 'admin',
-                ip: req.ip
-            },
-            server_info: { 
-                uptime: Math.floor(process.uptime()),
-                memory_usage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
-            }
-        });
-    } catch (error) {
-        console.error('Verify session error:', error);
-        res.status(500).json({ success: false, error: 'Session verification failed' });
-    }
+    res.json({
+        success: true,
+        session: { username: req.adminUser, role: req.adminRole || 'admin', ip: req.ip },
+        server_info: { 
+            uptime: Math.floor(process.uptime()),
+            memory_usage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
+        }
+    });
 });
 
 // ═══════════════════════════════════════════
@@ -170,8 +143,7 @@ router.get('/users', authAdmin, async (req, res) => {
         const users = response.data || {};
         
         const formattedUsers = {};
-        let activeCount = 0;
-        let expiredCount = 0;
+        let activeCount = 0, expiredCount = 0;
         const now = Date.now();
         
         for (const [id, user] of Object.entries(users)) {
@@ -209,6 +181,43 @@ router.get('/users', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════
+// 👁️ GET USER DETAILS - عرض تفاصيل المستخدم
+// ═══════════════════════════════════════════
+router.get('/users/:id', authAdmin, async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+        
+        if (!userRes.data) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        const user = userRes.data;
+        
+        res.json({
+            success: true,
+            user: {
+                id: userId,
+                username: user.username,
+                is_active: user.is_active,
+                subscription_end: user.subscription_end,
+                expiry_date: formatDate(user.subscription_end),
+                device_id: user.device_id || '',
+                max_devices: user.max_devices || 1,
+                created_at: user.created_at,
+                created_at_formatted: formatDate(user.created_at),
+                last_login: user.last_login,
+                last_login_formatted: user.last_login ? formatDate(user.last_login) : 'لم يسجل دخول',
+                created_by_key: user.created_by_key || 'admin'
+            }
+        });
+    } catch (error) {
+        console.error('Error getting user:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to get user' });
+    }
+});
+
 router.post('/users', authAdmin, async (req, res) => {
     try {
         const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
@@ -225,7 +234,6 @@ router.post('/users', authAdmin, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Password must be at least 4 characters' });
         }
         
-        // التحقق من عدم وجود مستخدم بنفس الاسم
         try {
             const checkRes = await firebase.get(`users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`);
             if (checkRes.data && Object.keys(checkRes.data).length > 0) {
@@ -233,7 +241,6 @@ router.post('/users', authAdmin, async (req, res) => {
             }
         } catch (e) { /* ignore */ }
         
-        // حساب وقت الانتهاء
         let expiryTimestamp;
         if (customExpiryDate) {
             expiryTimestamp = new Date(customExpiryDate).getTime();
@@ -352,7 +359,6 @@ router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
         }
         
         await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { device_id: '', last_device_reset: Date.now() });
-        
         console.log(`🔄 Device reset for user: ${userId} (${userRes.data.username})`);
         
         res.json({ success: true, message: 'Device reset successfully', userId, username: userRes.data.username });
@@ -374,7 +380,6 @@ router.post('/disable-user', authAdmin, async (req, res) => {
         if (!userRes.data) return res.status(404).json({ success: false, error: 'User not found' });
 
         await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { is_active: false, disabled_at: Date.now() });
-
         console.log(`🚫 User disabled: ${userId} (${userRes.data.username})`);
         res.json({ success: true, message: 'User disabled successfully', userId, username: userRes.data.username });
     } catch (error) {
@@ -392,7 +397,6 @@ router.post('/enable-user', authAdmin, async (req, res) => {
         if (!userRes.data) return res.status(404).json({ success: false, error: 'User not found' });
 
         await firebase.patch(`users/${userId}.json?auth=${FB_KEY}`, { is_active: true, enabled_at: Date.now() });
-
         console.log(`✅ User enabled: ${userId} (${userRes.data.username})`);
         res.json({ success: true, message: 'User enabled successfully', userId, username: userRes.data.username });
     } catch (error) {
@@ -459,7 +463,6 @@ router.post('/api-keys', authAdmin, async (req, res) => {
         };
         
         const response = await firebase.post(`api_keys.json?auth=${FB_KEY}`, keyData);
-        
         console.log(`🔑 API Key created for: ${adminName}`);
         
         res.json({ 
@@ -477,43 +480,7 @@ router.post('/api-keys', authAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-// SERVER STATS
-// ═══════════════════════════════════════════
-router.get('/server-stats', authAdmin, (req, res) => {
-    try {
-        const memoryUsage = process.memoryUsage();
-        res.json({ 
-            success: true, 
-            stats: {
-                uptime: Math.floor(process.uptime()),
-                memory: {
-                    heap_used: Math.round(memoryUsage.heapUsed / 1024 / 1024) + ' MB',
-                    heap_total: Math.round(memoryUsage.heapTotal / 1024 / 1024) + ' MB'
-                },
-                timestamp: Date.now(),
-                node_version: process.version
-            }
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: 'Failed to get server stats' });
-    }
-});
-
-router.get('/security-stats', authAdmin, (req, res) => {
-    try {
-        res.json({
-            success: true,
-            stats: {
-                blocked_ips: blockedIPs.size,
-                login_attempts: loginAttempts.size
-            }
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: 'Failed to get security stats' });
-    }
-});
-// ═══════════════════════════════════════════
-// 🗑️ DELETE API KEY
+// 🗑️ DELETE API KEY - حذف مفتاح API
 // ═══════════════════════════════════════════
 router.delete('/api-keys/:id', authAdmin, async (req, res) => {
     try {
@@ -525,7 +492,6 @@ router.delete('/api-keys/:id', authAdmin, async (req, res) => {
         }
         
         await firebase.delete(`api_keys/${keyId}.json?auth=${FB_KEY}`);
-        
         console.log(`🗑️ API Key deleted: ${keyId} (${keyRes.data.admin_name})`);
         
         res.json({ 
@@ -540,40 +506,32 @@ router.delete('/api-keys/:id', authAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-// 👁️ GET USER DETAILS
+// SERVER STATS
 // ═══════════════════════════════════════════
-router.get('/users/:id', authAdmin, async (req, res) => {
-    try {
-        const userId = req.params.id;
-        const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
-        
-        if (!userRes.data) {
-            return res.status(404).json({ success: false, error: 'User not found' });
+router.get('/server-stats', authAdmin, (req, res) => {
+    const memoryUsage = process.memoryUsage();
+    res.json({ 
+        success: true, 
+        stats: {
+            uptime: Math.floor(process.uptime()),
+            memory: {
+                heap_used: Math.round(memoryUsage.heapUsed / 1024 / 1024) + ' MB',
+                heap_total: Math.round(memoryUsage.heapTotal / 1024 / 1024) + ' MB'
+            },
+            timestamp: Date.now(),
+            node_version: process.version
         }
-        
-        const user = userRes.data;
-        
-        res.json({
-            success: true,
-            user: {
-                id: userId,
-                username: user.username,
-                is_active: user.is_active,
-                subscription_end: user.subscription_end,
-                expiry_date: formatDate(user.subscription_end),
-                device_id: user.device_id || '',
-                max_devices: user.max_devices || 1,
-                created_at: user.created_at,
-                created_at_formatted: formatDate(user.created_at),
-                last_login: user.last_login,
-                last_login_formatted: user.last_login ? formatDate(user.last_login) : 'لم يسجل دخول',
-                created_by_key: user.created_by_key || 'admin'
-            }
-        });
-    } catch (error) {
-        console.error('Error getting user:', error.message);
-        res.status(500).json({ success: false, error: 'Failed to get user' });
-    }
+    });
 });
-module.exports = router;
 
+router.get('/security-stats', authAdmin, (req, res) => {
+    res.json({
+        success: true,
+        stats: {
+            blocked_ips: blockedIPs.size,
+            login_attempts: loginAttempts.size
+        }
+    });
+});
+
+module.exports = router;
