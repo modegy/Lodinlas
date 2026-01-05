@@ -8,7 +8,7 @@ require('dotenv').config();
 // ═══════════════════════════════════════════════════════════════════
 // 📦 IMPORTS
 // ═══════════════════════════════════════════════════════════════════
-const { getFullConfig } = require('./config/constants');
+const constants = require('./config/constants');
 const { helmetConfig, init: initSecurity } = require('./middleware/security');
 const { startSessionCleanup } = require('./middleware/auth');
 
@@ -29,7 +29,8 @@ app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 // ═══════════════════════════════════════════════════════════════════
 // 🛡️ SECURITY MIDDLEWARE
 // ═══════════════════════════════════════════════════════════════════
-const config = getFullConfig();
+// Use constants directly instead of getFullConfig()
+const config = constants;
 const security = initSecurity(config);
 
 // Helmet
