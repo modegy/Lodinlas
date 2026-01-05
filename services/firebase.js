@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// 🔥 services/firebase.js - Firebase Service
+// 🔥 services/firebase.js - Firebase Service (Fixed)
 // ═══════════════════════════════════════════════════════════════════
 
 const axios = require('axios');
@@ -11,7 +11,9 @@ const config = require('../config');
 const FIREBASE_URL = config.FIREBASE_URL || process.env.FIREBASE_URL;
 const FB_KEY = config.FIREBASE_KEY || process.env.FIREBASE_KEY;
 
-// التحقق من الإعدادات
+// ✅ Connection Status
+let firebaseConnected = false;
+
 if (!FIREBASE_URL) {
     console.error('❌ FIREBASE_URL is not configured!');
 }
@@ -20,44 +22,42 @@ if (!FB_KEY) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Axios Instance with Timeout & Error Handling
+// Axios Instance
 // ═══════════════════════════════════════════════════════════════════
 const firebase = axios.create({
     baseURL: FIREBASE_URL,
-    timeout: 30000, // 30 ثانية
+    timeout: 30000,
     headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
     },
-    // مهم: لا ترمي خطأ للاستجابات غير 2xx
     validateStatus: function (status) {
         return status >= 200 && status < 500;
     }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// Request Interceptor - للتشخيص
+// Interceptors
 // ═══════════════════════════════════════════════════════════════════
 firebase.interceptors.request.use(
     (config) => {
-        // إضافة timestamp للتشخيص
         config.metadata = { startTime: Date.now() };
         return config;
     },
     (error) => {
         console.error('❌ Firebase Request Error:', error.message);
+        firebaseConnected = false;
         return Promise.reject(error);
     }
 );
 
-// ═══════════════════════════════════════════════════════════════════
-// Response Interceptor - للتشخيص والتعامل مع الأخطاء
-// ═══════════════════════════════════════════════════════════════════
 firebase.interceptors.response.use(
     (response) => {
         const duration = Date.now() - response.config.metadata.startTime;
         
-        // تسجيل الطلبات البطيئة
+        // ✅ Connection successful
+        firebaseConnected = true;
+        
         if (duration > 5000) {
             console.warn(`⚠️ Slow Firebase request: ${response.config.url} took ${duration}ms`);
         }
@@ -65,11 +65,13 @@ firebase.interceptors.response.use(
         return response;
     },
     (error) => {
-        // التعامل مع أخطاء الشبكة
+        // ❌ Connection failed
+        firebaseConnected = false;
+        
         if (error.code === 'ECONNABORTED') {
             console.error('❌ Firebase Timeout Error');
         } else if (error.code === 'ENOTFOUND') {
-            console.error('❌ Firebase DNS Error - Check FIREBASE_URL');
+            console.error('❌ Firebase DNS Error');
         } else if (error.response) {
             console.error(`❌ Firebase Error ${error.response.status}:`, error.response.data);
         } else {
@@ -81,13 +83,19 @@ firebase.interceptors.response.use(
 );
 
 // ═══════════════════════════════════════════════════════════════════
+// ✅ Connection Check Function
+// ═══════════════════════════════════════════════════════════════════
+function isFirebaseConnected() {
+    return firebaseConnected;
+}
+
+function setFirebaseConnected(status) {
+    firebaseConnected = status;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Helper Functions
 // ═══════════════════════════════════════════════════════════════════
-
-/**
- * قراءة بيانات من Firebase
- * @param {string} path - المسار (مثل: users.json)
- */
 async function firebaseGet(path) {
     try {
         const url = path.includes('?') 
@@ -101,11 +109,6 @@ async function firebaseGet(path) {
     }
 }
 
-/**
- * كتابة بيانات في Firebase (استبدال كامل)
- * @param {string} path - المسار
- * @param {object} data - البيانات
- */
 async function firebaseSet(path, data) {
     try {
         const url = path.includes('?') 
@@ -119,11 +122,6 @@ async function firebaseSet(path, data) {
     }
 }
 
-/**
- * تحديث بيانات في Firebase (دمج)
- * @param {string} path - المسار
- * @param {object} data - البيانات للتحديث
- */
 async function firebasePatch(path, data) {
     try {
         const url = path.includes('?') 
@@ -137,10 +135,6 @@ async function firebasePatch(path, data) {
     }
 }
 
-/**
- * حذف بيانات من Firebase
- * @param {string} path - المسار
- */
 async function firebaseDelete(path) {
     try {
         const url = path.includes('?') 
@@ -154,11 +148,6 @@ async function firebaseDelete(path) {
     }
 }
 
-/**
- * إضافة عنصر جديد (Push)
- * @param {string} path - المسار
- * @param {object} data - البيانات
- */
 async function firebasePost(path, data) {
     try {
         const url = path.includes('?') 
@@ -172,15 +161,14 @@ async function firebasePost(path, data) {
     }
 }
 
-/**
- * اختبار الاتصال بـ Firebase
- */
 async function testConnection() {
     try {
         const response = await firebase.get(`/.json?auth=${FB_KEY}&shallow=true`);
+        firebaseConnected = true;
         console.log('✅ Firebase connection successful');
         return true;
     } catch (error) {
+        firebaseConnected = false;
         console.error('❌ Firebase connection failed:', error.message);
         return false;
     }
@@ -198,6 +186,10 @@ module.exports = {
     firebase,
     FB_KEY,
     FIREBASE_URL,
+    
+    // ✅ Connection status
+    isFirebaseConnected,
+    setFirebaseConnected,
     
     // Helper functions
     firebaseGet,
