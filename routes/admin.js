@@ -512,5 +512,68 @@ router.get('/security-stats', authAdmin, (req, res) => {
         res.status(500).json({ success: false, error: 'Failed to get security stats' });
     }
 });
+// ═══════════════════════════════════════════
+// 🗑️ DELETE API KEY
+// ═══════════════════════════════════════════
+router.delete('/api-keys/:id', authAdmin, async (req, res) => {
+    try {
+        const keyId = req.params.id;
+        
+        const keyRes = await firebase.get(`api_keys/${keyId}.json?auth=${FB_KEY}`);
+        if (!keyRes.data) {
+            return res.status(404).json({ success: false, error: 'API Key not found' });
+        }
+        
+        await firebase.delete(`api_keys/${keyId}.json?auth=${FB_KEY}`);
+        
+        console.log(`🗑️ API Key deleted: ${keyId} (${keyRes.data.admin_name})`);
+        
+        res.json({ 
+            success: true, 
+            message: 'API Key deleted',
+            deletedKey: { id: keyId, name: keyRes.data.admin_name }
+        });
+    } catch (error) {
+        console.error('Error deleting API key:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to delete API key' });
+    }
+});
 
+// ═══════════════════════════════════════════
+// 👁️ GET USER DETAILS
+// ═══════════════════════════════════════════
+router.get('/users/:id', authAdmin, async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+        
+        if (!userRes.data) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        const user = userRes.data;
+        
+        res.json({
+            success: true,
+            user: {
+                id: userId,
+                username: user.username,
+                is_active: user.is_active,
+                subscription_end: user.subscription_end,
+                expiry_date: formatDate(user.subscription_end),
+                device_id: user.device_id || '',
+                max_devices: user.max_devices || 1,
+                created_at: user.created_at,
+                created_at_formatted: formatDate(user.created_at),
+                last_login: user.last_login,
+                last_login_formatted: user.last_login ? formatDate(user.last_login) : 'لم يسجل دخول',
+                created_by_key: user.created_by_key || 'admin'
+            }
+        });
+    } catch (error) {
+        console.error('Error getting user:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to get user' });
+    }
+});
 module.exports = router;
+
