@@ -590,7 +590,53 @@ const helmetConfig = helmet({
     contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false
 });
+// ═══════════════════════════════════════════════════════════════════
+// 🚦 SIMPLE RATE LIMITER (For compatibility)
+// ═══════════════════════════════════════════════════════════════════
+const simpleRateLimiter = new Map();
 
+const apiLimiter = (req, res, next) => {
+    const ip = req.headers['cf-connecting-ip'] ||
+               req.headers['x-real-ip'] ||
+               req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+               req.socket?.remoteAddress ||
+               req.ip ||
+               'unknown';
+    
+    const now = Date.now();
+    const windowMs = 15 * 60 * 1000; // 15 minutes
+    const maxRequests = 100;
+    
+    const key = `limiter:${ip}`;
+    let data = simpleRateLimiter.get(key) || { count: 0, windowStart: now };
+    
+    if (now - data.windowStart > windowMs) {
+        data = { count: 0, windowStart: now };
+    }
+    
+    data.count++;
+    simpleRateLimiter.set(key, data);
+    
+    if (data.count > maxRequests) {
+        return res.status(429).json({
+            success: false,
+            error: 'Too many requests, please try again later',
+            code: 429
+        });
+    }
+    
+    next();
+};
+
+// Cleanup every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, data] of simpleRateLimiter) {
+        if (now - data.windowStart > 30 * 60 * 1000) {
+            simpleRateLimiter.delete(key);
+        }
+    }
+}, 5 * 60 * 1000);
 // ═══════════════════════════════════════════════════════════════════
 // 📦 EXPORT
 // ═══════════════════════════════════════════════════════════════════
@@ -598,6 +644,7 @@ let instance = null;
 
 module.exports = {
     helmetConfig,
+    apiLimiter,  // أضف هذا السطر
     init: (config) => {
         if (!instance) {
             instance = new SecurityMiddleware(config);
@@ -607,3 +654,4 @@ module.exports = {
     getInstance: () => instance,
     SecurityMiddleware
 };
+
