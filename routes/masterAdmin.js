@@ -201,9 +201,17 @@ router.get('/users/:id', authAdmin, async (req, res) => {
 
 router.post('/users', authAdmin, async (req, res) => {
     try {
+        console.log('📝 إنشاء مستخدم - البيانات الواردة:', { 
+            username: req.body.username, 
+            expiryMinutes: req.body.expiryMinutes,
+            maxDevices: req.body.maxDevices,
+            status: req.body.status 
+        });
+
         const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
 
         if (!username || !password) {
+            console.log('❌ خطأ: اسم المستخدم أو كلمة المرور مفقود');
             return res.status(400).json({ success: false, error: 'اسم المستخدم وكلمة المرور مطلوبان' });
         }
 
@@ -212,15 +220,32 @@ router.post('/users', authAdmin, async (req, res) => {
         const checkRes = await firebase.get(checkUrl);
 
         if (checkRes.data && Object.keys(checkRes.data).length > 0) {
+            console.log('❌ خطأ: اسم المستخدم موجود بالفعل:', username);
             return res.status(400).json({ success: false, error: 'اسم المستخدم موجود بالفعل' });
         }
 
         let expiryTimestamp;
         if (customExpiryDate) {
             expiryTimestamp = new Date(customExpiryDate).getTime();
+            console.log('📅 استخدام التاريخ المخصص:', customExpiryDate, '->', expiryTimestamp);
         } else if (expiryMinutes) {
-            expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
+            console.log('📊 expiryMinutes الواردة:', expiryMinutes);
+            
+            // منطق التوافق: إذا كانت expiryMinutes أقل من 100، نعتبرها أيامًا (للتطبيق الحالي)
+            // إذا كانت 100 أو أكثر، نعتبرها دقائق (للتوافق مع الإصدارات القديمة)
+            if (expiryMinutes < 100) {
+                // التطبيق الحالي يرسل الأيام في حقل expiryMinutes
+                expiryTimestamp = Date.now() + (expiryMinutes * 24 * 60 * 60 * 1000);
+                console.log(`📅 معالجة ${expiryMinutes} كأيام -> ${expiryMinutes} يوم`);
+            } else {
+                // إصدارات قديمة كانت ترسل الدقائق
+                expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
+                console.log(`⏰ معالجة ${expiryMinutes} كدقائق -> ${Math.floor(expiryMinutes/60)} ساعة`);
+            }
+            
+            console.log('📊 expiryTimestamp المحسوب:', expiryTimestamp, '->', formatDate(expiryTimestamp));
         } else {
+            console.log('❌ خطأ: لم يتم تحديد مدة الاشتراك');
             return res.status(400).json({ success: false, error: 'يجب تحديد مدة الاشتراك' });
         }
 
@@ -236,14 +261,27 @@ router.post('/users', authAdmin, async (req, res) => {
             created_by_key: 'master'
         };
 
-        const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
-        console.log(`✅ User created by Master Admin: ${username}`);
+        console.log('📦 بيانات المستخدم المرسلة إلى Firebase:', {
+            username: userData.username,
+            is_active: userData.is_active,
+            subscription_end: userData.subscription_end,
+            expiry_date: formatDate(userData.subscription_end)
+        });
 
-        res.json({ success: true, message: 'تم إنشاء المستخدم بنجاح', userId: createRes.data.name });
+        const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
+        console.log(`✅ User created by Master Admin: ${username} -> ID: ${createRes.data.name}`);
+
+        res.json({ 
+            success: true, 
+            message: 'تم إنشاء المستخدم بنجاح', 
+            userId: createRes.data.name,
+            expiryDate: formatDate(expiryTimestamp)
+        });
 
     } catch (error) {
-        console.error('Create user error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في إنشاء المستخدم' });
+        console.error('❌ Create user error:', error.message);
+        console.error('❌ Stack trace:', error.stack);
+        res.status(500).json({ success: false, error: `فشل في إنشاء المستخدم: ${error.message}` });
     }
 });
 
