@@ -1,4 +1,4 @@
-// routes/masterAdmin.js - Master Admin Routes v14.2 FIXED
+// routes/masterAdmin.js - الإصدار النهائي الصحيح
 'use strict';
 
 const express = require('express');
@@ -229,20 +229,18 @@ router.post('/users', authAdmin, async (req, res) => {
             expiryTimestamp = new Date(customExpiryDate).getTime();
             console.log('📅 استخدام التاريخ المخصص:', customExpiryDate, '->', expiryTimestamp);
         } else if (expiryMinutes) {
-            console.log('📊 expiryMinutes الواردة:', expiryMinutes);
+            console.log('📊 expiryMinutes الواردة:', expiryMinutes, 'دقيقة');
             
-            // منطق التوافق: إذا كانت expiryMinutes أقل من 100، نعتبرها أيامًا (للتطبيق الحالي)
-            // إذا كانت 100 أو أكثر، نعتبرها دقائق (للتوافق مع الإصدارات القديمة)
-            if (expiryMinutes < 100) {
-                // التطبيق الحالي يرسل الأيام في حقل expiryMinutes
-                expiryTimestamp = Date.now() + (expiryMinutes * 24 * 60 * 60 * 1000);
-                console.log(`📅 معالجة ${expiryMinutes} كأيام -> ${expiryMinutes} يوم`);
-            } else {
-                // إصدارات قديمة كانت ترسل الدقائق
-                expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
-                console.log(`⏰ معالجة ${expiryMinutes} كدقائق -> ${Math.floor(expiryMinutes/60)} ساعة`);
-            }
+            // ✅ الحل الحقيقي: التطبيق يرسل الدقائق دائمًا
+            // لا نحتاج للتحويل أو التخمين
+            expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
             
+            // فقط للعرض في السجلات
+            const days = Math.floor(expiryMinutes / 1440);
+            const hours = Math.floor((expiryMinutes % 1440) / 60);
+            const remainingMinutes = expiryMinutes % 60;
+            
+            console.log(`⏱️ التحويل: ${expiryMinutes} دقيقة = ${days} يوم, ${hours} ساعة, ${remainingMinutes} دقيقة`);
             console.log('📊 expiryTimestamp المحسوب:', expiryTimestamp, '->', formatDate(expiryTimestamp));
         } else {
             console.log('❌ خطأ: لم يتم تحديد مدة الاشتراك');
