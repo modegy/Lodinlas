@@ -1,4 +1,4 @@
-// routes/masterAdmin.js - الإصدار المحدث مع جميع الـ Endpoints
+// routes/masterAdmin.js - Master Admin Routes v14.2 Complete
 'use strict';
 
 const express = require('express');
@@ -6,13 +6,13 @@ const crypto = require('crypto');
 const router = express.Router();
 
 const { firebase, FB_KEY } = require('../config/database');
-const { ADMIN_CREDENTIALS, adminSessions, loginAttempts } = require('../config/constants');
+const { ADMIN_CREDENTIALS, adminSessions } = require('../config/constants');
 const { authAdmin } = require('../middleware/auth');
 const { getInstance: getSecurityInstance } = require('../middleware/security');
 const { generateToken, hashPassword, formatDate, getClientIP } = require('../utils/helpers');
 
 // ═══════════════════════════════════════════════════════════════════
-// 🔐 SECURE LOGIN ENDPOINT WITH PROTECTION
+// 🔐 LOGIN
 // ═══════════════════════════════════════════════════════════════════
 router.post('/login', async (req, res) => {
     const security = getSecurityInstance();
@@ -36,9 +36,7 @@ router.post('/login', async (req, res) => {
         console.log('🔐 Login attempt:', username, 'from IP:', ip);
 
         if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
-            if (security) {
-                security.recordLoginAttempt(ip, false);
-            }
+            if (security) security.recordLoginAttempt(ip, false);
             console.log('❌ Login failed: Invalid credentials');
             return res.status(401).json({
                 success: false,
@@ -46,9 +44,7 @@ router.post('/login', async (req, res) => {
             });
         }
 
-        if (security) {
-            security.recordLoginAttempt(ip, true);
-        }
+        if (security) security.recordLoginAttempt(ip, true);
 
         const sessionToken = generateToken();
 
@@ -60,6 +56,7 @@ router.post('/login', async (req, res) => {
         });
 
         console.log(`✅ Admin login successful: ${username} from ${ip}`);
+        console.log(`📝 Session created: ${sessionToken.substring(0, 20)}... | Total sessions: ${adminSessions.size}`);
 
         return res.json({
             success: true,
@@ -71,15 +68,12 @@ router.post('/login', async (req, res) => {
 
     } catch (error) {
         console.error('Login error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'خطأ في تسجيل الدخول'
-        });
+        res.status(500).json({ success: false, error: 'خطأ في تسجيل الدخول' });
     }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🚪 LOGOUT ENDPOINT
+// 🚪 LOGOUT
 // ═══════════════════════════════════════════════════════════════════
 router.post('/logout', authAdmin, (req, res) => {
     const sessionToken = req.headers['x-session-token'];
@@ -87,47 +81,31 @@ router.post('/logout', authAdmin, (req, res) => {
         adminSessions.delete(sessionToken);
         console.log('👋 Admin logged out');
     }
-    res.json({
-        success: true,
-        message: 'تم تسجيل الخروج بنجاح'
-    });
+    res.json({ success: true, message: 'تم تسجيل الخروج بنجاح' });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// ✅ VERIFY SESSION ENDPOINT
+// ✅ VERIFY SESSION
 // ═══════════════════════════════════════════════════════════════════
 router.get('/verify-session', authAdmin, (req, res) => {
     const sessionToken = req.headers['x-session-token'];
     const session = adminSessions.get(sessionToken);
 
-    if (!session) {
-        return res.json({ 
-            success: true, 
-            session: { username: 'master_owner' } 
-        });
-    }
-
-    const expiresIn = 24 * 60 * 60 * 1000 - (Date.now() - session.createdAt);
-
     res.json({
         success: true,
         session: {
-            username: session.username,
-            expires_in: Math.floor(expiresIn / 1000 / 60) + ' دقيقة',
-            ip: session.ip
-        },
-        server_info: {
-            active_sessions: adminSessions.size,
-            uptime: Math.floor(process.uptime()) + ' ثانية'
+            username: session?.username || req.adminUser,
+            expires_in: session ? Math.floor((24 * 60 * 60 * 1000 - (Date.now() - session.createdAt)) / 1000 / 60) + ' دقيقة' : 'N/A'
         }
     });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 👥 USER MANAGEMENT
+// 👥 GET ALL USERS
 // ═══════════════════════════════════════════════════════════════════
 router.get('/users', authAdmin, async (req, res) => {
     try {
+        console.log('📥 Fetching users...');
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
 
@@ -142,22 +120,17 @@ router.get('/users', authAdmin, async (req, res) => {
                 created_at: user.created_at || null,
                 last_login: user.last_login || null,
                 device_id: user.device_id || '',
-                device_info: user.device_info || '',
+                device_info: user.device_model ? `${user.device_brand || ''} ${user.device_model}` : '',
                 device_type: user.device_type || '',
-                browser: user.browser || '',
                 ip_address: user.ip_address || '',
                 login_count: user.login_count || 0,
                 max_devices: user.max_devices || 1,
-                notes: user.notes || '',
                 created_by_key: user.created_by_key || 'master'
             };
         }
 
-        res.json({
-            success: true,
-            data: formattedUsers,
-            count: Object.keys(formattedUsers).length
-        });
+        console.log(`✅ Loaded ${Object.keys(formattedUsers).length} users`);
+        res.json({ success: true, data: formattedUsers, count: Object.keys(formattedUsers).length });
 
     } catch (error) {
         console.error('Get users error:', error.message);
@@ -165,75 +138,33 @@ router.get('/users', authAdmin, async (req, res) => {
     }
 });
 
-router.get('/users/:id', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
-
-        if (!response.data) {
-            return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
-        }
-
-        const user = response.data;
-        res.json({
-            success: true,
-            data: {
-                id: req.params.id,
-                username: user.username,
-                is_active: user.is_active !== false,
-                expiry_timestamp: user.subscription_end || 0,
-                expiry_date: formatDate(user.subscription_end),
-                device_id: user.device_id || '',
-                max_devices: user.max_devices || 1,
-                created_by_key: user.created_by_key || 'master'
-            }
-        });
-
-    } catch (error) {
-        console.error('Get user error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في جلب بيانات المستخدم' });
-    }
-});
-
+// ═══════════════════════════════════════════════════════════════════
+// ➕ CREATE USER
+// ═══════════════════════════════════════════════════════════════════
 router.post('/users', authAdmin, async (req, res) => {
     try {
-        console.log('📝 إنشاء مستخدم - البيانات الواردة:', { 
-            username: req.body.username, 
-            expiryMinutes: req.body.expiryMinutes,
-            maxDevices: req.body.maxDevices,
-            status: req.body.status 
-        });
-
         const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
 
+        console.log('📝 Creating user:', { username, expiryMinutes, maxDevices, status });
+
         if (!username || !password) {
-            console.log('❌ خطأ: اسم المستخدم أو كلمة المرور مفقود');
             return res.status(400).json({ success: false, error: 'اسم المستخدم وكلمة المرور مطلوبان' });
         }
 
+        // Check duplicate
         const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
         const checkRes = await firebase.get(checkUrl);
 
         if (checkRes.data && Object.keys(checkRes.data).length > 0) {
-            console.log('❌ خطأ: اسم المستخدم موجود بالفعل:', username);
             return res.status(400).json({ success: false, error: 'اسم المستخدم موجود بالفعل' });
         }
 
         let expiryTimestamp;
         if (customExpiryDate) {
             expiryTimestamp = new Date(customExpiryDate).getTime();
-            console.log('📅 استخدام التاريخ المخصص:', customExpiryDate, '->', expiryTimestamp);
-        } else if (expiryMinutes) {
-            console.log('📊 expiryMinutes الواردة:', expiryMinutes, 'دقيقة');
+        } else if (expiryMinutes && expiryMinutes > 0) {
             expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
-            
-            const days = Math.floor(expiryMinutes / 1440);
-            const hours = Math.floor((expiryMinutes % 1440) / 60);
-            const remainingMinutes = expiryMinutes % 60;
-            
-            console.log(`⏱️ التحويل: ${expiryMinutes} دقيقة = ${days} يوم, ${hours} ساعة, ${remainingMinutes} دقيقة`);
-            console.log('📊 expiryTimestamp المحسوب:', expiryTimestamp, '->', formatDate(expiryTimestamp));
         } else {
-            console.log('❌ خطأ: لم يتم تحديد مدة الاشتراك');
             return res.status(400).json({ success: false, error: 'يجب تحديد مدة الاشتراك' });
         }
 
@@ -249,15 +180,8 @@ router.post('/users', authAdmin, async (req, res) => {
             created_by_key: 'master'
         };
 
-        console.log('📦 بيانات المستخدم المرسلة إلى Firebase:', {
-            username: userData.username,
-            is_active: userData.is_active,
-            subscription_end: userData.subscription_end,
-            expiry_date: formatDate(userData.subscription_end)
-        });
-
         const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
-        console.log(`✅ User created by Master Admin: ${username} -> ID: ${createRes.data.name}`);
+        console.log(`✅ User created: ${username} -> ID: ${createRes.data.name}`);
 
         res.json({ 
             success: true, 
@@ -267,12 +191,14 @@ router.post('/users', authAdmin, async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Create user error:', error.message);
-        console.error('❌ Stack trace:', error.stack);
-        res.status(500).json({ success: false, error: `فشل في إنشاء المستخدم: ${error.message}` });
+        console.error('Create user error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في إنشاء المستخدم' });
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// ✏️ UPDATE USER
+// ═══════════════════════════════════════════════════════════════════
 router.patch('/users/:id', authAdmin, async (req, res) => {
     try {
         const { is_active, max_devices, notes } = req.body;
@@ -283,6 +209,7 @@ router.patch('/users/:id', authAdmin, async (req, res) => {
         if (notes !== undefined) updateData.notes = notes;
 
         await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, updateData);
+        console.log(`✅ User updated: ${req.params.id}`);
         res.json({ success: true, message: 'تم تحديث المستخدم بنجاح' });
 
     } catch (error) {
@@ -291,6 +218,9 @@ router.patch('/users/:id', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 🗑️ DELETE USER
+// ═══════════════════════════════════════════════════════════════════
 router.delete('/users/:id', authAdmin, async (req, res) => {
     try {
         await firebase.delete(`users/${req.params.id}.json?auth=${FB_KEY}`);
@@ -304,198 +234,7 @@ router.delete('/users/:id', authAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🆕 حذف المستخدمين المنتهيين
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users/delete-expired', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-        const now = Date.now();
-
-        const deletePromises = [];
-        let expiredCount = 0;
-        const deletedUsers = [];
-
-        for (const [id, user] of Object.entries(users)) {
-            if (user.subscription_end && user.subscription_end <= now) {
-                deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
-                deletedUsers.push(user.username);
-                expiredCount++;
-            }
-        }
-
-        if (deletePromises.length === 0) {
-            return res.json({ success: true, message: 'لا توجد حسابات منتهية', count: 0 });
-        }
-
-        await Promise.all(deletePromises);
-        console.log(`🗑️ Bulk deleted ${expiredCount} expired users:`, deletedUsers);
-
-        res.json({ 
-            success: true, 
-            message: `تم حذف ${expiredCount} حساب منتهي`, 
-            count: expiredCount,
-            deletedUsers 
-        });
-
-    } catch (error) {
-        console.error('Delete expired error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في حذف الحسابات المنتهية' });
-    }
-});
-
-
-
-
-// ═══════════════════════════════════════════════════════════════════
-// ⏸️ تعطيل المستخدمين المنتهيين (بدون حذف)
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users/bulk-disable-expired', authAdmin, async (req, res) => {
-    try {
-        console.log('⏸️ Starting bulk disable expired users...');
-        
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-        const now = Date.now();
-
-        const updatePromises = [];
-        let disabledCount = 0;
-        const disabledUsers = [];
-
-        for (const [id, user] of Object.entries(users)) {
-            // تعطيل فقط المنتهيين والنشطين حالياً
-            if (user.subscription_end && user.subscription_end <= now && user.is_active !== false) {
-                updatePromises.push(
-                    firebase.patch(`users/${id}.json?auth=${FB_KEY}`, { is_active: false })
-                );
-                disabledUsers.push(user.username || id);
-                disabledCount++;
-            }
-        }
-
-        if (updatePromises.length === 0) {
-            console.log('⏸️ No expired active users to disable');
-            return res.json({ 
-                success: true, 
-                message: 'لا يوجد مستخدمين منتهيين نشطين للتعطيل', 
-                count: 0 
-            });
-        }
-
-        await Promise.all(updatePromises);
-        console.log(`⏸️ Bulk disabled ${disabledCount} expired users:`, disabledUsers);
-
-        res.json({ 
-            success: true, 
-            message: `تم تعطيل ${disabledCount} مستخدم منتهي`, 
-            count: disabledCount,
-            disabledUsers 
-        });
-
-    } catch (error) {
-        console.error('❌ Bulk disable expired error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في تعطيل المستخدمين المنتهيين' });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 🗑️ حذف المستخدمين المعطلين
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users/delete-inactive', authAdmin, async (req, res) => {
-    try {
-        console.log('🗑️ Starting delete inactive users...');
-        
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        const deletePromises = [];
-        let inactiveCount = 0;
-        const deletedUsers = [];
-
-        for (const [id, user] of Object.entries(users)) {
-            // حذف المستخدمين المعطلين فقط (is_active = false)
-            if (user.is_active === false) {
-                deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
-                deletedUsers.push(user.username || id);
-                inactiveCount++;
-            }
-        }
-
-        if (deletePromises.length === 0) {
-            console.log('🗑️ No inactive users to delete');
-            return res.json({ 
-                success: true, 
-                message: 'لا يوجد مستخدمين معطلين للحذف', 
-                count: 0 
-            });
-        }
-
-        await Promise.all(deletePromises);
-        console.log(`🗑️ Bulk deleted ${inactiveCount} inactive users:`, deletedUsers);
-
-        res.json({ 
-            success: true, 
-            message: `تم حذف ${inactiveCount} مستخدم معطل`, 
-            count: inactiveCount,
-            deletedUsers 
-        });
-
-    } catch (error) {
-        console.error('❌ Delete inactive error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في حذف المستخدمين المعطلين' });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 🗑️ حذف مفاتيح API المنتهية
-// ═══════════════════════════════════════════════════════════════════
-router.post('/api-keys/delete-expired', authAdmin, async (req, res) => {
-    try {
-        console.log('🗑️ Starting delete expired API keys...');
-        
-        const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
-        const keys = response.data || {};
-        const now = Date.now();
-
-        const deletePromises = [];
-        let expiredCount = 0;
-        const deletedKeys = [];
-
-        for (const [id, key] of Object.entries(keys)) {
-            if (key.expiry_timestamp && key.expiry_timestamp <= now) {
-                deletePromises.push(firebase.delete(`api_keys/${id}.json?auth=${FB_KEY}`));
-                deletedKeys.push(key.admin_name || id);
-                expiredCount++;
-            }
-        }
-
-        if (deletePromises.length === 0) {
-            console.log('🗑️ No expired API keys to delete');
-            return res.json({ 
-                success: true, 
-                message: 'لا توجد مفاتيح منتهية', 
-                count: 0 
-            });
-        }
-
-        await Promise.all(deletePromises);
-        console.log(`🗑️ Bulk deleted ${expiredCount} expired API keys:`, deletedKeys);
-
-        res.json({ 
-            success: true, 
-            message: `تم حذف ${expiredCount} مفتاح منتهي`, 
-            count: expiredCount,
-            deletedKeys 
-        });
-
-    } catch (error) {
-        console.error('❌ Delete expired API keys error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في حذف المفاتيح المنتهية' });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// تمديد الاشتراك
+// ⏰ EXTEND USER SUBSCRIPTION
 // ═══════════════════════════════════════════════════════════════════
 router.post('/users/:id/extend', authAdmin, async (req, res) => {
     try {
@@ -525,6 +264,7 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
             is_active: true
         });
 
+        console.log(`⏰ User extended: ${req.params.id}`);
         res.json({ success: true, message: 'تم تمديد الاشتراك بنجاح', new_end_date: newEndDate });
 
     } catch (error) {
@@ -533,10 +273,13 @@ router.post('/users/:id/extend', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 🔄 RESET USER DEVICE
+// ═══════════════════════════════════════════════════════════════════
 router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
     try {
         await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, { device_id: '' });
-        console.log(`🔄 Device reset for user: ${req.params.id}`);
+        console.log(`🔄 Device reset: ${req.params.id}`);
         res.json({ success: true, message: 'تم إعادة تعيين الجهاز بنجاح' });
 
     } catch (error) {
@@ -545,35 +288,116 @@ router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
     }
 });
 
-router.get('/users/:id/login-history', authAdmin, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════
+// 🗑️ DELETE EXPIRED USERS
+// ═══════════════════════════════════════════════════════════════════
+router.post('/users/delete-expired', authAdmin, async (req, res) => {
     try {
-        const response = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
+        console.log('🗑️ Deleting expired users...');
+        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+        const users = response.data || {};
+        const now = Date.now();
 
-        if (!response.data) {
-            return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
+        const deletePromises = [];
+        const deletedUsers = [];
+
+        for (const [id, user] of Object.entries(users)) {
+            if (user.subscription_end && user.subscription_end <= now) {
+                deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
+                deletedUsers.push(user.username || id);
+            }
         }
 
-        const user = response.data;
-        res.json({
-            success: true,
-            data: {
-                username: user.username,
-                total_logins: user.login_count || 0,
-                login_history: (user.login_history || []).reverse()
-            }
-        });
+        if (deletePromises.length === 0) {
+            return res.json({ success: true, message: 'لا توجد حسابات منتهية', count: 0 });
+        }
+
+        await Promise.all(deletePromises);
+        console.log(`🗑️ Deleted ${deletedUsers.length} expired users`);
+
+        res.json({ success: true, message: `تم حذف ${deletedUsers.length} حساب منتهي`, count: deletedUsers.length });
 
     } catch (error) {
-        console.error('Login history error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في جلب سجل الدخول' });
+        console.error('Delete expired error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في حذف الحسابات المنتهية' });
     }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🔑 API KEYS MANAGEMENT
+// ⏸️ BULK DISABLE EXPIRED USERS (NEW!)
+// ═══════════════════════════════════════════════════════════════════
+router.post('/users/bulk-disable-expired', authAdmin, async (req, res) => {
+    try {
+        console.log('⏸️ Disabling expired users...');
+        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+        const users = response.data || {};
+        const now = Date.now();
+
+        const updatePromises = [];
+        const disabledUsers = [];
+
+        for (const [id, user] of Object.entries(users)) {
+            if (user.subscription_end && user.subscription_end <= now && user.is_active !== false) {
+                updatePromises.push(firebase.patch(`users/${id}.json?auth=${FB_KEY}`, { is_active: false }));
+                disabledUsers.push(user.username || id);
+            }
+        }
+
+        if (updatePromises.length === 0) {
+            return res.json({ success: true, message: 'لا يوجد مستخدمين منتهيين نشطين', count: 0 });
+        }
+
+        await Promise.all(updatePromises);
+        console.log(`⏸️ Disabled ${disabledUsers.length} expired users`);
+
+        res.json({ success: true, message: `تم تعطيل ${disabledUsers.length} مستخدم منتهي`, count: disabledUsers.length });
+
+    } catch (error) {
+        console.error('Bulk disable error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في تعطيل المستخدمين' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🗑️ DELETE INACTIVE USERS (NEW!)
+// ═══════════════════════════════════════════════════════════════════
+router.post('/users/delete-inactive', authAdmin, async (req, res) => {
+    try {
+        console.log('🗑️ Deleting inactive users...');
+        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+        const users = response.data || {};
+
+        const deletePromises = [];
+        const deletedUsers = [];
+
+        for (const [id, user] of Object.entries(users)) {
+            if (user.is_active === false) {
+                deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
+                deletedUsers.push(user.username || id);
+            }
+        }
+
+        if (deletePromises.length === 0) {
+            return res.json({ success: true, message: 'لا يوجد مستخدمين معطلين', count: 0 });
+        }
+
+        await Promise.all(deletePromises);
+        console.log(`🗑️ Deleted ${deletedUsers.length} inactive users`);
+
+        res.json({ success: true, message: `تم حذف ${deletedUsers.length} مستخدم معطل`, count: deletedUsers.length });
+
+    } catch (error) {
+        console.error('Delete inactive error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في حذف المستخدمين المعطلين' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔑 GET ALL API KEYS
 // ═══════════════════════════════════════════════════════════════════
 router.get('/api-keys', authAdmin, async (req, res) => {
     try {
+        console.log('📥 Fetching API keys...');
         const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
         const keys = response.data || {};
 
@@ -588,11 +412,11 @@ router.get('/api-keys', authAdmin, async (req, res) => {
                 usage_count: key.usage_count || 0,
                 bound_device: key.bound_device || null,
                 created_at: key.created_at || null,
-                last_used: key.last_used || null,
-                signing_secret: key.signing_secret ? '*****' : null
+                last_used: key.last_used || null
             };
         }
 
+        console.log(`✅ Loaded ${Object.keys(formattedKeys).length} API keys`);
         res.json({ success: true, data: formattedKeys, count: Object.keys(formattedKeys).length });
 
     } catch (error) {
@@ -601,6 +425,9 @@ router.get('/api-keys', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// ➕ CREATE API KEY
+// ═══════════════════════════════════════════════════════════════════
 router.post('/api-keys', authAdmin, async (req, res) => {
     try {
         const { adminName, permissionLevel, expiryDays } = req.body;
@@ -633,7 +460,7 @@ router.post('/api-keys', authAdmin, async (req, res) => {
             message: 'تم إنشاء مفتاح API بنجاح',
             apiKey,
             signingSecret,
-            warning: 'احفظ الـ signing secret فوراً. لن يظهر مرة أخرى.'
+            warning: 'احفظ الـ signing secret فوراً.'
         });
 
     } catch (error) {
@@ -642,11 +469,14 @@ router.post('/api-keys', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// ✏️ UPDATE API KEY (Toggle Status)
+// ═══════════════════════════════════════════════════════════════════
 router.patch('/api-keys/:id', authAdmin, async (req, res) => {
     try {
         const { is_active } = req.body;
         await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, { is_active });
-        console.log(`🔑 API Key ${req.params.id} status changed to: ${is_active}`);
+        console.log(`🔑 API Key ${req.params.id} -> is_active: ${is_active}`);
         res.json({ success: true, message: 'تم تحديث مفتاح API بنجاح' });
 
     } catch (error) {
@@ -655,6 +485,9 @@ router.patch('/api-keys/:id', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 🗑️ DELETE API KEY
+// ═══════════════════════════════════════════════════════════════════
 router.delete('/api-keys/:id', authAdmin, async (req, res) => {
     try {
         await firebase.delete(`api_keys/${req.params.id}.json?auth=${FB_KEY}`);
@@ -668,43 +501,33 @@ router.delete('/api-keys/:id', authAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🆕 حذف مفاتيح API المنتهية
+// 🗑️ DELETE EXPIRED API KEYS (NEW!)
 // ═══════════════════════════════════════════════════════════════════
 router.post('/api-keys/delete-expired', authAdmin, async (req, res) => {
     try {
+        console.log('🗑️ Deleting expired API keys...');
         const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
         const keys = response.data || {};
         const now = Date.now();
 
         const deletePromises = [];
-        let expiredCount = 0;
         const deletedKeys = [];
 
         for (const [id, key] of Object.entries(keys)) {
             if (key.expiry_timestamp && key.expiry_timestamp <= now) {
                 deletePromises.push(firebase.delete(`api_keys/${id}.json?auth=${FB_KEY}`));
-                deletedKeys.push(key.admin_name);
-                expiredCount++;
+                deletedKeys.push(key.admin_name || id);
             }
         }
 
         if (deletePromises.length === 0) {
-            return res.json({ 
-                success: true, 
-                message: 'لا توجد مفاتيح منتهية', 
-                count: 0 
-            });
+            return res.json({ success: true, message: 'لا توجد مفاتيح منتهية', count: 0 });
         }
 
         await Promise.all(deletePromises);
-        console.log(`🗑️ Bulk deleted ${expiredCount} expired API keys:`, deletedKeys);
+        console.log(`🗑️ Deleted ${deletedKeys.length} expired API keys`);
 
-        res.json({ 
-            success: true, 
-            message: `تم حذف ${expiredCount} مفتاح منتهي`, 
-            count: expiredCount,
-            deletedKeys 
-        });
+        res.json({ success: true, message: `تم حذف ${deletedKeys.length} مفتاح منتهي`, count: deletedKeys.length });
 
     } catch (error) {
         console.error('Delete expired API keys error:', error.message);
@@ -712,44 +535,8 @@ router.post('/api-keys/delete-expired', authAdmin, async (req, res) => {
     }
 });
 
-router.post('/api-keys/:id/unbind-device', authAdmin, async (req, res) => {
-    try {
-        await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, { bound_device: null });
-        console.log(`🔓 Device unbound from API key: ${req.params.id}`);
-        res.json({ success: true, message: 'تم فك ربط الجهاز بنجاح' });
-
-    } catch (error) {
-        console.error('Unbind device error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في فك ربط الجهاز' });
-    }
-});
-
-router.post('/api-keys/:id/regenerate-secret', authAdmin, async (req, res) => {
-    try {
-        const newSecret = `SS_${crypto.randomBytes(32).toString('hex')}`;
-
-        await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, {
-            signing_secret: newSecret,
-            last_secret_update: Date.now()
-        });
-
-        console.log(`🔄 Regenerated signing secret for API Key: ${req.params.id}`);
-
-        res.json({
-            success: true,
-            message: 'تم إعادة توليد الـ signing secret بنجاح',
-            signingSecret: newSecret,
-            warning: 'احفظ هذا السر الجديد فوراً.'
-        });
-
-    } catch (error) {
-        console.error('Regenerate secret error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في إعادة توليد السر' });
-    }
-});
-
 // ═══════════════════════════════════════════════════════════════════
-// 📡 SECURITY & STATS
+// 📊 SECURITY STATS
 // ═══════════════════════════════════════════════════════════════════
 router.get('/security-stats', authAdmin, (req, res) => {
     const security = getSecurityInstance();
@@ -757,171 +544,6 @@ router.get('/security-stats', authAdmin, (req, res) => {
         res.json({ success: true, stats: security.getStats() });
     } else {
         res.json({ success: true, stats: { message: 'نظام الحماية غير مفعل' } });
-    }
-});
-
-router.post('/unblock-ip', authAdmin, (req, res) => {
-    const { ip } = req.body;
-    if (!ip) return res.status(400).json({ error: 'عنوان IP مطلوب' });
-
-    const security = getSecurityInstance();
-    if (security) {
-        security.unblockIP(ip);
-    }
-
-    res.json({ success: true, message: `تم إلغاء حظر IP: ${ip}` });
-});
-
-router.get('/device-stats', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        const stats = {
-            total_users: Object.keys(users).length,
-            total_devices: 0,
-            rooted_devices: 0,
-            device_brands: {},
-            android_versions: {},
-            active_last_day: 0,
-            active_last_week: 0
-        };
-
-        const now = Date.now();
-        const oneDay = 24 * 60 * 60 * 1000;
-        const oneWeek = 7 * oneDay;
-
-        for (const user of Object.values(users)) {
-            if (user.device_id) {
-                stats.total_devices++;
-                if (user.is_rooted) stats.rooted_devices++;
-
-                const brand = user.device_brand || 'Unknown';
-                stats.device_brands[brand] = (stats.device_brands[brand] || 0) + 1;
-
-                const version = user.android_version || 'Unknown';
-                stats.android_versions[version] = (stats.android_versions[version] || 0) + 1;
-            }
-
-            if (user.last_login) {
-                const timeSince = now - user.last_login;
-                if (timeSince < oneDay) stats.active_last_day++;
-                if (timeSince < oneWeek) stats.active_last_week++;
-            }
-        }
-
-        res.json({ success: true, data: stats });
-
-    } catch (error) {
-        console.error('Device stats error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في جلب إحصائيات الأجهزة' });
-    }
-});
-
-router.get('/rooted-devices', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        const rootedDevices = [];
-
-        for (const [userId, user] of Object.entries(users)) {
-            if (user.is_rooted) {
-                rootedDevices.push({
-                    user_id: userId,
-                    username: user.username,
-                    device_model: user.device_model || 'Unknown',
-                    device_brand: user.device_brand || 'Unknown',
-                    android_version: user.android_version || 'Unknown',
-                    last_login: user.last_login,
-                    ip_address: user.ip_address || 'Unknown'
-                });
-            }
-        }
-
-        res.json({ success: true, data: rootedDevices, count: rootedDevices.length });
-
-    } catch (error) {
-        console.error('Rooted devices error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في جلب الأجهزة المعدلة' });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 🛠️ MAINTENANCE
-// ═══════════════════════════════════════════════════════════════════
-router.post('/fix-old-users', authAdmin, async (req, res) => {
-    try {
-        console.log('🔧 Starting fix-old-users process...');
-
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        let fixed = 0;
-        let alreadyFixed = 0;
-        const fixedUsers = [];
-
-        for (const [id, user] of Object.entries(users)) {
-            if (!user.created_by_key) {
-                await firebase.patch(`users/${id}.json?auth=${FB_KEY}`, { created_by_key: 'master' });
-                fixedUsers.push(user.username);
-                fixed++;
-            } else {
-                alreadyFixed++;
-            }
-        }
-
-        console.log(`🎉 Fix completed: ${fixed} fixed, ${alreadyFixed} already had key`);
-
-        res.json({
-            success: true,
-            message: `تم إصلاح ${fixed} مستخدم قديم. ${alreadyFixed} لديهم مفتاح بالفعل`,
-            fixed,
-            alreadyFixed,
-            fixedUsers
-        });
-
-    } catch (error) {
-        console.error('❌ Fix-old-users error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/debug-users', authAdmin, async (req, res) => {
-    try {
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        const debugInfo = [];
-        let withKey = 0, withoutKey = 0, masterUsers = 0, subAdminUsers = 0;
-
-        for (const [id, user] of Object.entries(users)) {
-            const keyStatus = user.created_by_key || 'MISSING';
-
-            debugInfo.push({
-                id: id.substring(0, 10) + '...',
-                username: user.username,
-                created_by_key: keyStatus,
-                created_at: formatDate(user.created_at)
-            });
-
-            if (user.created_by_key) {
-                withKey++;
-                if (user.created_by_key === 'master') masterUsers++;
-                else subAdminUsers++;
-            } else {
-                withoutKey++;
-            }
-        }
-
-        res.json({
-            success: true,
-            summary: { total: Object.keys(users).length, withKey, withoutKey, masterUsers, subAdminUsers },
-            users: debugInfo
-        });
-
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
     }
 });
 
