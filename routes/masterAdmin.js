@@ -1,4 +1,4 @@
-// routes/masterAdmin.js - الإصدار النهائي الصحيح
+// routes/masterAdmin.js - الإصدار المحدث مع جميع الـ Endpoints
 'use strict';
 
 const express = require('express');
@@ -21,7 +21,6 @@ router.post('/login', async (req, res) => {
         const { username, password } = req.body;
         const ip = req.clientIP || getClientIP(req);
 
-        // التحقق من البيانات المدخلة
         if (!username || !password) {
             return res.status(400).json({
                 success: false,
@@ -29,39 +28,30 @@ router.post('/login', async (req, res) => {
             });
         }
 
-        // تأخير صناعي للحماية من هجمات Timing Attacks
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // قراءة بيانات الأدمن من Environment Variables أو الـ Constants
         const ADMIN_USERNAME = process.env.ADMIN_USERNAME || ADMIN_CREDENTIALS.username || 'admin';
         const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || ADMIN_CREDENTIALS.password || 'admin123';
 
         console.log('🔐 Login attempt:', username, 'from IP:', ip);
 
-        // التحقق من صحة البيانات
         if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
-            // تسجيل المحاولة الفاشلة في نظام الحماية
             if (security) {
                 security.recordLoginAttempt(ip, false);
             }
-            
             console.log('❌ Login failed: Invalid credentials');
-            
             return res.status(401).json({
                 success: false,
                 error: 'اسم المستخدم أو كلمة المرور غير صحيحة'
             });
         }
 
-        // تسجيل المحاولة الناجحة
         if (security) {
             security.recordLoginAttempt(ip, true);
         }
 
-        // إنشاء Session Token آمن
         const sessionToken = generateToken();
 
-        // حفظ الـ Session مع معلومات إضافية للأمان
         adminSessions.set(sessionToken, {
             username,
             ip,
@@ -152,6 +142,11 @@ router.get('/users', authAdmin, async (req, res) => {
                 created_at: user.created_at || null,
                 last_login: user.last_login || null,
                 device_id: user.device_id || '',
+                device_info: user.device_info || '',
+                device_type: user.device_type || '',
+                browser: user.browser || '',
+                ip_address: user.ip_address || '',
+                login_count: user.login_count || 0,
                 max_devices: user.max_devices || 1,
                 notes: user.notes || '',
                 created_by_key: user.created_by_key || 'master'
@@ -215,7 +210,6 @@ router.post('/users', authAdmin, async (req, res) => {
             return res.status(400).json({ success: false, error: 'اسم المستخدم وكلمة المرور مطلوبان' });
         }
 
-        // التحقق من عدم تكرار اسم المستخدم
         const checkUrl = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
         const checkRes = await firebase.get(checkUrl);
 
@@ -230,12 +224,8 @@ router.post('/users', authAdmin, async (req, res) => {
             console.log('📅 استخدام التاريخ المخصص:', customExpiryDate, '->', expiryTimestamp);
         } else if (expiryMinutes) {
             console.log('📊 expiryMinutes الواردة:', expiryMinutes, 'دقيقة');
-            
-            // ✅ الحل الحقيقي: التطبيق يرسل الدقائق دائمًا
-            // لا نحتاج للتحويل أو التخمين
             expiryTimestamp = Date.now() + (expiryMinutes * 60 * 1000);
             
-            // فقط للعرض في السجلات
             const days = Math.floor(expiryMinutes / 1440);
             const hours = Math.floor((expiryMinutes % 1440) / 60);
             const remainingMinutes = expiryMinutes % 60;
@@ -313,6 +303,9 @@ router.delete('/users/:id', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 🆕 حذف المستخدمين المنتهيين
+// ═══════════════════════════════════════════════════════════════════
 router.post('/users/delete-expired', authAdmin, async (req, res) => {
     try {
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
@@ -321,10 +314,12 @@ router.post('/users/delete-expired', authAdmin, async (req, res) => {
 
         const deletePromises = [];
         let expiredCount = 0;
+        const deletedUsers = [];
 
         for (const [id, user] of Object.entries(users)) {
             if (user.subscription_end && user.subscription_end <= now) {
                 deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
+                deletedUsers.push(user.username);
                 expiredCount++;
             }
         }
@@ -334,9 +329,14 @@ router.post('/users/delete-expired', authAdmin, async (req, res) => {
         }
 
         await Promise.all(deletePromises);
-        console.log(`🗑️ Bulk deleted ${expiredCount} expired users`);
+        console.log(`🗑️ Bulk deleted ${expiredCount} expired users:`, deletedUsers);
 
-        res.json({ success: true, message: `تم حذف ${expiredCount} حساب منتهي`, count: expiredCount });
+        res.json({ 
+            success: true, 
+            message: `تم حذف ${expiredCount} حساب منتهي`, 
+            count: expiredCount,
+            deletedUsers 
+        });
 
     } catch (error) {
         console.error('Delete expired error:', error.message);
@@ -344,6 +344,102 @@ router.post('/users/delete-expired', authAdmin, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 🆕 تعطيل المستخدمين المنتهيين (بدون حذف)
+// ═══════════════════════════════════════════════════════════════════
+router.post('/users/bulk-disable-expired', authAdmin, async (req, res) => {
+    try {
+        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+        const users = response.data || {};
+        const now = Date.now();
+
+        const updatePromises = [];
+        let disabledCount = 0;
+        const disabledUsers = [];
+
+        for (const [id, user] of Object.entries(users)) {
+            // تعطيل فقط المنتهيين والنشطين حالياً
+            if (user.subscription_end && user.subscription_end <= now && user.is_active !== false) {
+                updatePromises.push(
+                    firebase.patch(`users/${id}.json?auth=${FB_KEY}`, { is_active: false })
+                );
+                disabledUsers.push(user.username);
+                disabledCount++;
+            }
+        }
+
+        if (updatePromises.length === 0) {
+            return res.json({ 
+                success: true, 
+                message: 'لا يوجد مستخدمين منتهيين نشطين للتعطيل', 
+                count: 0 
+            });
+        }
+
+        await Promise.all(updatePromises);
+        console.log(`⏸️ Bulk disabled ${disabledCount} expired users:`, disabledUsers);
+
+        res.json({ 
+            success: true, 
+            message: `تم تعطيل ${disabledCount} مستخدم منتهي`, 
+            count: disabledCount,
+            disabledUsers 
+        });
+
+    } catch (error) {
+        console.error('Bulk disable expired error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في تعطيل المستخدمين المنتهيين' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🆕 حذف المستخدمين المعطلين
+// ═══════════════════════════════════════════════════════════════════
+router.post('/users/delete-inactive', authAdmin, async (req, res) => {
+    try {
+        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
+        const users = response.data || {};
+
+        const deletePromises = [];
+        let inactiveCount = 0;
+        const deletedUsers = [];
+
+        for (const [id, user] of Object.entries(users)) {
+            // حذف المستخدمين المعطلين فقط (is_active = false)
+            if (user.is_active === false) {
+                deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
+                deletedUsers.push(user.username);
+                inactiveCount++;
+            }
+        }
+
+        if (deletePromises.length === 0) {
+            return res.json({ 
+                success: true, 
+                message: 'لا يوجد مستخدمين معطلين للحذف', 
+                count: 0 
+            });
+        }
+
+        await Promise.all(deletePromises);
+        console.log(`🗑️ Bulk deleted ${inactiveCount} inactive users:`, deletedUsers);
+
+        res.json({ 
+            success: true, 
+            message: `تم حذف ${inactiveCount} مستخدم معطل`, 
+            count: inactiveCount,
+            deletedUsers 
+        });
+
+    } catch (error) {
+        console.error('Delete inactive error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في حذف المستخدمين المعطلين' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// تمديد الاشتراك
+// ═══════════════════════════════════════════════════════════════════
 router.post('/users/:id/extend', authAdmin, async (req, res) => {
     try {
         const { minutes, days, hours } = req.body;
@@ -435,6 +531,7 @@ router.get('/api-keys', authAdmin, async (req, res) => {
                 usage_count: key.usage_count || 0,
                 bound_device: key.bound_device || null,
                 created_at: key.created_at || null,
+                last_used: key.last_used || null,
                 signing_secret: key.signing_secret ? '*****' : null
             };
         }
@@ -467,6 +564,7 @@ router.post('/api-keys', authAdmin, async (req, res) => {
             usage_count: 0,
             bound_device: null,
             created_at: Date.now(),
+            last_used: null,
             signing_secret: signingSecret
         };
 
@@ -491,6 +589,7 @@ router.patch('/api-keys/:id', authAdmin, async (req, res) => {
     try {
         const { is_active } = req.body;
         await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, { is_active });
+        console.log(`🔑 API Key ${req.params.id} status changed to: ${is_active}`);
         res.json({ success: true, message: 'تم تحديث مفتاح API بنجاح' });
 
     } catch (error) {
@@ -508,6 +607,51 @@ router.delete('/api-keys/:id', authAdmin, async (req, res) => {
     } catch (error) {
         console.error('Delete API key error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في حذف مفتاح API' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🆕 حذف مفاتيح API المنتهية
+// ═══════════════════════════════════════════════════════════════════
+router.post('/api-keys/delete-expired', authAdmin, async (req, res) => {
+    try {
+        const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
+        const keys = response.data || {};
+        const now = Date.now();
+
+        const deletePromises = [];
+        let expiredCount = 0;
+        const deletedKeys = [];
+
+        for (const [id, key] of Object.entries(keys)) {
+            if (key.expiry_timestamp && key.expiry_timestamp <= now) {
+                deletePromises.push(firebase.delete(`api_keys/${id}.json?auth=${FB_KEY}`));
+                deletedKeys.push(key.admin_name);
+                expiredCount++;
+            }
+        }
+
+        if (deletePromises.length === 0) {
+            return res.json({ 
+                success: true, 
+                message: 'لا توجد مفاتيح منتهية', 
+                count: 0 
+            });
+        }
+
+        await Promise.all(deletePromises);
+        console.log(`🗑️ Bulk deleted ${expiredCount} expired API keys:`, deletedKeys);
+
+        res.json({ 
+            success: true, 
+            message: `تم حذف ${expiredCount} مفتاح منتهي`, 
+            count: expiredCount,
+            deletedKeys 
+        });
+
+    } catch (error) {
+        console.error('Delete expired API keys error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في حذف المفاتيح المنتهية' });
     }
 });
 
