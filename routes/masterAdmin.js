@@ -344,11 +344,16 @@ router.post('/users/delete-expired', authAdmin, async (req, res) => {
     }
 });
 
+
+
+
 // ═══════════════════════════════════════════════════════════════════
-// 🆕 تعطيل المستخدمين المنتهيين (بدون حذف)
+// ⏸️ تعطيل المستخدمين المنتهيين (بدون حذف)
 // ═══════════════════════════════════════════════════════════════════
 router.post('/users/bulk-disable-expired', authAdmin, async (req, res) => {
     try {
+        console.log('⏸️ Starting bulk disable expired users...');
+        
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
         const now = Date.now();
@@ -363,12 +368,13 @@ router.post('/users/bulk-disable-expired', authAdmin, async (req, res) => {
                 updatePromises.push(
                     firebase.patch(`users/${id}.json?auth=${FB_KEY}`, { is_active: false })
                 );
-                disabledUsers.push(user.username);
+                disabledUsers.push(user.username || id);
                 disabledCount++;
             }
         }
 
         if (updatePromises.length === 0) {
+            console.log('⏸️ No expired active users to disable');
             return res.json({ 
                 success: true, 
                 message: 'لا يوجد مستخدمين منتهيين نشطين للتعطيل', 
@@ -387,16 +393,18 @@ router.post('/users/bulk-disable-expired', authAdmin, async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Bulk disable expired error:', error.message);
+        console.error('❌ Bulk disable expired error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في تعطيل المستخدمين المنتهيين' });
     }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🆕 حذف المستخدمين المعطلين
+// 🗑️ حذف المستخدمين المعطلين
 // ═══════════════════════════════════════════════════════════════════
 router.post('/users/delete-inactive', authAdmin, async (req, res) => {
     try {
+        console.log('🗑️ Starting delete inactive users...');
+        
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
 
@@ -408,12 +416,13 @@ router.post('/users/delete-inactive', authAdmin, async (req, res) => {
             // حذف المستخدمين المعطلين فقط (is_active = false)
             if (user.is_active === false) {
                 deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
-                deletedUsers.push(user.username);
+                deletedUsers.push(user.username || id);
                 inactiveCount++;
             }
         }
 
         if (deletePromises.length === 0) {
+            console.log('🗑️ No inactive users to delete');
             return res.json({ 
                 success: true, 
                 message: 'لا يوجد مستخدمين معطلين للحذف', 
@@ -432,8 +441,56 @@ router.post('/users/delete-inactive', authAdmin, async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Delete inactive error:', error.message);
+        console.error('❌ Delete inactive error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في حذف المستخدمين المعطلين' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🗑️ حذف مفاتيح API المنتهية
+// ═══════════════════════════════════════════════════════════════════
+router.post('/api-keys/delete-expired', authAdmin, async (req, res) => {
+    try {
+        console.log('🗑️ Starting delete expired API keys...');
+        
+        const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
+        const keys = response.data || {};
+        const now = Date.now();
+
+        const deletePromises = [];
+        let expiredCount = 0;
+        const deletedKeys = [];
+
+        for (const [id, key] of Object.entries(keys)) {
+            if (key.expiry_timestamp && key.expiry_timestamp <= now) {
+                deletePromises.push(firebase.delete(`api_keys/${id}.json?auth=${FB_KEY}`));
+                deletedKeys.push(key.admin_name || id);
+                expiredCount++;
+            }
+        }
+
+        if (deletePromises.length === 0) {
+            console.log('🗑️ No expired API keys to delete');
+            return res.json({ 
+                success: true, 
+                message: 'لا توجد مفاتيح منتهية', 
+                count: 0 
+            });
+        }
+
+        await Promise.all(deletePromises);
+        console.log(`🗑️ Bulk deleted ${expiredCount} expired API keys:`, deletedKeys);
+
+        res.json({ 
+            success: true, 
+            message: `تم حذف ${expiredCount} مفتاح منتهي`, 
+            count: expiredCount,
+            deletedKeys 
+        });
+
+    } catch (error) {
+        console.error('❌ Delete expired API keys error:', error.message);
+        res.status(500).json({ success: false, error: 'فشل في حذف المفاتيح المنتهية' });
     }
 });
 
