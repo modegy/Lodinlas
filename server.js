@@ -1,4 +1,4 @@
-// server.js - Main Server v14.1
+// server.js - Secure Server v15.0
 'use strict';
 
 const express = require('express');
@@ -6,11 +6,93 @@ const cors = require('cors');
 require('dotenv').config();
 
 // ═══════════════════════════════════════════════════════════════════
-// 📦 IMPORTS
+// 🚨 SECURITY: VALIDATE ENVIRONMENT FIRST!
+// ═══════════════════════════════════════════════════════════════════
+console.log('');
+console.log('═'.repeat(60));
+console.log('🔐 SECURITY VALIDATION');
+console.log('═'.repeat(60));
+
+// Required environment variables - NO DEFAULTS ALLOWED!
+const REQUIRED_ENV = {
+    // Database
+    FIREBASE_URL: process.env.FIREBASE_URL,
+    FIREBASE_KEY: process.env.FIREBASE_KEY,
+    
+    // Master Admin Credentials
+    MASTER_ADMIN_USERNAME: process.env.MASTER_ADMIN_USERNAME,
+    MASTER_ADMIN_PASSWORD_HASH: process.env.MASTER_ADMIN_PASSWORD_HASH,
+    
+    // Security Secrets
+    SESSION_SECRET: process.env.SESSION_SECRET,
+    JWT_SECRET: process.env.JWT_SECRET,
+    SIGNING_SALT: process.env.SIGNING_SALT
+};
+
+// Check for missing variables
+const missing = Object.entries(REQUIRED_ENV)
+    .filter(([key, value]) => !value)
+    .map(([key]) => key);
+
+if (missing.length > 0) {
+    console.error('');
+    console.error('🚨 '.repeat(20));
+    console.error('');
+    console.error('   ⛔ CRITICAL SECURITY ERROR ⛔');
+    console.error('');
+    console.error('   Missing required environment variables:');
+    console.error('');
+    missing.forEach(key => {
+        console.error(`   ❌ ${key}`);
+    });
+    console.error('');
+    console.error('   ⚠️  SERVER CANNOT START WITHOUT THESE!');
+    console.error('   ⚠️  NO DEFAULT CREDENTIALS ARE ALLOWED!');
+    console.error('');
+    console.error('   📝 Create a .env file with all required variables.');
+    console.error('   📝 Use the provided .env.example as a template.');
+    console.error('');
+    console.error('🚨 '.repeat(20));
+    console.error('');
+    process.exit(1);
+}
+
+// Validate password hash format
+if (!REQUIRED_ENV.MASTER_ADMIN_PASSWORD_HASH.startsWith('$2a$') && 
+    !REQUIRED_ENV.MASTER_ADMIN_PASSWORD_HASH.startsWith('$2b$')) {
+    console.error('');
+    console.error('🚨 INVALID PASSWORD HASH FORMAT!');
+    console.error('   MASTER_ADMIN_PASSWORD_HASH must be a bcrypt hash.');
+    console.error('');
+    console.error('   Generate one using:');
+    console.error('   node -e "console.log(require(\'bcryptjs\').hashSync(\'YOUR_PASSWORD\', 12))"');
+    console.error('');
+    process.exit(1);
+}
+
+// Validate secret lengths
+if (REQUIRED_ENV.SESSION_SECRET.length < 32) {
+    console.error('🚨 SESSION_SECRET must be at least 32 characters!');
+    process.exit(1);
+}
+
+if (REQUIRED_ENV.JWT_SECRET.length < 32) {
+    console.error('🚨 JWT_SECRET must be at least 32 characters!');
+    process.exit(1);
+}
+
+console.log('✅ All required environment variables present');
+console.log('✅ Password hash format valid');
+console.log('✅ Secret lengths valid');
+console.log('═'.repeat(60));
+console.log('');
+
+// ═══════════════════════════════════════════════════════════════════
+// 📦 IMPORTS (After validation)
 // ═══════════════════════════════════════════════════════════════════
 const constants = require('./config/constants');
 const { helmetConfig, init: initSecurity } = require('./middleware/security');
-const { startSessionCleanup } = require('./middleware/auth');
+const { startSessionCleanup } = require('./middleware/secureAuth');
 
 // Routes
 const masterAdminRoutes = require('./routes/masterAdmin');
@@ -29,14 +111,8 @@ app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 // ═══════════════════════════════════════════════════════════════════
 // 🛡️ SECURITY MIDDLEWARE
 // ═══════════════════════════════════════════════════════════════════
-// Use constants directly instead of getFullConfig()
-const config = constants;
-const security = initSecurity(config);
-
-// Helmet
+const security = initSecurity(constants);
 app.use(helmetConfig);
-
-// Main Security Middleware (DDoS, WAF, Rate Limiting, Bot Detection)
 app.use(security.middleware());
 
 // ═══════════════════════════════════════════════════════════════════
@@ -46,20 +122,23 @@ app.use(cors({
     origin: function(origin, callback) {
         const allowedOrigins = process.env.ALLOWED_ORIGINS 
             ? process.env.ALLOWED_ORIGINS.split(',') 
-            : ['*'];
+            : [];
         
-        if (allowedOrigins[0] === '*' || !origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
+        // In production, don't allow * or empty origins
+        if (process.env.NODE_ENV === 'production') {
+            if (!origin || !allowedOrigins.includes(origin)) {
+                return callback(new Error('Not allowed by CORS'));
+            }
         }
+        
+        callback(null, true);
     },
     credentials: true,
     optionsSuccessStatus: 200
 }));
 
 // ═══════════════════════════════════════════════════════════════════
-// 📝 BODY PARSER (with raw body for signature)
+// 📝 BODY PARSER
 // ═══════════════════════════════════════════════════════════════════
 app.use(express.json({ 
     limit: '2mb',
@@ -67,20 +146,32 @@ app.use(express.json({
         req.rawBody = buf.toString('utf8');
     }
 }));
-
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 // ═══════════════════════════════════════════════════════════════════
-// 📊 REQUEST LOGGER
+// 📊 SECURITY REQUEST LOGGER
 // ═══════════════════════════════════════════════════════════════════
 app.use((req, res, next) => {
     const startTime = Date.now();
     const ip = req.clientIP || req.ip;
     
+    // Log all admin attempts
+    if (req.path.includes('/admin/')) {
+        console.log(`🔒 Admin request: ${req.method} ${req.path} | IP: ${ip}`);
+    }
+    
     res.on('finish', () => {
         const duration = Date.now() - startTime;
+        
+        // Log slow requests and errors
         if (duration > 1000 || res.statusCode >= 400) {
-            console.log(`📊 ${req.method} ${req.path} | IP: ${ip} | Status: ${res.statusCode} | Time: ${duration}ms`);
+            const emoji = res.statusCode >= 400 ? '⚠️' : '📊';
+            console.log(`${emoji} ${req.method} ${req.path} | IP: ${ip} | Status: ${res.statusCode} | ${duration}ms`);
+        }
+        
+        // Log all auth failures
+        if (res.statusCode === 401 || res.statusCode === 403) {
+            console.log(`🚫 AUTH FAIL: ${req.method} ${req.path} | IP: ${ip} | Status: ${res.statusCode}`);
         }
     });
     
@@ -90,18 +181,10 @@ app.use((req, res, next) => {
 // ═══════════════════════════════════════════════════════════════════
 // 🛣️ ROUTES
 // ═══════════════════════════════════════════════════════════════════
-
-// Public Routes (Health, Server Time, Home)
 app.use('/api', publicRoutes);
 app.use('/', publicRoutes);
-
-// Mobile App Routes
 app.use('/api', mobileAppRoutes);
-
-// Master Admin Routes
 app.use('/api/admin', masterAdminRoutes);
-
-// Sub Admin Routes
 app.use('/api/sub', subAdminRoutes);
 
 // ═══════════════════════════════════════════════════════════════════
@@ -117,9 +200,15 @@ app.use('*', (req, res) => {
 
 app.use((err, req, res, next) => {
     console.error('Server error:', err.message);
+    
+    // Don't leak error details in production
+    const errorMessage = process.env.NODE_ENV === 'production' 
+        ? 'Internal server error' 
+        : err.message;
+    
     res.status(500).json({ 
         success: false, 
-        error: 'Internal server error', 
+        error: errorMessage, 
         code: 500 
     });
 });
@@ -135,20 +224,27 @@ startSessionCleanup();
 app.listen(PORT, () => {
     console.log('');
     console.log('═'.repeat(60));
-    console.log('🛡️  Secure Firebase Proxy v14.1');
+    console.log('🛡️  Secure Firebase Proxy v15.0');
     console.log('═'.repeat(60));
     console.log(`📡 Port: ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log('');
     console.log('🔐 SECURITY FEATURES:');
-    console.log('   ✅ HMAC-SHA256 Signature Verification');
-    console.log('   ✅ Timing-Safe Comparison');
-    console.log('   ✅ Nonce Replay Protection');
-    console.log('   ✅ WAF (SQL, XSS, NoSQL, XXE, SSTI)');
-    console.log('   ✅ DDoS Protection');
-    console.log('   ✅ Token Bucket Rate Limiting');
-    console.log('   ✅ Bot Detection');
+    console.log('   ✅ NO Default Credentials');
+    console.log('   ✅ Bcrypt Password Hashing');
+    console.log('   ✅ Secure Session Management');
+    console.log('   ✅ IP-Bound Sessions');
     console.log('   ✅ Brute Force Protection');
+    console.log('   ✅ Timing-Safe Comparisons');
+    console.log('   ✅ HMAC-SHA256 Signatures');
+    console.log('   ✅ WAF Protection');
+    console.log('   ✅ DDoS Protection');
+    console.log('   ✅ Rate Limiting');
+    if (process.env.MASTER_ADMIN_2FA_SECRET) {
+        console.log('   ✅ 2FA Enabled');
+    }
+    console.log('');
+    console.log('👤 Master Admin: Configured via Environment');
     console.log('');
     console.log('═'.repeat(60));
 });
@@ -156,16 +252,13 @@ app.listen(PORT, () => {
 // ═══════════════════════════════════════════════════════════════════
 // 🛑 GRACEFUL SHUTDOWN
 // ═══════════════════════════════════════════════════════════════════
-process.on('SIGTERM', () => {
-    console.log('🛑 SIGTERM received. Shutting down gracefully...');
+const shutdown = (signal) => {
+    console.log(`\n🛑 ${signal} received. Shutting down gracefully...`);
     security.destroy();
     process.exit(0);
-});
+};
 
-process.on('SIGINT', () => {
-    console.log('🛑 SIGINT received. Shutting down gracefully...');
-    security.destroy();
-    process.exit(0);
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 module.exports = app;
