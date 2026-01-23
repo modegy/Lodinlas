@@ -8,49 +8,18 @@ const { apiLimiter } = require('../middleware/security');
 const { formatDate, getClientIP } = require('../utils/helpers');
 
 // ═══════════════════════════════════════════
-// 📱 GET USER
+// ❌ إزالة GET USER (غير آمن)
 // ═══════════════════════════════════════════
-router.post('/getUser', verifySignature, authApp, apiLimiter, async (req, res) => {
-    try {
-        const { username } = req.body;
-
-        if (!username) {
-            return res.status(400).json(null);
-        }
-
-        const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
-        const response = await firebase.get(url);
-        const users = response.data || {};
-
-        if (Object.keys(users).length === 0) {
-            return res.json(null);
-        }
-
-        const userId = Object.keys(users)[0];
-        const user = users[userId];
-
-        res.json({
-            username: user.username,
-            password_hash: user.password_hash,
-            is_active: user.is_active !== false,
-            device_id: user.device_id || '',
-            expiry_date: formatDate(user.subscription_end),
-            subscription_end: user.subscription_end
-        });
-
-    } catch (error) {
-        console.error('Get user error:', error.message);
-        res.status(500).json(null);
-    }
-});
+// router.post('/getUser', ...) // تم حذفها لأنها ترسل password_hash
 
 // ═══════════════════════════════════════════
-// 📱 VERIFY ACCOUNT
+// ✅ VERIFY ACCOUNT - التحقق الآمن بـ bcrypt
 // ═══════════════════════════════════════════
 router.post('/verifyAccount', verifySignature, authApp, apiLimiter, async (req, res) => {
     try {
         const { username, password, deviceId } = req.body;
 
+        // التحقق من المدخلات
         if (!username || !password) {
             return res.status(400).json({
                 success: false,
@@ -59,33 +28,51 @@ router.post('/verifyAccount', verifySignature, authApp, apiLimiter, async (req, 
             });
         }
 
+        // جلب المستخدم من Firebase
         const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
         const response = await firebase.get(url);
         const users = response.data || {};
 
         if (Object.keys(users).length === 0) {
-            return res.json({ success: false, code: 1 });
+            return res.json({ success: false, code: 1 }); // المستخدم غير موجود
         }
 
         const userId = Object.keys(users)[0];
         const user = users[userId];
 
-        // ✅ استخدم verifyPassword
+        // ✅ التحقق من كلمة المرور باستخدام bcrypt
         if (!verifyPassword(password, user.password_hash)) {
-            return res.json({ success: false, code: 2 });
+            return res.json({ success: false, code: 2 }); // كلمة مرور خاطئة
         }
 
+        // التحقق من حالة الحساب
         if (!user.is_active) {
-            return res.json({ success: false, code: 3 });
+            return res.json({ success: false, code: 3 }); // الحساب غير مفعل
         }
 
+        // التحقق من Device ID
         if (user.device_id && user.device_id !== '' && user.device_id !== deviceId) {
-            return res.json({ success: false, code: 4 });
+            return res.json({ success: false, code: 4 }); // جهاز غير متطابق
         }
 
+        // التحقق من تاريخ الانتهاء
+        const now = Date.now();
+        if (!user.subscription_end) {
+            return res.json({ success: false, code: 5 }); // تاريخ الانتهاء غير موجود
+        }
+
+        if (user.subscription_end <= now) {
+            return res.json({ success: false, code: 7 }); // الاشتراك منتهي
+        }
+
+        // ✅ نجح التحقق - إرجاع البيانات الأساسية فقط
         res.json({
             success: true,
             username: user.username,
+            expiry_date: formatDate(user.subscription_end),
+            subscription_end: user.subscription_end,
+            is_active: user.is_active,
+            device_id: user.device_id || '',
             code: 200
         });
 
