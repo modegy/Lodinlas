@@ -16,6 +16,8 @@ const { formatDate, getClientIP } = require('../utils/helpers');
 // ✅ VERIFY ACCOUNT - التحقق الآمن بـ bcrypt
 // ═══════════════════════════════════════════
 router.post('/verifyAccount', verifySignature, authApp, apiLimiter, async (req, res) => {
+    console.log('📱 Verify Account Request:', req.body);
+    
     try {
         const { username, password, deviceId } = req.body;
 
