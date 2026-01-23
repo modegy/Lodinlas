@@ -2,50 +2,17 @@ const express = require('express');
 const router = express.Router();
 
 const { firebase, FB_KEY } = require('../config/database');
-const { authApp } = require('../middleware/auth');
+const { authApp, verifyPassword } = require('../middleware/auth');  // ✅ أضف verifyPassword
 const { verifySignature } = require('../middleware/signature');
 const { apiLimiter } = require('../middleware/security');
-const { hashPassword, formatDate, getClientIP } = require('../utils/helpers');
+const { formatDate, getClientIP } = require('../utils/helpers');  // ✅ احذف hashPassword
 
 // ═══════════════════════════════════════════
-// 📱 GET USER
+// 📱 GET USER - لا تغيير
 // ═══════════════════════════════════════════
-router.post('/getUser', verifySignature, authApp, apiLimiter, async (req, res) => {
-    try {
-        const { username } = req.body;
-
-        if (!username) {
-            return res.status(400).json(null);
-        }
-
-        const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
-        const response = await firebase.get(url);
-        const users = response.data || {};
-
-        if (Object.keys(users).length === 0) {
-            return res.json(null);
-        }
-
-        const userId = Object.keys(users)[0];
-        const user = users[userId];
-
-        res.json({
-            username: user.username,
-            password_hash: user.password_hash,
-            is_active: user.is_active !== false,
-            device_id: user.device_id || '',
-            expiry_date: formatDate(user.subscription_end),
-            subscription_end: user.subscription_end
-        });
-
-    } catch (error) {
-        console.error('Get user error:', error.message);
-        res.status(500).json(null);
-    }
-});
 
 // ═══════════════════════════════════════════
-// 📱 VERIFY ACCOUNT
+// 📱 VERIFY ACCOUNT - عدّل هنا
 // ═══════════════════════════════════════════
 router.post('/verifyAccount', verifySignature, authApp, apiLimiter, async (req, res) => {
     try {
@@ -59,7 +26,9 @@ router.post('/verifyAccount', verifySignature, authApp, apiLimiter, async (req, 
             });
         }
 
-        const passHash = hashPassword(password);
+        // ❌ احذف هذا:
+        // const passHash = hashPassword(password);
+        
         const url = `users.json?orderBy="username"&equalTo="${encodeURIComponent(username)}"&auth=${FB_KEY}`;
         const response = await firebase.get(url);
         const users = response.data || {};
@@ -71,7 +40,8 @@ router.post('/verifyAccount', verifySignature, authApp, apiLimiter, async (req, 
         const userId = Object.keys(users)[0];
         const user = users[userId];
 
-        if (user.password_hash !== passHash) {
+        // ✅ استخدم verifyPassword بدلاً من المقارنة المباشرة:
+        if (!verifyPassword(password, user.password_hash)) {
             return res.json({ success: false, code: 2 });
         }
 
@@ -98,6 +68,8 @@ router.post('/verifyAccount', verifySignature, authApp, apiLimiter, async (req, 
         });
     }
 });
+
+ 
 
 // ═══════════════════════════════════════════
 // 📱 UPDATE DEVICE
