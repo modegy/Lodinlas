@@ -1,31 +1,56 @@
-// config/constants.js - Constants v14.1 Fixed
+// config/constants.js - Secure Constants v15.0
+// ⚠️ NO DEFAULT CREDENTIALS - All from Environment Variables!
 'use strict';
 
 require('dotenv').config();
 
-// ═══════════════════════════════════════════
-// 🔐 إعدادات التوقيع الآمنة
-// ═══════════════════════════════════════════
-const SIGNING_SALT = process.env.SIGNING_SALT || 'SubAdminSecureSalt@2024!NoOneKnows';
+// ═══════════════════════════════════════════════════════════════════
+// 🔒 ENVIRONMENT VALIDATION
+// ═══════════════════════════════════════════════════════════════════
+const REQUIRED_ENV_VARS = [
+    'FIREBASE_URL',
+    'FIREBASE_KEY',
+    'MASTER_ADMIN_USERNAME',
+    'MASTER_ADMIN_PASSWORD_HASH',
+    'SESSION_SECRET',
+    'SIGNING_SALT'
+];
 
-// ═══════════════════════════════════════════
-// API Keys & Credentials
-// ═══════════════════════════════════════════
-const APP_API_KEY = process.env.APP_API_KEY || 'MySecureAppKey@2024#Firebase$';
+// Check on load
+const missingVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+    console.error('\n🚨 CRITICAL: Missing required environment variables:');
+    missingVars.forEach(v => console.error(`   ❌ ${v}`));
+    console.error('\n⚠️  Server will not function correctly!\n');
+}
 
-const ADMIN_CREDENTIALS = {
-    username: process.env.ADMIN_USERNAME || 'admin',
-    password: process.env.ADMIN_PASSWORD || 'Admin@123456'
-};
+// ═══════════════════════════════════════════════════════════════════
+// 🔐 SIGNING SALT (For Sub Admin API Signatures)
+// ═══════════════════════════════════════════════════════════════════
+const SIGNING_SALT = process.env.SIGNING_SALT;
 
-// ═══════════════════════════════════════════
-// 🔑 MASTER ADMIN TOKEN (اختياري - للوصول المباشر)
-// ═══════════════════════════════════════════
-const MASTER_ADMIN_TOKEN = process.env.MASTER_ADMIN_TOKEN || null;
+if (!SIGNING_SALT) {
+    console.error('🚨 SIGNING_SALT is required for API signature verification!');
+}
 
-// ═══════════════════════════════════════════
-// Signed Endpoints List
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// 📱 APP API KEY (For Mobile App)
+// ═══════════════════════════════════════════════════════════════════
+const APP_API_KEY = process.env.APP_API_KEY;
+
+if (!APP_API_KEY) {
+    console.warn('⚠️ APP_API_KEY not set - Mobile app authentication disabled');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ❌ NO DEFAULT ADMIN CREDENTIALS!
+// ═══════════════════════════════════════════════════════════════════
+// Master Admin credentials are ONLY read from environment in auth.js
+// NEVER define default credentials here!
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔐 SIGNED ENDPOINTS LIST
+// ═══════════════════════════════════════════════════════════════════
 const SIGNED_ENDPOINTS = [
     '/api/getUser',
     '/api/verifyAccount',
@@ -39,9 +64,9 @@ const SIGNED_ENDPOINTS = [
     '/api/sub/stats'
 ];
 
-// ═══════════════════════════════════════════
-// 🛡️ Security Configuration
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// 🛡️ SECURITY CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
 const SECURITY = {
     PROTECTION_LEVEL: process.env.PROTECTION_LEVEL || 'balanced',
     ENABLE_WAF: true,
@@ -65,7 +90,7 @@ const SECURITY = {
     
     BRUTE_FORCE: {
         MAX_ATTEMPTS: 5,
-        LOCKOUT_DURATION: 15 * 60 * 1000
+        LOCKOUT_DURATION: 30 * 60 * 1000 // 30 minutes
     }
 };
 
@@ -76,29 +101,34 @@ const DDOS = {
     IP_RPS: 10
 };
 
-// ═══════════════════════════════════════════
-// Session Storage (In-Memory)
-// ═══════════════════════════════════════════
-const adminSessions = new Map();
-const subAdminKeys = new Map();
-const loginAttempts = new Map();
-const requestTracker = new Map();
-const blockedIPs = new Set();
+// ═══════════════════════════════════════════════════════════════════
+// 💾 IN-MEMORY STORAGE
+// ═══════════════════════════════════════════════════════════════════
+const subAdminKeys = new Map();      // Sub Admin API keys cache
+const requestTracker = new Map();    // Request tracking
+const blockedIPs = new Set();        // Blocked IPs (security.js uses this)
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // 📦 EXPORT
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 module.exports = {
+    // Secrets (from env only)
     SIGNING_SALT,
     APP_API_KEY,
-    ADMIN_CREDENTIALS,
-    MASTER_ADMIN_TOKEN,  // ✅ أضفنا هذا
+    
+    // Signed endpoints
     SIGNED_ENDPOINTS,
+    
+    // Security config
     SECURITY,
     DDOS,
-    adminSessions,
+    
+    // In-memory stores
     subAdminKeys,
-    loginAttempts,
     requestTracker,
-    blockedIPs
+    blockedIPs,
+    
+    // Environment check helper
+    isConfigValid: () => missingVars.length === 0,
+    getMissingVars: () => missingVars
 };
