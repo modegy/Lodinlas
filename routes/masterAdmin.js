@@ -1,4 +1,4 @@
-// routes/masterAdmin.js - Master Admin Routes v14.2 Complete
+// routes/masterAdmin.js - Secure Master Admin Routes v2.0
 'use strict';
 
 const express = require('express');
@@ -6,106 +6,304 @@ const crypto = require('crypto');
 const router = express.Router();
 
 const { firebase, FB_KEY } = require('../config/database');
-const { ADMIN_CREDENTIALS, adminSessions } = require('../config/constants');
-const { authAdmin } = require('../middleware/auth');
-const { getInstance: getSecurityInstance } = require('../middleware/security');
-const { generateToken, hashPassword, formatDate, getClientIP } = require('../utils/helpers');
+const { 
+    verifyPassword, 
+    hashPassword,
+    isIPBlocked, 
+    getBlockedRemainingTime,
+    recordLoginAttempt, 
+    getRemainingAttempts,
+    createSession, 
+    destroySession,
+    authMaster,
+    getSecurityStats,
+    validatePasswordStrength
+} = require('../middleware/secureAuth');
+const { generateToken, formatDate, getClientIP } = require('../utils/helpers');
 
 // ═══════════════════════════════════════════════════════════════════
-// 🔐 LOGIN
+// 🔐 SECURE LOGIN - No Default Credentials!
 // ═══════════════════════════════════════════════════════════════════
 router.post('/login', async (req, res) => {
-    const security = getSecurityInstance();
+    const ip = req.clientIP || getClientIP(req);
+    const userAgent = req.headers['user-agent'] || 'unknown';
     
     try {
-        const { username, password } = req.body;
-        const ip = req.clientIP || getClientIP(req);
-
+        // 1. Check if IP is blocked
+        if (isIPBlocked(ip)) {
+            const remaining = getBlockedRemainingTime(ip);
+            console.log(`🚫 Blocked IP attempted login: ${ip}`);
+            return res.status(429).json({
+                success: false,
+                error: `تم حظر IP مؤقتاً. حاول بعد ${remaining} دقيقة`,
+                code: 'IP_BLOCKED',
+                retryAfter: remaining * 60
+            });
+        }
+        
+        const { username, password, totpCode, deviceFingerprint } = req.body;
+        
+        // 2. Validate input
         if (!username || !password) {
             return res.status(400).json({
                 success: false,
-                error: 'اسم المستخدم وكلمة المرور مطلوبان'
+                error: 'اسم المستخدم وكلمة المرور مطلوبان',
+                code: 'MISSING_CREDENTIALS'
             });
         }
-
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        const ADMIN_USERNAME = process.env.ADMIN_USERNAME || ADMIN_CREDENTIALS.username || 'admin';
-        const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || ADMIN_CREDENTIALS.password || 'admin123';
-
-        console.log('🔐 Login attempt:', username, 'from IP:', ip);
-
-        if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
-            if (security) security.recordLoginAttempt(ip, false);
-            console.log('❌ Login failed: Invalid credentials');
+        
+        // 3. Add delay to prevent timing attacks
+        await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 500));
+        
+        // 4. Get credentials from environment ONLY (no fallback!)
+        const MASTER_USERNAME = process.env.MASTER_ADMIN_USERNAME;
+        const MASTER_PASSWORD_HASH = process.env.MASTER_ADMIN_PASSWORD_HASH;
+        
+        // 5. Verify credentials exist (server should not start without them)
+        if (!MASTER_USERNAME || !MASTER_PASSWORD_HASH) {
+            console.error('🚨 CRITICAL: Admin credentials not configured!');
+            return res.status(500).json({
+                success: false,
+                error: 'خطأ في تكوين الخادم',
+                code: 'SERVER_CONFIG_ERROR'
+            });
+        }
+        
+        console.log(`🔐 Login attempt: ${username} from IP: ${ip}`);
+        
+        // 6. Verify username (timing-safe)
+        const usernameBuffer = Buffer.from(username.padEnd(100));
+        const expectedBuffer = Buffer.from(MASTER_USERNAME.padEnd(100));
+        const usernameValid = crypto.timingSafeEqual(usernameBuffer, expectedBuffer);
+        
+        // 7. Verify password with bcrypt
+        const passwordValid = verifyPassword(password, MASTER_PASSWORD_HASH);
+        
+        // 8. Both must be valid
+        if (!usernameValid || !passwordValid) {
+            recordLoginAttempt(ip, false);
+            const remaining = getRemainingAttempts(ip);
+            
+            console.log(`❌ Login failed: ${username} | Remaining attempts: ${remaining}`);
+            
             return res.status(401).json({
                 success: false,
-                error: 'اسم المستخدم أو كلمة المرور غير صحيحة'
+                error: 'اسم المستخدم أو كلمة المرور غير صحيحة',
+                code: 'INVALID_CREDENTIALS',
+                remainingAttempts: remaining
             });
         }
-
-        if (security) security.recordLoginAttempt(ip, true);
-
-        const sessionToken = generateToken();
-
-        adminSessions.set(sessionToken, {
-            username,
+        
+        // 9. Check 2FA if enabled
+        const is2FAEnabled = process.env.MASTER_ADMIN_2FA_SECRET;
+        if (is2FAEnabled) {
+            if (!totpCode) {
+                return res.status(200).json({
+                    success: false,
+                    requires2FA: true,
+                    message: 'أدخل رمز التحقق الثنائي',
+                    code: '2FA_REQUIRED'
+                });
+            }
+            
+            // Verify TOTP (simplified - use proper library in production)
+            const { verifyTOTP } = require('../middleware/secureAuth');
+            if (!verifyTOTP(is2FAEnabled, totpCode)) {
+                return res.status(401).json({
+                    success: false,
+                    error: 'رمز التحقق غير صحيح',
+                    code: 'INVALID_2FA'
+                });
+            }
+        }
+        
+        // 10. Success! Record and create session
+        recordLoginAttempt(ip, true);
+        
+        const sessionData = createSession(
+            'master_admin',
+            'master',
             ip,
-            createdAt: Date.now(),
-            userAgent: req.headers['user-agent']
-        });
-
-        console.log(`✅ Admin login successful: ${username} from ${ip}`);
-        console.log(`📝 Session created: ${sessionToken.substring(0, 20)}... | Total sessions: ${adminSessions.size}`);
-
+            userAgent,
+            deviceFingerprint
+        );
+        
+        // 11. Log successful login
+        console.log('═'.repeat(50));
+        console.log(`✅ MASTER ADMIN LOGIN SUCCESSFUL`);
+        console.log(`   User: ${username}`);
+        console.log(`   IP: ${ip}`);
+        console.log(`   Session: ${sessionData.sessionId.substring(0, 16)}...`);
+        console.log(`   Expires: ${new Date(sessionData.expiresAt).toISOString()}`);
+        console.log('═'.repeat(50));
+        
         return res.json({
             success: true,
-            sessionToken,
-            username,
             message: 'تم تسجيل الدخول بنجاح',
-            expiresIn: '24 hours'
+            sessionId: sessionData.sessionId,
+            sessionToken: sessionData.token,
+            expiresAt: sessionData.expiresAt,
+            expiresIn: sessionData.expiresIn,
+            user: {
+                username: username,
+                type: 'master',
+                permissions: ['full']
+            }
         });
-
+        
     } catch (error) {
         console.error('Login error:', error.message);
-        res.status(500).json({ success: false, error: 'خطأ في تسجيل الدخول' });
+        res.status(500).json({ 
+            success: false, 
+            error: 'خطأ في تسجيل الدخول',
+            code: 'LOGIN_ERROR'
+        });
     }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🚪 LOGOUT
+// 🚪 SECURE LOGOUT
 // ═══════════════════════════════════════════════════════════════════
-router.post('/logout', authAdmin, (req, res) => {
-    const sessionToken = req.headers['x-session-token'];
-    if (sessionToken) {
-        adminSessions.delete(sessionToken);
-        console.log('👋 Admin logged out');
+router.post('/logout', authMaster, (req, res) => {
+    const sessionId = req.sessionId;
+    
+    if (sessionId) {
+        destroySession(sessionId);
+        console.log(`👋 Master Admin logged out`);
     }
-    res.json({ success: true, message: 'تم تسجيل الخروج بنجاح' });
+    
+    res.json({ 
+        success: true, 
+        message: 'تم تسجيل الخروج بنجاح' 
+    });
 });
 
 // ═══════════════════════════════════════════════════════════════════
 // ✅ VERIFY SESSION
 // ═══════════════════════════════════════════════════════════════════
-router.get('/verify-session', authAdmin, (req, res) => {
-    const sessionToken = req.headers['x-session-token'];
-    const session = adminSessions.get(sessionToken);
-
+router.get('/verify-session', authMaster, (req, res) => {
+    const session = req.session;
+    
     res.json({
         success: true,
+        valid: true,
         session: {
-            username: session?.username || req.adminUser,
-            expires_in: session ? Math.floor((24 * 60 * 60 * 1000 - (Date.now() - session.createdAt)) / 1000 / 60) + ' دقيقة' : 'N/A'
+            userId: session.userId,
+            userType: session.userType,
+            createdAt: session.createdAt,
+            expiresAt: session.expiresAt,
+            remainingTime: Math.floor((session.expiresAt - Date.now()) / 1000 / 60) + ' دقيقة'
         }
     });
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 👥 GET ALL USERS
+// 🔄 REFRESH SESSION (Extend expiry)
 // ═══════════════════════════════════════════════════════════════════
-router.get('/users', authAdmin, async (req, res) => {
+router.post('/refresh-session', authMaster, (req, res) => {
+    const ip = req.clientIP || getClientIP(req);
+    const userAgent = req.headers['user-agent'];
+    const { deviceFingerprint } = req.body;
+    
+    // Destroy old session
+    destroySession(req.sessionId);
+    
+    // Create new session
+    const newSession = createSession(
+        req.session.userId,
+        'master',
+        ip,
+        userAgent,
+        deviceFingerprint
+    );
+    
+    res.json({
+        success: true,
+        message: 'تم تجديد الجلسة',
+        sessionId: newSession.sessionId,
+        sessionToken: newSession.token,
+        expiresAt: newSession.expiresAt
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔐 CHANGE PASSWORD
+// ═══════════════════════════════════════════════════════════════════
+router.post('/change-password', authMaster, async (req, res) => {
     try {
-        console.log('📥 Fetching users...');
+        const { currentPassword, newPassword, confirmPassword } = req.body;
+        
+        // Validate input
+        if (!currentPassword || !newPassword || !confirmPassword) {
+            return res.status(400).json({
+                success: false,
+                error: 'جميع الحقول مطلوبة'
+            });
+        }
+        
+        if (newPassword !== confirmPassword) {
+            return res.status(400).json({
+                success: false,
+                error: 'كلمة المرور الجديدة غير متطابقة'
+            });
+        }
+        
+        // Validate password strength
+        const validation = validatePasswordStrength(newPassword);
+        if (!validation.valid) {
+            return res.status(400).json({
+                success: false,
+                error: 'كلمة المرور ضعيفة',
+                requirements: validation.errors
+            });
+        }
+        
+        // Verify current password
+        const currentHash = process.env.MASTER_ADMIN_PASSWORD_HASH;
+        if (!verifyPassword(currentPassword, currentHash)) {
+            return res.status(401).json({
+                success: false,
+                error: 'كلمة المرور الحالية غير صحيحة'
+            });
+        }
+        
+        // Generate new hash
+        const newHash = hashPassword(newPassword);
+        
+        // In production, you would update this in a secure config store
+        // For now, we'll just return the new hash for manual update
+        console.log('🔐 Password change requested');
+        console.log('   New hash (update in .env):');
+        console.log(`   MASTER_ADMIN_PASSWORD_HASH=${newHash}`);
+        
+        res.json({
+            success: true,
+            message: 'تم إنشاء كلمة المرور الجديدة',
+            newHash: newHash,
+            instruction: 'قم بتحديث MASTER_ADMIN_PASSWORD_HASH في ملف .env ثم أعد تشغيل الخادم'
+        });
+        
+    } catch (error) {
+        console.error('Change password error:', error.message);
+        res.status(500).json({ success: false, error: 'خطأ في تغيير كلمة المرور' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 📊 SECURITY STATS (Master Only)
+// ═══════════════════════════════════════════════════════════════════
+router.get('/security-stats', authMaster, (req, res) => {
+    const stats = getSecurityStats();
+    res.json({ success: true, stats });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 👥 USER MANAGEMENT (Existing routes with authMaster)
+// ═══════════════════════════════════════════════════════════════════
+
+// GET ALL USERS
+router.get('/users', authMaster, async (req, res) => {
+    try {
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
 
@@ -121,31 +319,23 @@ router.get('/users', authAdmin, async (req, res) => {
                 last_login: user.last_login || null,
                 device_id: user.device_id || '',
                 device_info: user.device_model ? `${user.device_brand || ''} ${user.device_model}` : '',
-                device_type: user.device_type || '',
-                ip_address: user.ip_address || '',
                 login_count: user.login_count || 0,
                 max_devices: user.max_devices || 1,
                 created_by_key: user.created_by_key || 'master'
             };
         }
 
-        console.log(`✅ Loaded ${Object.keys(formattedUsers).length} users`);
         res.json({ success: true, data: formattedUsers, count: Object.keys(formattedUsers).length });
-
     } catch (error) {
         console.error('Get users error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في جلب المستخدمين' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// ➕ CREATE USER
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users', authAdmin, async (req, res) => {
+// CREATE USER
+router.post('/users', authMaster, async (req, res) => {
     try {
         const { username, password, expiryMinutes, customExpiryDate, maxDevices, status } = req.body;
-
-        console.log('📝 Creating user:', { username, expiryMinutes, maxDevices, status });
 
         if (!username || !password) {
             return res.status(400).json({ success: false, error: 'اسم المستخدم وكلمة المرور مطلوبان' });
@@ -176,30 +366,25 @@ router.post('/users', authAdmin, async (req, res) => {
             max_devices: maxDevices || 1,
             device_id: '',
             created_at: Date.now(),
-            last_login: null,
-            created_by_key: 'master'
+            created_by: req.session.userId
         };
 
         const createRes = await firebase.post(`users.json?auth=${FB_KEY}`, userData);
-        console.log(`✅ User created: ${username} -> ID: ${createRes.data.name}`);
-
+        
         res.json({ 
             success: true, 
             message: 'تم إنشاء المستخدم بنجاح', 
             userId: createRes.data.name,
             expiryDate: formatDate(expiryTimestamp)
         });
-
     } catch (error) {
         console.error('Create user error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في إنشاء المستخدم' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// ✏️ UPDATE USER
-// ═══════════════════════════════════════════════════════════════════
-router.patch('/users/:id', authAdmin, async (req, res) => {
+// UPDATE USER
+router.patch('/users/:id', authMaster, async (req, res) => {
     try {
         const { is_active, max_devices, notes } = req.body;
         const updateData = {};
@@ -209,226 +394,92 @@ router.patch('/users/:id', authAdmin, async (req, res) => {
         if (notes !== undefined) updateData.notes = notes;
 
         await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, updateData);
-        console.log(`✅ User updated: ${req.params.id}`);
         res.json({ success: true, message: 'تم تحديث المستخدم بنجاح' });
-
     } catch (error) {
-        console.error('Update user error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في تحديث المستخدم' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 🗑️ DELETE USER
-// ═══════════════════════════════════════════════════════════════════
-router.delete('/users/:id', authAdmin, async (req, res) => {
+// DELETE USER
+router.delete('/users/:id', authMaster, async (req, res) => {
     try {
         await firebase.delete(`users/${req.params.id}.json?auth=${FB_KEY}`);
-        console.log(`🗑️ User deleted: ${req.params.id}`);
         res.json({ success: true, message: 'تم حذف المستخدم بنجاح' });
-
     } catch (error) {
-        console.error('Delete user error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في حذف المستخدم' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// ⏰ EXTEND USER SUBSCRIPTION
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users/:id/extend', authAdmin, async (req, res) => {
+// EXTEND SUBSCRIPTION
+router.post('/users/:id/extend', authMaster, async (req, res) => {
     try {
-        const { minutes, days, hours } = req.body;
+        const { minutes } = req.body;
         const userRes = await firebase.get(`users/${req.params.id}.json?auth=${FB_KEY}`);
 
         if (!userRes.data) {
             return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
         }
 
-        const user = userRes.data;
         const now = Date.now();
-        const currentEnd = user.subscription_end || now;
-
-        let extensionMs = 0;
-        if (minutes) extensionMs = minutes * 60 * 1000;
-        else if (days || hours) extensionMs = ((days || 0) * 24 * 60 * 60 * 1000) + ((hours || 0) * 60 * 60 * 1000);
-
-        if (!extensionMs) {
-            return res.status(400).json({ success: false, error: 'يجب تحديد مدة التمديد' });
-        }
-
-        const newEndDate = (currentEnd > now ? currentEnd : now) + extensionMs;
+        const currentEnd = userRes.data.subscription_end || now;
+        const newEndDate = (currentEnd > now ? currentEnd : now) + (minutes * 60 * 1000);
 
         await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, {
             subscription_end: newEndDate,
             is_active: true
         });
 
-        console.log(`⏰ User extended: ${req.params.id}`);
-        res.json({ success: true, message: 'تم تمديد الاشتراك بنجاح', new_end_date: newEndDate });
-
+        res.json({ success: true, message: 'تم تمديد الاشتراك', new_end_date: newEndDate });
     } catch (error) {
-        console.error('Extend subscription error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في تمديد الاشتراك' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 🔄 RESET USER DEVICE
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users/:id/reset-device', authAdmin, async (req, res) => {
+// RESET DEVICE
+router.post('/users/:id/reset-device', authMaster, async (req, res) => {
     try {
         await firebase.patch(`users/${req.params.id}.json?auth=${FB_KEY}`, { device_id: '' });
-        console.log(`🔄 Device reset: ${req.params.id}`);
-        res.json({ success: true, message: 'تم إعادة تعيين الجهاز بنجاح' });
-
+        res.json({ success: true, message: 'تم إعادة تعيين الجهاز' });
     } catch (error) {
-        console.error('Reset device error:', error.message);
         res.status(500).json({ success: false, error: 'فشل في إعادة تعيين الجهاز' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 🗑️ DELETE EXPIRED USERS
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users/delete-expired', authAdmin, async (req, res) => {
+// DELETE EXPIRED
+router.post('/users/delete-expired', authMaster, async (req, res) => {
     try {
-        console.log('🗑️ Deleting expired users...');
         const response = await firebase.get(`users.json?auth=${FB_KEY}`);
         const users = response.data || {};
         const now = Date.now();
-
         const deletePromises = [];
-        const deletedUsers = [];
 
         for (const [id, user] of Object.entries(users)) {
             if (user.subscription_end && user.subscription_end <= now) {
                 deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
-                deletedUsers.push(user.username || id);
             }
-        }
-
-        if (deletePromises.length === 0) {
-            return res.json({ success: true, message: 'لا توجد حسابات منتهية', count: 0 });
         }
 
         await Promise.all(deletePromises);
-        console.log(`🗑️ Deleted ${deletedUsers.length} expired users`);
-
-        res.json({ success: true, message: `تم حذف ${deletedUsers.length} حساب منتهي`, count: deletedUsers.length });
-
+        res.json({ success: true, message: `تم حذف ${deletePromises.length} مستخدم`, count: deletePromises.length });
     } catch (error) {
-        console.error('Delete expired error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في حذف الحسابات المنتهية' });
+        res.status(500).json({ success: false, error: 'فشل في الحذف' });
     }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// ⏸️ BULK DISABLE EXPIRED USERS (NEW!)
+// 🔑 API KEYS MANAGEMENT (with authMaster)
 // ═══════════════════════════════════════════════════════════════════
-router.post('/users/bulk-disable-expired', authAdmin, async (req, res) => {
+router.get('/api-keys', authMaster, async (req, res) => {
     try {
-        console.log('⏸️ Disabling expired users...');
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-        const now = Date.now();
-
-        const updatePromises = [];
-        const disabledUsers = [];
-
-        for (const [id, user] of Object.entries(users)) {
-            if (user.subscription_end && user.subscription_end <= now && user.is_active !== false) {
-                updatePromises.push(firebase.patch(`users/${id}.json?auth=${FB_KEY}`, { is_active: false }));
-                disabledUsers.push(user.username || id);
-            }
-        }
-
-        if (updatePromises.length === 0) {
-            return res.json({ success: true, message: 'لا يوجد مستخدمين منتهيين نشطين', count: 0 });
-        }
-
-        await Promise.all(updatePromises);
-        console.log(`⏸️ Disabled ${disabledUsers.length} expired users`);
-
-        res.json({ success: true, message: `تم تعطيل ${disabledUsers.length} مستخدم منتهي`, count: disabledUsers.length });
-
-    } catch (error) {
-        console.error('Bulk disable error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في تعطيل المستخدمين' });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 🗑️ DELETE INACTIVE USERS (NEW!)
-// ═══════════════════════════════════════════════════════════════════
-router.post('/users/delete-inactive', authAdmin, async (req, res) => {
-    try {
-        console.log('🗑️ Deleting inactive users...');
-        const response = await firebase.get(`users.json?auth=${FB_KEY}`);
-        const users = response.data || {};
-
-        const deletePromises = [];
-        const deletedUsers = [];
-
-        for (const [id, user] of Object.entries(users)) {
-            if (user.is_active === false) {
-                deletePromises.push(firebase.delete(`users/${id}.json?auth=${FB_KEY}`));
-                deletedUsers.push(user.username || id);
-            }
-        }
-
-        if (deletePromises.length === 0) {
-            return res.json({ success: true, message: 'لا يوجد مستخدمين معطلين', count: 0 });
-        }
-
-        await Promise.all(deletePromises);
-        console.log(`🗑️ Deleted ${deletedUsers.length} inactive users`);
-
-        res.json({ success: true, message: `تم حذف ${deletedUsers.length} مستخدم معطل`, count: deletedUsers.length });
-
-    } catch (error) {
-        console.error('Delete inactive error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في حذف المستخدمين المعطلين' });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 🔑 GET ALL API KEYS
-// ═══════════════════════════════════════════════════════════════════
-router.get('/api-keys', authAdmin, async (req, res) => {
-    try {
-        console.log('📥 Fetching API keys...');
         const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
         const keys = response.data || {};
-
-        const formattedKeys = {};
-        for (const [id, key] of Object.entries(keys)) {
-            formattedKeys[id] = {
-                api_key: key.api_key || '',
-                admin_name: key.admin_name || '',
-                permission_level: key.permission_level || 'view_only',
-                is_active: key.is_active !== false,
-                expiry_timestamp: key.expiry_timestamp || null,
-                usage_count: key.usage_count || 0,
-                bound_device: key.bound_device || null,
-                created_at: key.created_at || null,
-                last_used: key.last_used || null
-            };
-        }
-
-        console.log(`✅ Loaded ${Object.keys(formattedKeys).length} API keys`);
-        res.json({ success: true, data: formattedKeys, count: Object.keys(formattedKeys).length });
-
+        res.json({ success: true, data: keys, count: Object.keys(keys).length });
     } catch (error) {
-        console.error('Get API keys error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في جلب مفاتيح API' });
+        res.status(500).json({ success: false, error: 'فشل في جلب المفاتيح' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// ➕ CREATE API KEY
-// ═══════════════════════════════════════════════════════════════════
-router.post('/api-keys', authAdmin, async (req, res) => {
+router.post('/api-keys', authMaster, async (req, res) => {
     try {
         const { adminName, permissionLevel, expiryDays } = req.body;
 
@@ -444,110 +495,43 @@ router.post('/api-keys', authAdmin, async (req, res) => {
             admin_name: adminName,
             permission_level: permissionLevel || 'view_only',
             is_active: true,
-            expiry_timestamp: Date.now() + ((expiryDays || 30) * 24 * 60 * 60 * 1000),
-            usage_count: 0,
-            bound_device: null,
+            expiry_timestamp: expiryDays ? Date.now() + (expiryDays * 86400000) : null,
             created_at: Date.now(),
-            last_used: null,
-            signing_secret: signingSecret
+            signing_secret: signingSecret,
+            created_by: req.session.userId
         };
 
         await firebase.post(`api_keys.json?auth=${FB_KEY}`, keyData);
-        console.log(`🔑 API Key created for: ${adminName}`);
-
+        
         res.json({
             success: true,
-            message: 'تم إنشاء مفتاح API بنجاح',
+            message: 'تم إنشاء المفتاح',
             apiKey,
             signingSecret,
-            warning: 'احفظ الـ signing secret فوراً.'
+            warning: 'احفظ signing secret فوراً!'
         });
-
     } catch (error) {
-        console.error('Create API key error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في إنشاء مفتاح API' });
+        res.status(500).json({ success: false, error: 'فشل في إنشاء المفتاح' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// ✏️ UPDATE API KEY (Toggle Status)
-// ═══════════════════════════════════════════════════════════════════
-router.patch('/api-keys/:id', authAdmin, async (req, res) => {
+router.patch('/api-keys/:id', authMaster, async (req, res) => {
     try {
         const { is_active } = req.body;
         await firebase.patch(`api_keys/${req.params.id}.json?auth=${FB_KEY}`, { is_active });
-        console.log(`🔑 API Key ${req.params.id} -> is_active: ${is_active}`);
-        res.json({ success: true, message: 'تم تحديث مفتاح API بنجاح' });
-
+        res.json({ success: true, message: 'تم التحديث' });
     } catch (error) {
-        console.error('Update API key error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في تحديث مفتاح API' });
+        res.status(500).json({ success: false, error: 'فشل في التحديث' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 🗑️ DELETE API KEY
-// ═══════════════════════════════════════════════════════════════════
-router.delete('/api-keys/:id', authAdmin, async (req, res) => {
+router.delete('/api-keys/:id', authMaster, async (req, res) => {
     try {
         await firebase.delete(`api_keys/${req.params.id}.json?auth=${FB_KEY}`);
-        console.log(`🗑️ API Key deleted: ${req.params.id}`);
-        res.json({ success: true, message: 'تم حذف مفتاح API بنجاح' });
-
+        res.json({ success: true, message: 'تم الحذف' });
     } catch (error) {
-        console.error('Delete API key error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في حذف مفتاح API' });
+        res.status(500).json({ success: false, error: 'فشل في الحذف' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 🗑️ DELETE EXPIRED API KEYS (NEW!)
-// ═══════════════════════════════════════════════════════════════════
-router.post('/api-keys/delete-expired', authAdmin, async (req, res) => {
-    try {
-        console.log('🗑️ Deleting expired API keys...');
-        const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
-        const keys = response.data || {};
-        const now = Date.now();
-
-        const deletePromises = [];
-        const deletedKeys = [];
-
-        for (const [id, key] of Object.entries(keys)) {
-            if (key.expiry_timestamp && key.expiry_timestamp <= now) {
-                deletePromises.push(firebase.delete(`api_keys/${id}.json?auth=${FB_KEY}`));
-                deletedKeys.push(key.admin_name || id);
-            }
-        }
-
-        if (deletePromises.length === 0) {
-            return res.json({ success: true, message: 'لا توجد مفاتيح منتهية', count: 0 });
-        }
-
-        await Promise.all(deletePromises);
-        console.log(`🗑️ Deleted ${deletedKeys.length} expired API keys`);
-
-        res.json({ success: true, message: `تم حذف ${deletedKeys.length} مفتاح منتهي`, count: deletedKeys.length });
-
-    } catch (error) {
-        console.error('Delete expired API keys error:', error.message);
-        res.status(500).json({ success: false, error: 'فشل في حذف المفاتيح المنتهية' });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 📊 SECURITY STATS
-// ═══════════════════════════════════════════════════════════════════
-router.get('/security-stats', authAdmin, (req, res) => {
-    const security = getSecurityInstance();
-    if (security) {
-        res.json({ success: true, stats: security.getStats() });
-    } else {
-        res.json({ success: true, stats: { message: 'نظام الحماية غير مفعل' } });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 📦 EXPORT
-// ═══════════════════════════════════════════════════════════════════
 module.exports = router;
