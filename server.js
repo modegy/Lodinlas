@@ -1,4 +1,4 @@
-// server.js - Secure Server v15.0
+// server.js - Secure Server v15.0 (Fixed)
 'use strict';
 
 const express = require('express');
@@ -15,17 +15,11 @@ console.log('═'.repeat(60));
 
 // Required environment variables - NO DEFAULTS ALLOWED!
 const REQUIRED_ENV = {
-    // Database
     FIREBASE_URL: process.env.FIREBASE_URL,
     FIREBASE_KEY: process.env.FIREBASE_KEY,
-    
-    // Master Admin Credentials
     MASTER_ADMIN_USERNAME: process.env.MASTER_ADMIN_USERNAME,
     MASTER_ADMIN_PASSWORD_HASH: process.env.MASTER_ADMIN_PASSWORD_HASH,
-    
-    // Security Secrets
     SESSION_SECRET: process.env.SESSION_SECRET,
-    JWT_SECRET: process.env.JWT_SECRET,
     SIGNING_SALT: process.env.SIGNING_SALT
 };
 
@@ -76,11 +70,6 @@ if (REQUIRED_ENV.SESSION_SECRET.length < 32) {
     process.exit(1);
 }
 
-if (REQUIRED_ENV.JWT_SECRET.length < 32) {
-    console.error('🚨 JWT_SECRET must be at least 32 characters!');
-    process.exit(1);
-}
-
 console.log('✅ All required environment variables present');
 console.log('✅ Password hash format valid');
 console.log('✅ Secret lengths valid');
@@ -92,7 +81,7 @@ console.log('');
 // ═══════════════════════════════════════════════════════════════════
 const constants = require('./config/constants');
 const { helmetConfig, init: initSecurity } = require('./middleware/security');
-const { startSessionCleanup } = require('./middleware/secureAuth');
+const { startSessionCleanup } = require('./middleware/auth'); // ✅ Fixed!
 
 // Routes
 const masterAdminRoutes = require('./routes/masterAdmin');
@@ -122,16 +111,13 @@ app.use(cors({
     origin: function(origin, callback) {
         const allowedOrigins = process.env.ALLOWED_ORIGINS 
             ? process.env.ALLOWED_ORIGINS.split(',') 
-            : [];
+            : ['*'];
         
-        // In production, don't allow * or empty origins
-        if (process.env.NODE_ENV === 'production') {
-            if (!origin || !allowedOrigins.includes(origin)) {
-                return callback(new Error('Not allowed by CORS'));
-            }
+        if (allowedOrigins[0] === '*' || !origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
         }
-        
-        callback(null, true);
     },
     credentials: true,
     optionsSuccessStatus: 200
@@ -201,7 +187,6 @@ app.use('*', (req, res) => {
 app.use((err, req, res, next) => {
     console.error('Server error:', err.message);
     
-    // Don't leak error details in production
     const errorMessage = process.env.NODE_ENV === 'production' 
         ? 'Internal server error' 
         : err.message;
@@ -240,9 +225,6 @@ app.listen(PORT, () => {
     console.log('   ✅ WAF Protection');
     console.log('   ✅ DDoS Protection');
     console.log('   ✅ Rate Limiting');
-    if (process.env.MASTER_ADMIN_2FA_SECRET) {
-        console.log('   ✅ 2FA Enabled');
-    }
     console.log('');
     console.log('👤 Master Admin: Configured via Environment');
     console.log('');
