@@ -81,7 +81,10 @@ console.log('');
 // ═══════════════════════════════════════════════════════════════════
 const constants = require('./config/constants');
 const { helmetConfig, init: initSecurity } = require('./middleware/security');
-const { startSessionCleanup } = require('./middleware/auth'); // ✅ Fixed!
+const { startSessionCleanup } = require('./middleware/auth');
+
+// ✅ تمت الإضافة بدون حذف أي شيء
+const { testNotifications } = require('./middleware/notifications');
 
 // Routes
 const masterAdminRoutes = require('./routes/masterAdmin');
@@ -141,7 +144,6 @@ app.use((req, res, next) => {
     const startTime = Date.now();
     const ip = req.clientIP || req.ip;
     
-    // Log all admin attempts
     if (req.path.includes('/admin/')) {
         console.log(`🔒 Admin request: ${req.method} ${req.path} | IP: ${ip}`);
     }
@@ -149,13 +151,11 @@ app.use((req, res, next) => {
     res.on('finish', () => {
         const duration = Date.now() - startTime;
         
-        // Log slow requests and errors
         if (duration > 1000 || res.statusCode >= 400) {
             const emoji = res.statusCode >= 400 ? '⚠️' : '📊';
             console.log(`${emoji} ${req.method} ${req.path} | IP: ${ip} | Status: ${res.statusCode} | ${duration}ms`);
         }
         
-        // Log all auth failures
         if (res.statusCode === 401 || res.statusCode === 403) {
             console.log(`🚫 AUTH FAIL: ${req.method} ${req.path} | IP: ${ip} | Status: ${res.statusCode}`);
         }
@@ -204,9 +204,9 @@ app.use((err, req, res, next) => {
 startSessionCleanup();
 
 // ═══════════════════════════════════════════════════════════════════
-// 🚀 START SERVER
+// 🚀 START SERVER (مع دمج اختبار الإشعارات)
 // ═══════════════════════════════════════════════════════════════════
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log('');
     console.log('═'.repeat(60));
     console.log('🛡️  Secure Firebase Proxy v15.0');
@@ -229,6 +229,16 @@ app.listen(PORT, () => {
     console.log('👤 Master Admin: Configured via Environment');
     console.log('');
     console.log('═'.repeat(60));
+
+    // 🔔 اختبار الإشعارات بعد تشغيل السيرفر
+    if (process.env.NODE_ENV === 'production') {
+        try {
+            await testNotifications();
+            console.log('🔔 Notifications test executed successfully');
+        } catch (err) {
+            console.error('❌ Notifications test failed:', err.message);
+        }
+    }
 });
 
 // ═══════════════════════════════════════════════════════════════════
