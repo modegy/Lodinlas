@@ -1,4 +1,4 @@
-// server.js - Secure Server v15.0 (Fixed)
+// server.js - Secure Server v16.0 (Complete with Control System)
 'use strict';
 
 const express = require('express');
@@ -83,8 +83,20 @@ const constants = require('./config/constants');
 const { helmetConfig, init: initSecurity } = require('./middleware/security');
 const { startSessionCleanup } = require('./middleware/auth');
 
-// ✅ تمت الإضافة بدون حذف أي شيء
+// ✅ Notifications & Telegram Bot
 const { testNotifications } = require('./middleware/notifications');
+const { 
+    handleTelegramUpdate, 
+    setupTelegramWebhook,
+    sendServerAlert 
+} = require('./middleware/telegramBot');
+
+// ✅ Admin Control System
+const { 
+    router: adminControlRouter, 
+    checkServerState,
+    addLog 
+} = require('./routes/adminControl');
 
 // Routes
 const masterAdminRoutes = require('./routes/masterAdmin');
@@ -138,7 +150,7 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 // ═══════════════════════════════════════════════════════════════════
-// 📊 SECURITY REQUEST LOGGER
+// 📊 SECURITY REQUEST LOGGER (محسّن مع addLog)
 // ═══════════════════════════════════════════════════════════════════
 app.use((req, res, next) => {
     const startTime = Date.now();
@@ -158,20 +170,65 @@ app.use((req, res, next) => {
         
         if (res.statusCode === 401 || res.statusCode === 403) {
             console.log(`🚫 AUTH FAIL: ${req.method} ${req.path} | IP: ${ip} | Status: ${res.statusCode}`);
+            
+            // إضافة للـ Log
+            addLog('AUTH_FAIL', `${req.method} ${req.path} - ${res.statusCode}`, {
+                ip,
+                path: req.path,
+                method: req.method
+            });
         }
+        
+        // تسجيل جميع الطلبات
+        addLog('REQUEST', `${req.method} ${req.path}`, {
+            ip,
+            status: res.statusCode,
+            duration: `${duration}ms`
+        });
     });
     
     next();
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛣️ ROUTES
+// 🛣️ ROUTES (بترتيب الأولوية)
 // ═══════════════════════════════════════════════════════════════════
+
+// 1. Health Check (بدون checkServerState)
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+// 2. Telegram Webhook (بدون checkServerState)
+app.post('/telegram/webhook', async (req, res) => {
+    try {
+        await handleTelegramUpdate(req.body);
+        res.sendStatus(200);
+    } catch (error) {
+        console.error('Telegram webhook error:', error);
+        res.sendStatus(500);
+    }
+});
+
+// 3. Admin Control Routes (بدون checkServerState - للتحكم بالسيرفر)
+app.use('/api/control', adminControlRouter);
+
+// 4. Public Routes (بدون checkServerState)
 app.use('/api', publicRoutes);
 app.use('/', publicRoutes);
-app.use('/api', mobileAppRoutes);
-app.use('/api/admin', masterAdminRoutes);
-app.use('/api/sub', subAdminRoutes);
+
+// 5. Mobile App Routes (مع checkServerState)
+app.use('/api', checkServerState, mobileAppRoutes);
+
+// 6. Master Admin Routes (مع checkServerState)
+app.use('/api/admin', checkServerState, masterAdminRoutes);
+
+// 7. Sub Admin Routes (مع checkServerState)
+app.use('/api/sub', checkServerState, subAdminRoutes);
 
 // ═══════════════════════════════════════════════════════════════════
 // ❌ ERROR HANDLERS
@@ -186,6 +243,12 @@ app.use('*', (req, res) => {
 
 app.use((err, req, res, next) => {
     console.error('Server error:', err.message);
+    
+    // تسجيل الأخطاء
+    addLog('ERROR', err.message, {
+        stack: err.stack,
+        path: req.path
+    });
     
     const errorMessage = process.env.NODE_ENV === 'production' 
         ? 'Internal server error' 
@@ -204,12 +267,12 @@ app.use((err, req, res, next) => {
 startSessionCleanup();
 
 // ═══════════════════════════════════════════════════════════════════
-// 🚀 START SERVER (مع دمج اختبار الإشعارات)
+// 🚀 START SERVER (مع النظام الكامل)
 // ═══════════════════════════════════════════════════════════════════
 app.listen(PORT, async () => {
     console.log('');
     console.log('═'.repeat(60));
-    console.log('🛡️  Secure Firebase Proxy v15.0');
+    console.log('🛡️  Secure Firebase Proxy v16.0');
     console.log('═'.repeat(60));
     console.log(`📡 Port: ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
@@ -226,31 +289,109 @@ app.listen(PORT, async () => {
     console.log('   ✅ DDoS Protection');
     console.log('   ✅ Rate Limiting');
     console.log('');
+    console.log('🎛️  CONTROL FEATURES:');
+    console.log('   ✅ Server Start/Stop Control');
+    console.log('   ✅ Maintenance Mode');
+    console.log('   ✅ IP Blocking Management');
+    console.log('   ✅ Cache Control');
+    console.log('   ✅ Live Logs Viewer');
+    console.log('   ✅ Telegram Bot Integration');
+    console.log('   ✅ Email & Telegram Alerts');
+    console.log('');
     console.log('👤 Master Admin: Configured via Environment');
     console.log('');
     console.log('═'.repeat(60));
 
-    // 🔔 اختبار الإشعارات بعد تشغيل السيرفر
+    // 🔔 Setup Telegram Webhook (Production only)
+    if (process.env.NODE_ENV === 'production' && process.env.RENDER_EXTERNAL_URL) {
+        try {
+            const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/telegram/webhook`;
+            await setupTelegramWebhook(webhookUrl);
+            console.log('✅ Telegram webhook configured:', webhookUrl);
+        } catch (error) {
+            console.error('⚠️ Telegram webhook setup failed:', error.message);
+        }
+    }
+
+    // 🔔 Test Notifications (Production only)
     if (process.env.NODE_ENV === 'production') {
         try {
             await testNotifications();
-            console.log('🔔 Notifications test executed successfully');
+            console.log('✅ Notifications test executed successfully');
         } catch (err) {
-            console.error('❌ Notifications test failed:', err.message);
+            console.error('⚠️ Notifications test failed:', err.message);
         }
     }
+
+    // 📢 Send Server Started Alert
+    try {
+        await sendServerAlert('SERVER_STARTED', {
+            port: PORT,
+            environment: process.env.NODE_ENV || 'development',
+            url: process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`,
+            version: '16.0'
+        });
+        console.log('✅ Server start notification sent');
+    } catch (error) {
+        console.log('⚠️ Could not send start notification');
+    }
+
+    console.log('');
+    console.log('🚀 Server is ready to accept connections!');
+    console.log('═'.repeat(60));
+    console.log('');
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🛑 GRACEFUL SHUTDOWN
+// 🛑 GRACEFUL SHUTDOWN (محسّن مع إشعارات)
 // ═══════════════════════════════════════════════════════════════════
-const shutdown = (signal) => {
+const shutdown = async (signal) => {
     console.log(`\n🛑 ${signal} received. Shutting down gracefully...`);
+    
+    try {
+        await sendServerAlert('SERVER_STOPPED', {
+            reason: signal,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.log('⚠️ Could not send shutdown notification');
+    }
+    
     security.destroy();
     process.exit(0);
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// ═══════════════════════════════════════════════════════════════════
+// 🚨 UNCAUGHT ERRORS (محسّن مع إشعارات)
+// ═══════════════════════════════════════════════════════════════════
+process.on('uncaughtException', async (error) => {
+    console.error('💥 Uncaught Exception:', error);
+    
+    try {
+        await sendServerAlert('SERVER_CRASHED', {
+            error: error.message,
+            stack: error.stack
+        });
+    } catch (e) {
+        console.log('⚠️ Could not send crash notification');
+    }
+    
+    process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+    console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+    
+    try {
+        await sendServerAlert('SERVER_ERROR', {
+            error: String(reason)
+        });
+    } catch (e) {
+        console.log('⚠️ Could not send error notification');
+    }
+});
 
 module.exports = app;
