@@ -1,22 +1,17 @@
-// middleware/security.js - Security Middleware v14.1
 'use strict';
 
 const crypto = require('crypto');
 const helmet = require('helmet');
+const redis = require('../config/redis'); // ✅ الصحيح
 
 class SecurityMiddleware {
     constructor(config) {
         this.config = config.SECURITY || {};
-        this.ddosConfig = config.SECURITY?.DDOS || config.DDOS || {};
-        this.bruteForceConfig = config.SECURITY?.BRUTE_FORCE || {};
-        this.wafConfig = config.SECURITY?.WAF || {};
-        
-        // Data stores
-        this.ipCache = new Map();
-        this.rateLimitStore = new Map();
-        this.blockedIPs = new Set();
-        this.requestCounts = new Map();
-        this.loginAttempts = new Map();
+        this.ddosConfig = this.config.DDOS || {};
+        this.bruteForceConfig = this.config.BRUTE_FORCE || {};
+        this.wafConfig = this.config.WAF || {};
+    }
+}
         
         // Statistics
         this.stats = {
@@ -27,6 +22,10 @@ class SecurityMiddleware {
             startTime: Date.now()
         };
         
+        // Redis client
+        this.client = redis.createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+        this.client.on('error', (err) => console.error('Redis Client Error', err));
+        
         // Periodic cleanup
         this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
         
@@ -35,6 +34,10 @@ class SecurityMiddleware {
         console.log(`   - WAF: ${this.config.ENABLE_WAF !== false ? '✅' : '❌'}`);
         console.log(`   - Rate Limiting: ${this.config.ENABLE_RATE_LIMIT !== false ? '✅' : '❌'}`);
         console.log(`   - Bot Detection: ${this.config.ENABLE_BOT_DETECTION !== false ? '✅' : '❌'}`);
+    }
+
+    async init() {
+        await this.client.connect();
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -52,7 +55,7 @@ class SecurityMiddleware {
                 this.stats.totalRequests++;
 
                 // 1. Check blocked IP
-                if (this.isBlocked(ip)) {
+                if (await this.isBlocked(ip)) {
                     this.stats.blockedRequests++;
                     return this.blockResponse(res, 'IP_BLOCKED', null, {
                         reason: 'Your IP has been temporarily blocked',
@@ -61,14 +64,14 @@ class SecurityMiddleware {
                 }
 
                 // 2. DDoS Protection
-                if (!this.checkDDoS(ip)) {
+                if (!await this.checkDDoS(ip)) {
                     this.stats.blockedRequests++;
                     return this.blockResponse(res, 'DDOS_DETECTED');
                 }
 
                 // 3. Rate Limiting
                 if (this.config.ENABLE_RATE_LIMIT !== false) {
-                    const rateLimitResult = this.checkRateLimit(ip, req.path);
+                    const rateLimitResult = await this.checkRateLimit(ip, req.path);
                     if (!rateLimitResult.allowed) {
                         this.stats.rateLimitBlocks++;
                         return this.blockResponse(res, 'RATE_LIMITED', rateLimitResult.retryAfter);
@@ -81,7 +84,7 @@ class SecurityMiddleware {
                     const wafResult = this.wafCheck(req);
                     if (!wafResult.safe) {
                         this.stats.wafBlocks++;
-                        this.recordViolation(ip, `WAF:${wafResult.reason}`);
+                        await this.recordViolation(ip, `WAF:${wafResult.reason}`);
                         return this.blockResponse(res, 'WAF_BLOCKED', null, {
                             reason: wafResult.reason
                         });
@@ -94,7 +97,7 @@ class SecurityMiddleware {
                     req.securityContext.botScore = botScore;
                     
                     if (botScore > (this.config.ANOMALY_THRESHOLD || 70)) {
-                        this.recordViolation(ip, 'HIGH_BOT_SCORE');
+                        await this.recordViolation(ip, 'HIGH_BOT_SCORE');
                     }
                 }
 
@@ -113,7 +116,7 @@ class SecurityMiddleware {
                 
             } catch (err) {
                 console.error('[Security] Middleware error:', err.message);
-                next();
+                return this.blockResponse(res, 'INTERNAL_ERROR');
             }
         };
     }
@@ -121,25 +124,32 @@ class SecurityMiddleware {
     // ═══════════════════════════════════════════════════════════════
     // 🚫 DDoS PROTECTION
     // ═══════════════════════════════════════════════════════════════
-    checkDDoS(ip) {
+    async checkDDoS(ip) {
         const now = Date.now();
         const windowMs = 60000;
         const maxRequests = this.ddosConfig.IP_RPS ? this.ddosConfig.IP_RPS * 60 : 
                            this.ddosConfig.MAX_REQUESTS_PER_MINUTE || 100;
         
         const key = `ddos:${ip}`;
-        let data = this.requestCounts.get(key) || { count: 0, windowStart: now };
+        let dataStr = await this.client.get(key);
+        let data;
+        try {
+            data = dataStr ? JSON.parse(dataStr) : { count: 0, windowStart: now };
+        } catch (e) {
+            console.error(`Error parsing DDoS data for ${ip}:`, e);
+            data = { count: 0, windowStart: now };
+        }
         
         if (now - data.windowStart > windowMs) {
             data = { count: 0, windowStart: now };
         }
         
         data.count++;
-        this.requestCounts.set(key, data);
+        await this.client.set(key, JSON.stringify(data), { EX: 120 }); // TTL 2 min
         
         if (data.count > maxRequests) {
             const blockDuration = this.ddosConfig.BLOCK_DURATION || 600000;
-            this.blockIP(ip, blockDuration);
+            await this.blockIP(ip, blockDuration);
             console.warn(`🚨 DDoS detected from ${ip}: ${data.count} requests/min`);
             return false;
         }
@@ -155,15 +165,22 @@ class SecurityMiddleware {
     // ═══════════════════════════════════════════════════════════════
     // ⏱️ RATE LIMITING (Token Bucket Algorithm)
     // ═══════════════════════════════════════════════════════════════
-    checkRateLimit(ip, path) {
+    async checkRateLimit(ip, path) {
         const limitType = this.getLimitType(path);
         const limits = this.config.RATE_LIMITS?.[limitType] || { capacity: 100, refill: 10 };
         const key = `rate:${ip}:${limitType}`;
         const now = Date.now();
 
-        let bucket = this.rateLimitStore.get(key);
-        
-        if (!bucket) {
+        let bucketStr = await this.client.get(key);
+        let bucket;
+        try {
+            bucket = bucketStr ? JSON.parse(bucketStr) : { 
+                tokens: limits.capacity, 
+                lastRefill: now,
+                totalRequests: 0
+            };
+        } catch (e) {
+            console.error(`Error parsing rate limit data for ${ip}:${limitType}:`, e);
             bucket = { 
                 tokens: limits.capacity, 
                 lastRefill: now,
@@ -179,7 +196,7 @@ class SecurityMiddleware {
 
         if (bucket.tokens >= 1) {
             bucket.tokens -= 1;
-            this.rateLimitStore.set(key, bucket);
+            await this.client.set(key, JSON.stringify(bucket), { EX: 300 }); // TTL 5 min
             return { 
                 allowed: true, 
                 remaining: Math.floor(bucket.tokens),
@@ -188,7 +205,7 @@ class SecurityMiddleware {
             };
         }
 
-        this.rateLimitStore.set(key, bucket);
+        await this.client.set(key, JSON.stringify(bucket), { EX: 300 });
         const retryAfter = Math.ceil((1 - bucket.tokens) / limits.refill);
         
         return { 
@@ -219,14 +236,20 @@ class SecurityMiddleware {
             return { safe: false, reason: 'URL_TOO_LONG' };
         }
 
-        const contentLength = parseInt(req.headers['content-length'] || 0);
+        const contentLength = parseInt(req.headers['content-length'] || '0', 10);
         const maxBodySize = this.wafConfig.MAX_BODY_SIZE || 1048576;
         if (contentLength > maxBodySize) {
             return { safe: false, reason: 'BODY_TOO_LARGE' };
         }
 
         // URL & Query Check
-        const urlToCheck = decodeURIComponent(req.url || '').toLowerCase();
+        let urlToCheck = '';
+        try {
+            urlToCheck = decodeURIComponent(req.url || '').toLowerCase();
+        } catch (e) {
+            console.warn(`⚠️ URL decode error: ${e.message}`);
+            return { safe: false, reason: 'INVALID_URL_ENCODING' };
+        }
         const queryString = JSON.stringify(req.query || {}).toLowerCase();
         
         const urlAttacks = [
@@ -237,12 +260,13 @@ class SecurityMiddleware {
             { pattern: /%0[ad]/i, name: 'CRLF_INJECTION' },
             { pattern: /\/(\.env|\.git|\.htaccess|wp-config|phpinfo)/i, name: 'SENSITIVE_FILE_ACCESS' },
             { pattern: /\/(etc\/passwd|proc\/self|windows\/system32)/i, name: 'SYSTEM_FILE_ACCESS' },
-            { pattern: /^(file|gopher|dict|php|data):\/\//i, name: 'PROTOCOL_ATTACK' }
+            { pattern: /^(file|gopher|dict|php|data):\/\//i, name: 'PROTOCOL_ATTACK' },
+            { pattern: /%25%35%33%25%34%33%25%34%43/i, name: 'ENCODED_SQLI' }
         ];
 
         for (const attack of urlAttacks) {
             if (attack.pattern.test(urlToCheck) || attack.pattern.test(queryString)) {
-                console.warn(`🚨 WAF [URL]: ${attack.name} | IP: ${req.clientIP || req.ip} | Path: ${currentPath}`);
+                console.warn(`🚨 WAF [URL]: ${attack.name} | IP: ${crypto.createHash('sha256').update(req.clientIP || req.ip).digest('hex')} | Path: ${currentPath}`);
                 return { safe: false, reason: attack.name };
             }
         }
@@ -265,12 +289,13 @@ class SecurityMiddleware {
             { pattern: /<!\[CDATA\[/gi, name: 'XXE_CDATA' },
             { pattern: /\{\{.*\}\}/g, name: 'SSTI_DOUBLE_BRACE' },
             { pattern: /<%.*%>/g, name: 'SSTI_ERB' },
-            { pattern: /\${[^}]+}/g, name: 'SSTI_DOLLAR' }
+            { pattern: /\${[^}]+}/g, name: 'SSTI_DOLLAR' },
+            { pattern: /%27%20or%201%3D1/i, name: 'ENCODED_SQLI' }
         ];
 
         for (const attack of bodyAttacks) {
             if (attack.pattern.test(bodyToCheck)) {
-                console.warn(`🚨 WAF [BODY]: ${attack.name} | IP: ${req.clientIP || req.ip} | Path: ${currentPath}`);
+                console.warn(`🚨 WAF [BODY]: ${attack.name} | IP: ${crypto.createHash('sha256').update(req.clientIP || req.ip).digest('hex')} | Path: ${currentPath}`);
                 return { safe: false, reason: attack.name };
             }
         }
@@ -287,7 +312,7 @@ class SecurityMiddleware {
         const headersToCheck = userAgent + ' ' + referer;
         for (const attack of headerAttacks) {
             if (attack.pattern.test(headersToCheck)) {
-                console.warn(`🚨 WAF [HEADER]: ${attack.name} | IP: ${req.clientIP || req.ip}`);
+                console.warn(`🚨 WAF [HEADER]: ${attack.name} | IP: ${crypto.createHash('sha256').update(req.clientIP || req.ip).digest('hex')}`);
                 return { safe: false, reason: attack.name };
             }
         }
@@ -296,7 +321,14 @@ class SecurityMiddleware {
     }
 
     sanitizeBodyForCheck(body) {
-        if (!body || typeof body !== 'object') return '';
+        if (!body) return '';
+        let bodyStr = '';
+        try {
+            bodyStr = typeof body === 'object' ? JSON.stringify(body) : body.toString();
+        } catch (e) {
+            console.warn(`⚠️ Body stringify error: ${e.message}`);
+            return '';
+        }
         
         const sensitiveFields = [
             'password', 'passwd', 'pass', 'pwd',
@@ -306,17 +338,13 @@ class SecurityMiddleware {
             'private_key', 'secret_key'
         ];
         
-        const cleanBody = { ...body };
-        
+        let cleanBody = bodyStr;
         for (const field of sensitiveFields) {
-            for (const key of Object.keys(cleanBody)) {
-                if (key.toLowerCase().includes(field)) {
-                    delete cleanBody[key];
-                }
-            }
+            const regex = new RegExp(`"${field}":"[^"]*"`, 'gi');
+            cleanBody = cleanBody.replace(regex, `"${field}":"[REDACTED]`);
         }
         
-        return JSON.stringify(cleanBody).toLowerCase();
+        return cleanBody.toLowerCase();
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -376,42 +404,57 @@ class SecurityMiddleware {
     // 🔐 BRUTE FORCE PROTECTION
     // ═══════════════════════════════════════════════════════════════
     bruteForceProtection() {
-        return (req, res, next) => {
+        return async (req, res, next) => {
             const ip = this.getClientIP(req);
             const maxAttempts = this.bruteForceConfig.MAX_ATTEMPTS || 5;
             const lockoutDuration = this.bruteForceConfig.LOCKOUT_DURATION || 15 * 60 * 1000;
 
-            if (!this.loginAttempts.has(ip)) {
-                this.loginAttempts.set(ip, { count: 0, lastAttempt: Date.now() });
+            const key = `brute:login:${ip}`;
+            let attemptStr = await this.client.get(key);
+            let attempt;
+            try {
+                attempt = attemptStr ? JSON.parse(attemptStr) : { count: 0, lastAttempt: Date.now() };
+            } catch (e) {
+                console.error(`Error parsing brute force data for ${ip}:`, e);
+                attempt = { count: 0, lastAttempt: Date.now() };
             }
-
-            const attempt = this.loginAttempts.get(ip);
 
             if (Date.now() - attempt.lastAttempt > lockoutDuration) {
                 attempt.count = 0;
             }
 
             if (attempt.count >= maxAttempts) {
-                const remainingTime = Math.ceil((lockoutDuration - (Date.now() - attempt.lastAttempt)) / 1000 / 60);
+                const remainingTime = Math.ceil((lockoutDuration - (Date.now() - attempt.lastAttempt)) / 60000);
                 return res.status(429).json({
                     success: false,
                     error: `Too many attempts. Try again in ${remainingTime} minutes`
                 });
             }
 
+            attempt.lastAttempt = Date.now(); // Update lastAttempt even on check
+            await this.client.set(key, JSON.stringify(attempt), { EX: Math.ceil(lockoutDuration / 1000) });
+
             next();
         };
     }
 
-    recordLoginAttempt(ip, success) {
-        const attempt = this.loginAttempts.get(ip) || { count: 0, lastAttempt: Date.now() };
+    async recordLoginAttempt(ip, success) {
+        const key = `brute:login:${ip}`;
+        let attemptStr = await this.client.get(key);
+        let attempt;
+        try {
+            attempt = attemptStr ? JSON.parse(attemptStr) : { count: 0, lastAttempt: Date.now() };
+        } catch (e) {
+            console.error(`Error parsing brute force data for ${ip}:`, e);
+            attempt = { count: 0, lastAttempt: Date.now() };
+        }
         
         if (success) {
-            this.loginAttempts.delete(ip);
+            await this.client.del(key);
         } else {
             attempt.count++;
             attempt.lastAttempt = Date.now();
-            this.loginAttempts.set(ip, attempt);
+            await this.client.set(key, JSON.stringify(attempt));
         }
     }
 
@@ -421,42 +464,47 @@ class SecurityMiddleware {
     getClientIP(req) {
         return req.headers['cf-connecting-ip'] ||
                req.headers['x-real-ip'] ||
-               req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+               req.headers['x-forwarded-for']?.split(',').map(ip => ip.trim())[0] ||
                req.socket?.remoteAddress ||
                req.ip ||
                'unknown';
     }
 
-    isBlocked(ip) {
-        return this.blockedIPs.has(ip);
+    async isBlocked(ip) {
+        return (await this.client.exists(`block:${ip}`)) === 1;
     }
 
-    blockIP(ip, duration = 600000) {
-        this.blockedIPs.add(ip);
-        console.warn(`🚫 IP Blocked: ${ip} for ${duration/1000}s`);
-        
-        if (duration > 0) {
-            setTimeout(() => {
-                this.blockedIPs.delete(ip);
-                console.log(`✅ IP Unblocked: ${ip}`);
-            }, duration);
-        }
+    async blockIP(ip, duration = 600000) {
+        await this.client.set(`block:${ip}`, 'blocked', { EX: Math.ceil(duration / 1000) });
+        console.warn(`🚫 IP Blocked: ${crypto.createHash('sha256').update(ip).digest('hex')} for ${duration/1000}s`);
     }
 
-    unblockIP(ip) {
-        const deleted = this.blockedIPs.delete(ip);
+    async unblockIP(ip) {
+        const deleted = await this.client.del(`block:${ip}`);
         if (deleted) {
-            console.log(`✅ IP Manually Unblocked: ${ip}`);
+            console.log(`✅ IP Manually Unblocked: ${crypto.createHash('sha256').update(ip).digest('hex')}`);
         }
         return deleted;
     }
 
-    recordViolation(ip, reason) {
-        const cache = this.ipCache.get(ip) || { 
-            violations: 0, 
-            reasons: [],
-            firstSeen: Date.now()
-        };
+    async recordViolation(ip, reason) {
+        const key = `violation:${ip}`;
+        let cacheStr = await this.client.get(key);
+        let cache;
+        try {
+            cache = cacheStr ? JSON.parse(cacheStr) : { 
+                violations: 0, 
+                reasons: [],
+                firstSeen: Date.now()
+            };
+        } catch (e) {
+            console.error(`Error parsing violation data for ${ip}:`, e);
+            cache = { 
+                violations: 0, 
+                reasons: [],
+                firstSeen: Date.now()
+            };
+        }
         
         cache.violations++;
         cache.lastViolation = Date.now();
@@ -466,12 +514,12 @@ class SecurityMiddleware {
             cache.reasons = cache.reasons.slice(-10);
         }
         
-        this.ipCache.set(ip, cache);
+        await this.client.set(key, JSON.stringify(cache), { EX: 3600 });
 
         const softBlockViolations = this.config.SOFT_BLOCK_VIOLATIONS || 3;
         if (cache.violations >= softBlockViolations) {
             const blockDuration = this.ddosConfig.BLOCK_DURATION || 600000;
-            this.blockIP(ip, blockDuration);
+            await this.blockIP(ip, blockDuration);
         }
     }
 
@@ -489,7 +537,8 @@ class SecurityMiddleware {
             'DDOS_DETECTED': 429,
             'RATE_LIMITED': 429,
             'WAF_BLOCKED': 403,
-            'BOT_DETECTED': 403
+            'BOT_DETECTED': 403,
+            'INTERNAL_ERROR': 500
         };
         
         const status = statusCodes[reason] || 403;
@@ -515,43 +564,47 @@ class SecurityMiddleware {
             'DDOS_DETECTED': 'Too many requests detected. Please slow down.',
             'RATE_LIMITED': 'Rate limit exceeded. Please wait before making more requests.',
             'WAF_BLOCKED': 'Request blocked by security filter',
-            'BOT_DETECTED': 'Automated access detected and blocked'
+            'BOT_DETECTED': 'Automated access detected and blocked',
+            'INTERNAL_ERROR': 'Internal server error. Please try again later.'
         };
         return messages[reason] || 'Access denied';
     }
 
-    cleanup() {
+    async cleanup() {
         const now = Date.now();
         const cacheTTL = (this.config.IP_CACHE_TTL || 300) * 1000;
         let cleaned = 0;
 
-        for (const [ip, data] of this.ipCache) {
-            if (data.lastViolation && now - data.lastViolation > cacheTTL) {
-                this.ipCache.delete(ip);
-                cleaned++;
+        // Helper function to scan and clean keys
+        const scanAndClean = async (pattern, checkFn) => {
+            for await (const key of this.client.scanIterator({ MATCH: pattern })) {
+                let dataStr = await this.client.get(key);
+                let data;
+                try {
+                    data = dataStr ? JSON.parse(dataStr) : null;
+                } catch (e) {
+                    await this.client.del(key);
+                    cleaned++;
+                    continue;
+                }
+                if (data && checkFn(data, now)) {
+                    await this.client.del(key);
+                    cleaned++;
+                }
             }
-        }
+        };
 
-        for (const [key, bucket] of this.rateLimitStore) {
-            if (now - bucket.lastRefill > 300000) {
-                this.rateLimitStore.delete(key);
-                cleaned++;
-            }
-        }
+        // Cleanup violations
+        await scanAndClean('violation:*', (data, now) => data.lastViolation && now - data.lastViolation > cacheTTL);
 
-        for (const [key, data] of this.requestCounts) {
-            if (now - data.windowStart > 120000) {
-                this.requestCounts.delete(key);
-                cleaned++;
-            }
-        }
+        // Cleanup rates
+        await scanAndClean('rate:*', (data, now) => now - data.lastRefill > 300000);
 
-        for (const [ip, attempt] of this.loginAttempts) {
-            if (now - attempt.lastAttempt > 60 * 60 * 1000) {
-                this.loginAttempts.delete(ip);
-                cleaned++;
-            }
-        }
+        // Cleanup ddos
+        await scanAndClean('ddos:*', (data, now) => now - data.windowStart > 120000);
+
+        // Cleanup brute
+        await scanAndClean('brute:*', (data, now) => now - data.lastAttempt > 60 * 60 * 1000);
 
         if (cleaned > 0) {
             console.log(`🧹 Security cleanup: ${cleaned} entries removed`);
@@ -561,15 +614,19 @@ class SecurityMiddleware {
     // ═══════════════════════════════════════════════════════════════
     // 📊 STATS & MONITORING
     // ═══════════════════════════════════════════════════════════════
-    getStats() {
+    async getStats() {
         const uptime = Date.now() - this.stats.startTime;
+        const blockedIPs = [];
+        for await (const key of this.client.scanIterator({ MATCH: 'block:*' })) {
+            blockedIPs.push(key);
+        }
         return {
             ...this.stats,
             uptime: Math.floor(uptime / 1000),
-            blockedIPs: this.blockedIPs.size,
-            blockedIPsList: Array.from(this.blockedIPs).slice(0, 20),
-            cachedIPs: this.ipCache.size,
-            activeBuckets: this.rateLimitStore.size,
+            blockedIPs: blockedIPs.length,
+            blockedIPsList: blockedIPs.slice(0, 20).map(k => crypto.createHash('sha256').update(k.split(':')[1]).digest('hex')),
+            cachedIPs: 0, // Note: To count, would need another scan, but for stats, perhaps approximate or remove
+            activeBuckets: 0, // Similar note
             blockRate: this.stats.totalRequests > 0 
                 ? ((this.stats.blockedRequests / this.stats.totalRequests) * 100).toFixed(2) + '%'
                 : '0%'
@@ -580,6 +637,7 @@ class SecurityMiddleware {
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
         }
+        this.client.quit();
     }
 }
 
@@ -587,56 +645,16 @@ class SecurityMiddleware {
 // 📦 HELMET CONFIG
 // ═══════════════════════════════════════════════════════════════════
 const helmetConfig = helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false
-});
-// ═══════════════════════════════════════════════════════════════════
-// 🚦 SIMPLE RATE LIMITER (For compatibility)
-// ═══════════════════════════════════════════════════════════════════
-const simpleRateLimiter = new Map();
-
-const apiLimiter = (req, res, next) => {
-    const ip = req.headers['cf-connecting-ip'] ||
-               req.headers['x-real-ip'] ||
-               req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-               req.socket?.remoteAddress ||
-               req.ip ||
-               'unknown';
-    
-    const now = Date.now();
-    const windowMs = 15 * 60 * 1000; // 15 minutes
-    const maxRequests = 100;
-    
-    const key = `limiter:${ip}`;
-    let data = simpleRateLimiter.get(key) || { count: 0, windowStart: now };
-    
-    if (now - data.windowStart > windowMs) {
-        data = { count: 0, windowStart: now };
-    }
-    
-    data.count++;
-    simpleRateLimiter.set(key, data);
-    
-    if (data.count > maxRequests) {
-        return res.status(429).json({
-            success: false,
-            error: 'Too many requests, please try again later',
-            code: 429
-        });
-    }
-    
-    next();
-};
-
-// Cleanup every 5 minutes
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, data] of simpleRateLimiter) {
-        if (now - data.windowStart > 30 * 60 * 1000) {
-            simpleRateLimiter.delete(key);
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'"], // حسب الحاجة
+            // أضف directives أخرى
         }
-    }
-}, 5 * 60 * 1000);
+    },
+    crossOriginEmbedderPolicy: { policy: 'require-corp' }
+});
+
 // ═══════════════════════════════════════════════════════════════════
 // 📦 EXPORT
 // ═══════════════════════════════════════════════════════════════════
@@ -644,14 +662,13 @@ let instance = null;
 
 module.exports = {
     helmetConfig,
-    apiLimiter,  // أضف هذا السطر
-    init: (config) => {
+    init: async (config) => {
         if (!instance) {
             instance = new SecurityMiddleware(config);
+            await instance.init();
         }
         return instance;
     },
     getInstance: () => instance,
     SecurityMiddleware
 };
-
