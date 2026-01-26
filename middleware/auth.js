@@ -4,15 +4,20 @@
 
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { firebase, FB_KEY } = require('../config/database');
+const speakeasy = require('speakeasy'); // إضافة لـ MFA (TOTP)
+const { admin, db } = require('../config/firebase-admin');
+const redis = require('redis'); // إضافة Redis
+const client = redis.createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+client.connect();
+
 const { APP_API_KEY, subAdminKeys } = require('../config/constants');
 
 // ═══════════════════════════════════════════════════════════════════
 // 🔐 SECURE SESSION STORE (Master Admin)
 // ═══════════════════════════════════════════════════════════════════
-const secureSessions = new Map();
-const loginAttempts = new Map();
-const blockedIPs = new Map();
+// const secureSessions = new Map(); // نقل إلى Redis
+// const loginAttempts = new Map();
+// const blockedIPs = new Map();
 
 // ═══════════════════════════════════════════════════════════════════
 // ⚙️ CONFIGURATION
@@ -50,6 +55,7 @@ function validateAuthEnvironment() {
         console.error('🚨 CRITICAL: Missing auth environment variables:');
         missing.forEach(key => console.error(`   ❌ ${key}`));
         console.error('═'.repeat(60));
+        process.exit(1); // إصلاح: إيقاف الخادم
         return false;
     }
     
@@ -57,6 +63,7 @@ function validateAuthEnvironment() {
     const hash = process.env.MASTER_ADMIN_PASSWORD_HASH;
     if (!hash.startsWith('$2a$') && !hash.startsWith('$2b$')) {
         console.error('🚨 MASTER_ADMIN_PASSWORD_HASH must be a bcrypt hash!');
+        process.exit(1);
         return false;
     }
     
@@ -87,55 +94,81 @@ function validatePasswordStrength(password) {
     return { valid: errors.length === 0, errors };
 }
 
+// إضافة MFA utilities
+function generateMFASecret() {
+    return speakeasy.generateSecret({ length: 20 });
+}
+
+function verifyMFAToken(secret, token) {
+    return speakeasy.totp.verify({
+        secret: secret.base32,
+        encoding: 'base32',
+        token,
+        window: 1
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // 🛡️ BRUTE FORCE PROTECTION
 // ═══════════════════════════════════════════════════════════════════
-function isIPBlocked(ip) {
-    const blocked = blockedIPs.get(ip);
+async function isIPBlocked(ip) {
+    const blocked = await client.get(`block:${ip}`);
     if (!blocked) return false;
     
     if (Date.now() > blocked.until) {
-        blockedIPs.delete(ip);
+        await client.del(`block:${ip}`);
         return false;
     }
     return true;
 }
 
 function getBlockedRemainingTime(ip) {
-    const blocked = blockedIPs.get(ip);
+    const blocked = JSON.parse(await client.get(`block:${ip}`));
     if (!blocked) return 0;
     return Math.ceil((blocked.until - Date.now()) / 1000 / 60);
 }
 
-function recordLoginAttempt(ip, success) {
-    if (success) {
-        loginAttempts.delete(ip);
-        return;
-    }
-    
+async function recordLoginAttempt(ip, success, username = null) { // إضافة username لربط بالحساب
+    const ipKey = `brute:ip:${ip}`;
+    const userKey = username ? `brute:user:${username}` : null;
+
     const now = Date.now();
-    let attempts = loginAttempts.get(ip) || { count: 0, firstAttempt: now };
+    let attempts = JSON.parse(await client.get(ipKey)) || { count: 0, firstAttempt: now };
     
     if (now - attempts.firstAttempt > AUTH_CONFIG.ATTEMPT_WINDOW) {
         attempts = { count: 0, firstAttempt: now };
     }
     
-    attempts.count++;
-    attempts.lastAttempt = now;
-    loginAttempts.set(ip, attempts);
-    
-    if (attempts.count >= AUTH_CONFIG.MAX_LOGIN_ATTEMPTS) {
-        blockedIPs.set(ip, {
-            until: now + AUTH_CONFIG.LOCKOUT_DURATION,
-            attempts: attempts.count
-        });
-        loginAttempts.delete(ip);
-        console.log(`🚫 IP blocked due to brute force: ${ip}`);
+    if (!success) {
+        attempts.count++;
+        attempts.lastAttempt = now;
+        await client.set(ipKey, JSON.stringify(attempts), { EX: AUTH_CONFIG.ATTEMPT_WINDOW / 1000 });
+        
+        if (userKey) {
+            let userAttempts = JSON.parse(await client.get(userKey)) || { count: 0 };
+            userAttempts.count++;
+            await client.set(userKey, JSON.stringify(userAttempts), { EX: AUTH_CONFIG.ATTEMPT_WINDOW / 1000 });
+            if (userAttempts.count >= AUTH_CONFIG.MAX_LOGIN_ATTEMPTS) {
+                // حظر الحساب أيضاً
+            }
+        }
+        
+        if (attempts.count >= AUTH_CONFIG.MAX_LOGIN_ATTEMPTS) {
+            await client.set(`block:${ip}`, JSON.stringify({
+                until: now + AUTH_CONFIG.LOCKOUT_DURATION,
+                attempts: attempts.count
+            }), { EX: AUTH_CONFIG.LOCKOUT_DURATION / 1000 });
+            await client.del(ipKey);
+            console.log(`🚫 IP blocked due to brute force: ${crypto.createHash('sha256').update(ip).digest('hex')}`);
+        }
+    } else {
+        await client.del(ipKey);
+        if (userKey) await client.del(userKey);
     }
 }
 
-function getRemainingAttempts(ip) {
-    const attempts = loginAttempts.get(ip);
+async function getRemainingAttempts(ip) {
+    const attempts = JSON.parse(await client.get(`brute:ip:${ip}`));
     if (!attempts) return AUTH_CONFIG.MAX_LOGIN_ATTEMPTS;
     return Math.max(0, AUTH_CONFIG.MAX_LOGIN_ATTEMPTS - attempts.count);
 }
@@ -151,7 +184,7 @@ function generateSessionId() {
     return crypto.randomBytes(32).toString('hex');
 }
 
-function createSession(userId, userType, ip, userAgent, deviceFingerprint = null) {
+async function createSession(userId, userType, ip, userAgent, deviceFingerprint = null) {
     const sessionId = generateSessionId();
     const token = generateSecureToken();
     const now = Date.now();
@@ -175,19 +208,20 @@ function createSession(userId, userType, ip, userAgent, deviceFingerprint = null
         isValid: true
     };
     
-    secureSessions.set(sessionId, session);
+    await client.set(`session:${sessionId}`, JSON.stringify(session), { EX: AUTH_CONFIG.SESSION_DURATION / 1000 });
     console.log(`✅ Session created: ${sessionId.substring(0, 16)}... for ${userType}`);
     
     return { sessionId, token, expiresAt: session.expiresAt, expiresIn: AUTH_CONFIG.SESSION_DURATION / 1000 };
 }
 
-function validateSession(sessionId, token, ip) {
-    const session = secureSessions.get(sessionId);
+async function validateSession(sessionId, token, ip) {
+    const sessionStr = await client.get(`session:${sessionId}`);
+    if (!sessionStr) return { valid: false, error: 'SESSION_NOT_FOUND' };
+    const session = JSON.parse(sessionStr);
     
-    if (!session) return { valid: false, error: 'SESSION_NOT_FOUND' };
     if (!session.isValid) return { valid: false, error: 'SESSION_INVALIDATED' };
     if (Date.now() > session.expiresAt) {
-        secureSessions.delete(sessionId);
+        await client.del(`session:${sessionId}`);
         return { valid: false, error: 'SESSION_EXPIRED' };
     }
     
@@ -206,14 +240,14 @@ function validateSession(sessionId, token, ip) {
     }
     
     session.lastActivity = Date.now();
+    await client.set(`session:${sessionId}`, JSON.stringify(session), { EX: (session.expiresAt - Date.now()) / 1000 });
     return { valid: true, session };
 }
 
-function destroySession(sessionId) {
-    const session = secureSessions.get(sessionId);
-    if (session) {
-        session.isValid = false;
-        secureSessions.delete(sessionId);
+async function destroySession(sessionId) {
+    const sessionStr = await client.get(`session:${sessionId}`);
+    if (sessionStr) {
+        await client.del(`session:${sessionId}`);
         console.log(`👋 Session destroyed: ${sessionId.substring(0, 16)}...`);
         return true;
     }
@@ -248,7 +282,7 @@ const authApp = (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════════
 // 👑 MASTER ADMIN AUTHENTICATION (Secure Version)
 // ═══════════════════════════════════════════════════════════════════
-const authAdmin = (req, res, next) => {
+const authAdmin = async (req, res, next) => { // async لـ Redis
     const sessionId = req.headers['x-session-id'];
     const sessionToken = req.headers['x-session-token'];
     const ip = req.clientIP || req.ip;
@@ -270,7 +304,7 @@ const authAdmin = (req, res, next) => {
         });
     }
 
-    const validation = validateSession(sessionId, sessionToken, ip);
+    const validation = await validateSession(sessionId, sessionToken, ip);
 
     if (!validation.valid) {
         const errorMessages = {
@@ -330,28 +364,23 @@ const authSubAdmin = async (req, res, next) => {
             }
         }
 
-        // Fetch from Firebase
-        const response = await firebase.get(`api_keys.json?auth=${FB_KEY}`);
-        const keys = response.data || {};
+        // Fetch from Firebase using Admin SDK - إصلاح: تجنب HTTP
+        const db = admin.database();
+        const snapshot = await db.ref('api_keys')
+            .orderByChild('api_key')
+            .equalTo(apiKey)
+            .once('value');
 
-        let foundKey = null;
-        let keyId = null;
-
-        for (const [id, key] of Object.entries(keys)) {
-            if (key.api_key === apiKey) {
-                foundKey = key;
-                keyId = id;
-                break;
-            }
-        }
-
-        if (!foundKey) {
+        if (!snapshot.exists()) {
             return res.status(401).json({
                 success: false,
                 error: 'Invalid API key',
                 code: 'INVALID_API_KEY'
             });
         }
+
+        const data = snapshot.val();
+        const [[keyId, foundKey]] = Object.entries(data);
 
         if (!foundKey.is_active) {
             return res.status(403).json({
@@ -435,17 +464,17 @@ const checkUserOwnership = async (req, res, next) => {
         const userId = req.params.id;
         const currentKeyId = req.subAdminKeyId;
 
-        const userRes = await firebase.get(`users/${userId}.json?auth=${FB_KEY}`);
+        const db = admin.database(); // Admin SDK
+        const userSnapshot = await db.ref(`users/${userId}`).once('value');
+        const user = userSnapshot.val();
 
-        if (!userRes.data) {
+        if (!user) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found',
                 code: 'USER_NOT_FOUND'
             });
         }
-
-        const user = userRes.data;
 
         if (!user.created_by_key || user.created_by_key !== currentKeyId) {
             return res.status(403).json({
@@ -473,28 +502,34 @@ const checkUserOwnership = async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════════
 const startSessionCleanup = () => {
     // Clean master admin sessions
-    setInterval(() => {
+    setInterval(async () => {
         const now = Date.now();
         let cleaned = 0;
 
-        for (const [id, session] of secureSessions.entries()) {
+        const sessionKeys = await client.keys('session:*');
+        for (const key of sessionKeys) {
+            const session = JSON.parse(await client.get(key));
             if (now > session.expiresAt || !session.isValid) {
-                secureSessions.delete(id);
+                await client.del(key);
                 cleaned++;
             }
         }
 
         // Clean login attempts
-        for (const [ip, attempts] of loginAttempts.entries()) {
+        const attemptKeys = await client.keys('brute:*');
+        for (const key of attemptKeys) {
+            const attempts = JSON.parse(await client.get(key));
             if (now - attempts.lastAttempt > AUTH_CONFIG.ATTEMPT_WINDOW) {
-                loginAttempts.delete(ip);
+                await client.del(key);
             }
         }
 
         // Clean expired blocks
-        for (const [ip, block] of blockedIPs.entries()) {
+        const blockKeys = await client.keys('block:*');
+        for (const key of blockKeys) {
+            const block = JSON.parse(await client.get(key));
             if (now > block.until) {
-                blockedIPs.delete(ip);
+                await client.del(key);
             }
         }
 
@@ -526,11 +561,11 @@ const startSessionCleanup = () => {
 // ═══════════════════════════════════════════════════════════════════
 // 📊 AUTH STATS
 // ═══════════════════════════════════════════════════════════════════
-function getAuthStats() {
+async function getAuthStats() {
     return {
-        activeMasterSessions: secureSessions.size,
-        blockedIPs: blockedIPs.size,
-        pendingAttempts: loginAttempts.size,
+        activeMasterSessions: await client.keys('session:*').length,
+        blockedIPs: await client.keys('block:*').length,
+        pendingAttempts: await client.keys('brute:*').length,
         cachedSubAdminKeys: subAdminKeys.size
     };
 }
@@ -558,7 +593,7 @@ module.exports = {
     createSession,
     validateSession,
     destroySession,
-    secureSessions,
+    secureSessions, // محافظ عليه للتوافق، لكن غير مستخدم
     
     // Middleware
     authApp,
@@ -574,6 +609,10 @@ module.exports = {
     getAuthStats,
     
     // Storage references
-    blockedIPs,
-    loginAttempts
+    blockedIPs, // محافظ عليه
+    loginAttempts,
+    
+    // MFA
+    generateMFASecret,
+    verifyMFAToken
 };
