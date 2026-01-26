@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const helmet = require('helmet');
-const redis = require('../config/redis'); // ✅ الصحيح
+const redis = require('redis');
 
 class SecurityMiddleware {
     constructor(config) {
@@ -10,8 +10,6 @@ class SecurityMiddleware {
         this.ddosConfig = this.config.DDOS || {};
         this.bruteForceConfig = this.config.BRUTE_FORCE || {};
         this.wafConfig = this.config.WAF || {};
-    }
-}
         
         // Statistics
         this.stats = {
@@ -26,8 +24,8 @@ class SecurityMiddleware {
         this.client = redis.createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
         this.client.on('error', (err) => console.error('Redis Client Error', err));
         
-        // Periodic cleanup
-        this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
+        // Periodic cleanup - increased interval to 5 minutes for better performance
+        this.cleanupInterval = setInterval(() => this.cleanup(), 300000);
         
         console.log('🛡️ Security Middleware initialized');
         console.log(`   - Protection Level: ${this.config.PROTECTION_LEVEL || 'balanced'}`);
@@ -101,7 +99,7 @@ class SecurityMiddleware {
                     }
                 }
 
-                // 6. Add Security Headers
+                // 6. Add Security Headers (kept for custom headers; helmet handles others)
                 this.setSecurityHeaders(res);
 
                 // 7. Log slow requests
@@ -341,7 +339,7 @@ class SecurityMiddleware {
         let cleanBody = bodyStr;
         for (const field of sensitiveFields) {
             const regex = new RegExp(`"${field}":"[^"]*"`, 'gi');
-            cleanBody = cleanBody.replace(regex, `"${field}":"[REDACTED]`);
+            cleanBody = cleanBody.replace(regex, `"${field}":"[REDACTED]"`);
         }
         
         return cleanBody.toLowerCase();
@@ -625,8 +623,6 @@ class SecurityMiddleware {
             uptime: Math.floor(uptime / 1000),
             blockedIPs: blockedIPs.length,
             blockedIPsList: blockedIPs.slice(0, 20).map(k => crypto.createHash('sha256').update(k.split(':')[1]).digest('hex')),
-            cachedIPs: 0, // Note: To count, would need another scan, but for stats, perhaps approximate or remove
-            activeBuckets: 0, // Similar note
             blockRate: this.stats.totalRequests > 0 
                 ? ((this.stats.blockedRequests / this.stats.totalRequests) * 100).toFixed(2) + '%'
                 : '0%'
@@ -634,6 +630,7 @@ class SecurityMiddleware {
     }
 
     destroy() {
+        // WARNING: Call this only during graceful shutdown, not while handling requests
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
         }
