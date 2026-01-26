@@ -1,4 +1,3 @@
-
 // ═══════════════════════════════════════════════════════════════════════════
 // 🛡️ SECURE SERVER v17.0 - Complete Edition
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8,7 +7,11 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const { admin, db } = require('./config/firebase-admin');
 require('dotenv').config();
+const redis = require('redis'); // إضافة Redis لـ brute force و sessions إذا لزم
+const client = redis.createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+client.connect();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 🚨 SECURITY: VALIDATE ENVIRONMENT
@@ -23,12 +26,12 @@ const REQUIRED_ENV = {
     FIREBASE_KEY: process.env.FIREBASE_KEY,
     MASTER_ADMIN_USERNAME: process.env.MASTER_ADMIN_USERNAME,
     MASTER_ADMIN_PASSWORD_HASH: process.env.MASTER_ADMIN_PASSWORD_HASH,
-    SESSION_SECRET: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
-    ADMIN_CONTROL_TOKEN: process.env.ADMIN_CONTROL_TOKEN || 'master-admin-token'
+    SESSION_SECRET: process.env.SESSION_SECRET, // إصلاح: جعله إلزامي
+    ADMIN_CONTROL_TOKEN: process.env.ADMIN_CONTROL_TOKEN // إصلاح: جعله إلزامي
 };
 
 const missing = Object.entries(REQUIRED_ENV)
-    .filter(([key, value]) => !value && !['SESSION_SECRET', 'ADMIN_CONTROL_TOKEN'].includes(key))
+    .filter(([key, value]) => !value)
     .map(([key]) => key);
 
 if (missing.length > 0) {
@@ -45,24 +48,26 @@ console.log('═'.repeat(60));
 // ═══════════════════════════════════════════════════════════════════════════
 // 📦 FIREBASE SETUP
 // ═══════════════════════════════════════════════════════════════════════════
-const FIREBASE_URL = process.env.FIREBASE_URL;
-const FIREBASE_KEY = process.env.FIREBASE_KEY;
+// إصلاح: استخدام Admin SDK بدلاً من fetch للأمان
+const serviceAccount = {
+    type: "service_account",
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+    private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    client_id: process.env.FIREBASE_CLIENT_ID,
+    auth_uri: "https://accounts.google.com/o/oauth2/auth",
+    token_uri: "https://oauth2.googleapis.com/token",
+    auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+    client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
+};
 
-async function firebaseRequest(path, method = 'GET', data = null) {
-    const url = `${FIREBASE_URL}${path}.json?auth=${FIREBASE_KEY}`;
-    
-    const options = {
-        method,
-        headers: { 'Content-Type': 'application/json' }
-    };
-    
-    if (data && method !== 'GET') {
-        options.body = JSON.stringify(data);
-    }
-    
-    const response = await fetch(url, options);
-    return response.json();
-}
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: process.env.FIREBASE_URL
+});
+
+const db = admin.database();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 🎛️ SERVER STATE (للتحكم بالسيرفر)
@@ -116,7 +121,7 @@ app.set('trust proxy', true);
 // 🛡️ MIDDLEWARE: CORS
 // ═══════════════════════════════════════════════════════════════════════════
 app.use(cors({
-    origin: '*',
+    origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*', // إصلاح: حدد origins لمنع CSRF
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Session-Id', 'X-Session-Token', 'X-Admin-Token']
@@ -142,11 +147,11 @@ app.use((req, res, next) => {
         const duration = Date.now() - startTime;
         
         if (req.path.includes('/admin') || req.path.includes('/control')) {
-            console.log(`🔒 ${req.method} ${req.path} | IP: ${ip} | ${res.statusCode} | ${duration}ms`);
+            console.log(`🔒 ${req.method} ${req.path} | IP: ${crypto.createHash('sha256').update(ip).digest('hex')} | ${res.statusCode} | ${duration}ms`); // إصلاح: hash IP
         }
         
         if (res.statusCode >= 400) {
-            addLog('ERROR', `${req.method} ${req.path} - ${res.statusCode}`, { ip, duration });
+            addLog('ERROR', `${req.method} ${req.path} - ${res.statusCode}`, { ip: crypto.createHash('sha256').update(ip).digest('hex'), duration });
         }
     });
     
@@ -162,7 +167,7 @@ const checkServerState = (req, res, next) => {
     // تحقق من IP المحظور
     if (serverState.blockedIPs.has(ip)) {
         serverState.stats.blockedRequests++;
-        addLog('BLOCKED', `Blocked request from ${ip}`, { path: req.path });
+        addLog('BLOCKED', `Blocked request from ${crypto.createHash('sha256').update(ip).digest('hex')}`, { path: req.path });
         return res.status(403).json({
             success: false,
             error: 'IP blocked',
@@ -208,8 +213,9 @@ const verifyAdmin = async (req, res, next) => {
             });
         }
         
-        // تحقق من الجلسة في Firebase
-        const session = await firebaseRequest(`/admin_sessions/${sessionId}`);
+        // تحقق من الجلسة في Firebase باستخدام Admin SDK
+        const sessionSnapshot = await db.ref(`/admin_sessions/${sessionId}`).once('value');
+        const session = sessionSnapshot.val();
         
         if (!session || session.token !== sessionToken) {
             return res.status(401).json({
@@ -220,7 +226,7 @@ const verifyAdmin = async (req, res, next) => {
         
         // تحقق من انتهاء الجلسة
         if (session.expiresAt && Date.now() > session.expiresAt) {
-            await firebaseRequest(`/admin_sessions/${sessionId}`, 'DELETE');
+            await db.ref(`/admin_sessions/${sessionId}`).remove();
             return res.status(401).json({
                 success: false,
                 error: 'Session expired'
@@ -262,6 +268,20 @@ const verifyControlAccess = (req, res, next) => {
         error: 'Unauthorized - Admin access required'
     });
 };
+
+// إضافة: Rate limiter بسيط لمنع brute force
+async function rateLimiter(req, res, next) {
+    const ip = req.clientIP;
+    const key = `rate:${crypto.createHash('sha256').update(ip).digest('hex')}`;
+    const count = await client.incr(key);
+    if (count === 1) await client.expire(key, 60); // 1 min window
+    if (count > 100) { // حد 100 طلب/dq
+        return res.status(429).json({ success: false, error: 'Too many requests' });
+    }
+    next();
+}
+
+app.use(rateLimiter);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 🏥 HEALTH CHECK
@@ -389,19 +409,19 @@ app.post('/api/control/ip/block', verifyControlAccess, (req, res) => {
     
     serverState.blockedIPs.add(ip);
     
-    addLog('WARNING', `IP blocked: ${ip}`, { reason: reason || 'Manual block' });
+    addLog('WARNING', `IP blocked: ${crypto.createHash('sha256').update(ip).digest('hex')}`, { reason: reason || 'Manual block' });
     
     // إزالة تلقائية بعد المدة (إذا محددة)
     if (duration) {
         setTimeout(() => {
             serverState.blockedIPs.delete(ip);
-            addLog('INFO', `IP auto-unblocked: ${ip}`);
+            addLog('INFO', `IP auto-unblocked: ${crypto.createHash('sha256').update(ip).digest('hex')}`);
         }, duration * 60 * 1000);
     }
     
     res.json({
         success: true,
-        message: `IP ${ip} blocked`,
+        message: `IP ${crypto.createHash('sha256').update(ip).digest('hex')} blocked`,
         ip
     });
 });
@@ -416,9 +436,9 @@ app.post('/api/control/ip/unblock', verifyControlAccess, (req, res) => {
     
     if (serverState.blockedIPs.has(ip)) {
         serverState.blockedIPs.delete(ip);
-        addLog('INFO', `IP unblocked: ${ip}`);
+        addLog('INFO', `IP unblocked: ${crypto.createHash('sha256').update(ip).digest('hex')}`);
         
-        res.json({ success: true, message: `IP ${ip} unblocked` });
+        res.json({ success: true, message: `IP ${crypto.createHash('sha256').update(ip).digest('hex')} unblocked` });
     } else {
         res.json({ success: false, error: 'IP not found in blocked list' });
     }
@@ -429,7 +449,7 @@ app.get('/api/control/ip/blocked', verifyControlAccess, (req, res) => {
     res.json({
         success: true,
         count: serverState.blockedIPs.size,
-        ips: Array.from(serverState.blockedIPs)
+        ips: Array.from(serverState.blockedIPs).map(ip => crypto.createHash('sha256').update(ip).digest('hex')) // إصلاح: hash IPs
     });
 });
 
@@ -488,6 +508,15 @@ app.post('/api/admin/login', async (req, res) => {
         const { username, password, deviceFingerprint } = req.body;
         const ip = req.clientIP || req.ip;
         
+        // إضافة brute force protection
+        const bruteKey = `brute:login:\( {crypto.createHash('sha256').update(ip).digest('hex')}: \){username}`;
+        let attempts = await client.get(bruteKey) || 0;
+        attempts = parseInt(attempts);
+        if (attempts >= 5) {
+            return res.status(429).json({ success: false, error: 'Too many attempts' });
+        }
+        await client.set(bruteKey, attempts + 1, { EX: 3600 }); // 1 hour
+        
         if (!username || !password) {
             return res.status(400).json({
                 success: false,
@@ -500,7 +529,7 @@ app.post('/api/admin/login', async (req, res) => {
             const isValid = await bcrypt.compare(password, REQUIRED_ENV.MASTER_ADMIN_PASSWORD_HASH);
             
             if (!isValid) {
-                addLog('AUTH_FAIL', `Failed login attempt for ${username}`, { ip });
+                addLog('AUTH_FAIL', `Failed login attempt for ${username}`, { ip: crypto.createHash('sha256').update(ip).digest('hex') });
                 return res.status(401).json({
                     success: false,
                     error: 'Invalid credentials'
@@ -523,9 +552,9 @@ app.post('/api/admin/login', async (req, res) => {
                 expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 ساعة
             };
             
-            await firebaseRequest(`/admin_sessions/${sessionId}`, 'PUT', sessionData);
+            await db.ref(`/admin_sessions/${sessionId}`).set(sessionData);
             
-            addLog('LOGIN', `Admin logged in: ${username}`, { ip });
+            addLog('LOGIN', `Admin logged in: ${username}`, { ip: crypto.createHash('sha256').update(ip).digest('hex') });
             
             return res.json({
                 success: true,
@@ -539,7 +568,8 @@ app.post('/api/admin/login', async (req, res) => {
         }
         
         // تحقق من Sub Admin في Firebase
-        const subAdmins = await firebaseRequest('/sub_admins');
+        const subAdminsSnapshot = await db.ref('/sub_admins').once('value');
+        const subAdmins = subAdminsSnapshot.val();
         
         if (subAdmins) {
             for (const [id, admin] of Object.entries(subAdmins)) {
@@ -563,9 +593,9 @@ app.post('/api/admin/login', async (req, res) => {
                             expiresAt: Date.now() + (12 * 60 * 60 * 1000)
                         };
                         
-                        await firebaseRequest(`/admin_sessions/${sessionId}`, 'PUT', sessionData);
+                        await db.ref(`/admin_sessions/${sessionId}`).set(sessionData);
                         
-                        addLog('LOGIN', `Sub-admin logged in: ${username}`, { ip });
+                        addLog('LOGIN', `Sub-admin logged in: ${username}`, { ip: crypto.createHash('sha256').update(ip).digest('hex') });
                         
                         return res.json({
                             success: true,
@@ -579,7 +609,7 @@ app.post('/api/admin/login', async (req, res) => {
             }
         }
         
-        addLog('AUTH_FAIL', `Invalid login: ${username}`, { ip });
+        addLog('AUTH_FAIL', `Invalid login: ${username}`, { ip: crypto.createHash('sha256').update(ip).digest('hex') });
         
         res.status(401).json({
             success: false,
@@ -597,7 +627,7 @@ app.post('/api/admin/login', async (req, res) => {
 
 app.post('/api/admin/logout', verifyAdmin, async (req, res) => {
     try {
-        await firebaseRequest(`/admin_sessions/${req.adminId}`, 'DELETE');
+        await db.ref(`/admin_sessions/${req.adminId}`).remove();
         
         addLog('LOGOUT', `Admin logged out`, { adminId: req.adminId });
         
@@ -628,7 +658,8 @@ app.get('/api/admin/verify-session', verifyAdmin, (req, res) => {
 // جلب جميع المستخدمين
 app.get('/api/admin/users', checkServerState, verifyAdmin, async (req, res) => {
     try {
-        const users = await firebaseRequest('/users');
+        const usersSnapshot = await db.ref('/users').once('value');
+        const users = usersSnapshot.val();
         
         res.json({
             success: true,
@@ -657,15 +688,12 @@ app.post('/api/admin/users', checkServerState, verifyAdmin, async (req, res) => 
         }
         
         // تحقق من عدم وجود المستخدم
-        const existingUsers = await firebaseRequest('/users');
-        if (existingUsers) {
-            const exists = Object.values(existingUsers).some(u => u.username === username);
-            if (exists) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Username already exists'
-                });
-            }
+        const existingUsersSnapshot = await db.ref('/users').orderByChild('username').equalTo(username).once('value');
+        if (existingUsersSnapshot.exists()) {
+            return res.status(400).json({
+                success: false,
+                error: 'Username already exists'
+            });
         }
         
         // حساب تاريخ الانتهاء
@@ -694,7 +722,7 @@ app.post('/api/admin/users', checkServerState, verifyAdmin, async (req, res) => 
             created_by: req.adminUser?.username || 'admin'
         };
         
-        await firebaseRequest(`/users/${userId}`, 'PUT', userData);
+        await db.ref(`/users/${userId}`).set(userData);
         
         addLog('USER_CREATED', `User created: ${username}`, { by: req.adminUser?.username });
         
@@ -719,7 +747,8 @@ app.patch('/api/admin/users/:id', checkServerState, verifyAdmin, async (req, res
         const { id } = req.params;
         const updates = req.body;
         
-        const user = await firebaseRequest(`/users/${id}`);
+        const userSnapshot = await db.ref(`/users/${id}`).once('value');
+        const user = userSnapshot.val();
         if (!user) {
             return res.status(404).json({
                 success: false,
@@ -731,7 +760,7 @@ app.patch('/api/admin/users/:id', checkServerState, verifyAdmin, async (req, res
         delete updates.password_hash;
         delete updates.id;
         
-        await firebaseRequest(`/users/${id}`, 'PATCH', updates);
+        await db.ref(`/users/${id}`).update(updates);
         
         addLog('USER_UPDATED', `User updated: ${user.username}`, { updates: Object.keys(updates) });
         
@@ -754,7 +783,8 @@ app.delete('/api/admin/users/:id', checkServerState, verifyAdmin, async (req, re
     try {
         const { id } = req.params;
         
-        const user = await firebaseRequest(`/users/${id}`);
+        const userSnapshot = await db.ref(`/users/${id}`).once('value');
+        const user = userSnapshot.val();
         if (!user) {
             return res.status(404).json({
                 success: false,
@@ -762,7 +792,7 @@ app.delete('/api/admin/users/:id', checkServerState, verifyAdmin, async (req, re
             });
         }
         
-        await firebaseRequest(`/users/${id}`, 'DELETE');
+        await db.ref(`/users/${id}`).remove();
         
         addLog('USER_DELETED', `User deleted: ${user.username}`, { by: req.adminUser?.username });
         
@@ -793,7 +823,8 @@ app.post('/api/admin/users/:id/extend', checkServerState, verifyAdmin, async (re
             });
         }
         
-        const user = await firebaseRequest(`/users/${id}`);
+        const userSnapshot = await db.ref(`/users/${id}`).once('value');
+        const user = userSnapshot.val();
         if (!user) {
             return res.status(404).json({
                 success: false,
@@ -805,7 +836,7 @@ app.post('/api/admin/users/:id/extend', checkServerState, verifyAdmin, async (re
         const baseTime = currentExpiry > Date.now() ? currentExpiry : Date.now();
         const newExpiry = new Date(baseTime + minutes * 60 * 1000).toISOString();
         
-        await firebaseRequest(`/users/${id}`, 'PATCH', { expiry_date: newExpiry });
+        await db.ref(`/users/${id}`).update({ expiry_date: newExpiry });
         
         addLog('USER_EXTENDED', `User extended: ${user.username}`, { minutes, newExpiry });
         
@@ -829,7 +860,8 @@ app.post('/api/admin/users/:id/reset-device', checkServerState, verifyAdmin, asy
     try {
         const { id } = req.params;
         
-        const user = await firebaseRequest(`/users/${id}`);
+        const userSnapshot = await db.ref(`/users/${id}`).once('value');
+        const user = userSnapshot.val();
         if (!user) {
             return res.status(404).json({
                 success: false,
@@ -837,7 +869,7 @@ app.post('/api/admin/users/:id/reset-device', checkServerState, verifyAdmin, asy
             });
         }
         
-        await firebaseRequest(`/users/${id}`, 'PATCH', {
+        await db.ref(`/users/${id}`).update({
             device_id: null,
             device_info: null
         });
@@ -861,7 +893,13 @@ app.post('/api/admin/users/:id/reset-device', checkServerState, verifyAdmin, asy
 // حذف المنتهيين
 app.post('/api/admin/users/delete-expired', checkServerState, verifyAdmin, async (req, res) => {
     try {
-        const users = await firebaseRequest('/users');
+        const { confirm } = req.body; // إصلاح: أضف تأكيد لحذف
+        if (!confirm || confirm !== 'yes') {
+            return res.status(400).json({ success: false, error: 'Confirmation required (yes)' });
+        }
+
+        const usersSnapshot = await db.ref('/users').once('value');
+        const users = usersSnapshot.val();
         
         if (!users) {
             return res.json({
@@ -878,7 +916,7 @@ app.post('/api/admin/users/delete-expired', checkServerState, verifyAdmin, async
             if (user.expiry_date) {
                 const expiryTime = new Date(user.expiry_date).getTime();
                 if (expiryTime <= now) {
-                    await firebaseRequest(`/users/${id}`, 'DELETE');
+                    await db.ref(`/users/${id}`).remove();
                     deletedCount++;
                 }
             }
@@ -908,7 +946,8 @@ app.post('/api/admin/users/delete-expired', checkServerState, verifyAdmin, async
 // جلب جميع المفاتيح
 app.get('/api/admin/api-keys', checkServerState, verifyAdmin, async (req, res) => {
     try {
-        const apiKeys = await firebaseRequest('/api_keys');
+        const apiKeysSnapshot = await db.ref('/api_keys').once('value');
+        const apiKeys = apiKeysSnapshot.val();
         
         res.json({
             success: true,
@@ -951,7 +990,7 @@ app.post('/api/admin/api-keys', checkServerState, verifyAdmin, async (req, res) 
             last_used: null
         };
         
-        await firebaseRequest(`/api_keys/${keyId}`, 'PUT', keyData);
+        await db.ref(`/api_keys/${keyId}`).set(keyData);
         
         addLog('KEY_CREATED', `API key created for: ${adminName}`, { permission: permissionLevel });
         
@@ -980,7 +1019,7 @@ app.patch('/api/admin/api-keys/:id', checkServerState, verifyAdmin, async (req, 
         delete updates.api_key;
         delete updates.id;
         
-        await firebaseRequest(`/api_keys/${id}`, 'PATCH', updates);
+        await db.ref(`/api_keys/${id}`).update(updates);
         
         res.json({
             success: true,
@@ -1001,7 +1040,7 @@ app.delete('/api/admin/api-keys/:id', checkServerState, verifyAdmin, async (req,
     try {
         const { id } = req.params;
         
-        await firebaseRequest(`/api_keys/${id}`, 'DELETE');
+        await db.ref(`/api_keys/${id}`).remove();
         
         addLog('KEY_DELETED', `API key deleted: ${id}`);
         
@@ -1029,6 +1068,15 @@ app.post('/api/login', checkServerState, async (req, res) => {
         const { username, password, device_id, device_info, is_rooted } = req.body;
         const ip = req.clientIP || req.ip;
         
+        // إضافة brute force protection
+        const bruteKey = `brute:user:${username}`;
+        let attempts = await client.get(bruteKey) || 0;
+        attempts = parseInt(attempts);
+        if (attempts >= 5) {
+            return res.status(429).json({ success: false, error: 'Too many attempts' });
+        }
+        await client.set(bruteKey, attempts + 1, { EX: 3600 });
+        
         if (!username || !password) {
             return res.status(400).json({
                 success: false,
@@ -1036,7 +1084,8 @@ app.post('/api/login', checkServerState, async (req, res) => {
             });
         }
         
-        const users = await firebaseRequest('/users');
+        const usersSnapshot = await db.ref('/users').once('value');
+        const users = usersSnapshot.val();
         
         if (!users) {
             return res.status(401).json({
@@ -1057,7 +1106,7 @@ app.post('/api/login', checkServerState, async (req, res) => {
         }
         
         if (!foundUser) {
-            addLog('LOGIN_FAIL', `Invalid username: ${username}`, { ip });
+            addLog('LOGIN_FAIL', `Invalid username: ${username}`, { ip: crypto.createHash('sha256').update(ip).digest('hex') });
             return res.status(401).json({
                 success: false,
                 error: 'Invalid credentials'
@@ -1067,7 +1116,7 @@ app.post('/api/login', checkServerState, async (req, res) => {
         // تحقق من كلمة المرور
         const isValid = await bcrypt.compare(password, foundUser.password_hash);
         if (!isValid) {
-            addLog('LOGIN_FAIL', `Invalid password for: ${username}`, { ip });
+            addLog('LOGIN_FAIL', `Invalid password for: ${username}`, { ip: crypto.createHash('sha256').update(ip).digest('hex') });
             return res.status(401).json({
                 success: false,
                 error: 'Invalid credentials'
@@ -1105,7 +1154,7 @@ app.post('/api/login', checkServerState, async (req, res) => {
         const updateData = {
             last_login: new Date().toISOString(),
             login_count: (foundUser.login_count || 0) + 1,
-            last_ip: ip
+            last_ip: crypto.createHash('sha256').update(ip).digest('hex') // إصلاح: hash IP
         };
         
         if (!foundUser.device_id && device_id) {
@@ -1117,9 +1166,12 @@ app.post('/api/login', checkServerState, async (req, res) => {
             updateData.is_rooted = is_rooted;
         }
         
-        await firebaseRequest(`/users/${foundId}`, 'PATCH', updateData);
+        await db.ref(`/users/${foundId}`).update(updateData);
         
-        addLog('USER_LOGIN', `User login: ${username}`, { ip, device_id });
+        addLog('USER_LOGIN', `User login: ${username}`, { ip: crypto.createHash('sha256').update(ip).digest('hex'), device_id });
+        
+        // إعادة تعيين brute force عند النجاح
+        await client.del(bruteKey);
         
         res.json({
             success: true,
@@ -1152,7 +1204,8 @@ app.post('/api/verify', checkServerState, async (req, res) => {
             });
         }
         
-        const users = await firebaseRequest('/users');
+        const usersSnapshot = await db.ref('/users').once('value');
+        const users = usersSnapshot.val();
         
         if (!users) {
             return res.status(404).json({
@@ -1313,4 +1366,3 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 module.exports = app;
-
